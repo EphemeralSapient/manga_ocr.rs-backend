@@ -1,0 +1,7 @@
+/target
+/.cache
+# Model is embedded at compile time, no need to track in git
+#/models
+# Environment variables (use .env.example as template)
+.env
+input_image.webp
