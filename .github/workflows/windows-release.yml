@@ -32,11 +32,12 @@ jobs:
           path: C:\opencv
           key: opencv-4.12.0-windows
 
-      - name: Download and install OpenCV
+      - name: Download and extract OpenCV
         if: steps.cache-opencv.outputs.cache-hit != 'true'
         run: |
-          curl -L https://github.com/opencv/opencv/releases/download/4.12.0/opencv-4.12.0-windows.exe -o opencv-installer.exe
-          Start-Process opencv-installer.exe -ArgumentList '/S','/D=C:\opencv' -Wait
+          curl -L https://github.com/opencv/opencv/releases/download/4.12.0/opencv-4.12.0-windows.exe -o opencv.exe
+          7z x opencv.exe -oC:\ -y
+          Remove-Item opencv.exe
 
       - name: Setup OpenCV environment
         run: |
