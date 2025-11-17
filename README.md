@@ -61,7 +61,7 @@ sudo apt-get install libopencv-dev clang pkg-config
 brew install opencv pkg-config llvm
 
 # Windows
-vcpkg install opencv4[core,imgproc,imgcodecs]:x64-windows
+vcpkg install opencv4:x64-windows
 ```
 
 **Build:**

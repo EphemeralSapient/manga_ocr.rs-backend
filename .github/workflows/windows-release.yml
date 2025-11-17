@@ -25,7 +25,7 @@ jobs:
 
       - name: Install OpenCV via vcpkg
         run: |
-          vcpkg install opencv4[core,imgproc,imgcodecs]:x64-windows
+          vcpkg install opencv4:x64-windows
           echo "OPENCV_LINK_LIBS=opencv_world4" >> $env:GITHUB_ENV
           echo "OPENCV_LINK_PATHS=C:\vcpkg\installed\x64-windows\lib" >> $env:GITHUB_ENV
           echo "OPENCV_INCLUDE_PATHS=C:\vcpkg\installed\x64-windows\include" >> $env:GITHUB_ENV
