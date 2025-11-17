@@ -101,8 +101,12 @@ sudo apt-get install libopencv-dev clang pkg-config
 # macOS
 brew install opencv pkg-config llvm
 
-# Windows
-vcpkg install opencv4:x64-windows
+# Windows - Download and install official OpenCV
+# https://github.com/opencv/opencv/releases/download/4.12.0/opencv-4.12.0-windows.exe
+# Then set environment variables:
+# OPENCV_LINK_LIBS=opencv_world4120
+# OPENCV_LINK_PATHS=C:\opencv\build\x64\vc16\lib
+# OPENCV_INCLUDE_PATHS=C:\opencv\build\include
 ```
 
 **Build:**

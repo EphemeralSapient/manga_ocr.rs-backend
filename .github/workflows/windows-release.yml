@@ -17,22 +17,32 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Setup vcpkg binary cache
-        run: |
-          echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> $env:GITHUB_ENV
+      - name: Cache OpenCV
+        id: cache-opencv
+        uses: actions/cache@v4
+        with:
+          path: C:\opencv
+          key: opencv-4.12.0-windows
 
-      - name: Install OpenCV via vcpkg
+      - name: Download and install OpenCV
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
         run: |
-          vcpkg install opencv4:x64-windows
-          echo "OPENCV_LINK_LIBS=opencv_world4" >> $env:GITHUB_ENV
-          echo "OPENCV_LINK_PATHS=C:\vcpkg\installed\x64-windows\lib" >> $env:GITHUB_ENV
-          echo "OPENCV_INCLUDE_PATHS=C:\vcpkg\installed\x64-windows\include" >> $env:GITHUB_ENV
+          curl -L https://github.com/opencv/opencv/releases/download/4.12.0/opencv-4.12.0-windows.exe -o opencv-installer.exe
+          Start-Process opencv-installer.exe -ArgumentList '/S','/D=C:\opencv' -Wait
+
+      - name: Setup OpenCV environment
+        run: |
+          echo "OPENCV_LINK_LIBS=opencv_world4120" >> $env:GITHUB_ENV
+          echo "OPENCV_LINK_PATHS=C:\opencv\build\x64\vc16\lib" >> $env:GITHUB_ENV
+          echo "OPENCV_INCLUDE_PATHS=C:\opencv\build\include" >> $env:GITHUB_ENV
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.6
@@ -43,13 +53,15 @@ jobs:
           shared-key: "release"
           cache-on-failure: true
 
-      - name: Configure sccache
+      - name: Configure build environment
         run: |
           echo "SCCACHE_GHA_ENABLED=true" >> $env:GITHUB_ENV
           echo "RUSTC_WRAPPER=sccache" >> $env:GITHUB_ENV
+          echo "CARGO_INCREMENTAL=0" >> $env:GITHUB_ENV
+          echo "CARGO_TERM_COLOR=always" >> $env:GITHUB_ENV
 
       - name: Build release binary
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
       - name: Get version
         id: get_version
