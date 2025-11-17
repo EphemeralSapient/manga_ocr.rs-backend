@@ -1,43 +1,57 @@
 # Git
-.git
+.git/
 .gitignore
 .gitattributes
 
 # CI/CD
-.github
+.github/
 
-# Target directory
+# Build artifacts
 target/
 **/target/
 
-# Output files
+# Output and cache
 output/
+.cache/
 *.png
 *.jpg
+*.jpeg
+*.webp
 *.json
 !models/*.onnx
 
-# Environment files
+# Environment files (KEEP .env.example for reference)
 .env
-.env.*
+.env.local
+.env.production
+.env.development
 !.env.example
 
-# IDE
+# IDE and editor files
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+.DS_Store
 
 # Documentation
 *.md
 !README.md
+!LICENSE
 docs/
+references/
 
 # Test files
 tests/
 benches/
+__pycache__/
+
+# Python files (client.py not needed in Docker)
+*.py
+*.pyc
+requirements.txt
 
 # Build artifacts
 **/*.rs.bk
-Cargo.lock
+**/*.bak

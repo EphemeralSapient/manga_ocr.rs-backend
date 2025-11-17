@@ -1,72 +1,95 @@
-# Multi-stage Dockerfile for manga_workflow
-# Builds optimized release binary with OpenCV support
+# syntax=docker/dockerfile:1.4
 
-# Build stage
-FROM rust:1.75-slim-bookworm AS builder
+# ============================================================================
+# Build Stage
+# ============================================================================
+FROM rust:1.83-slim-bookworm AS builder
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
+# Install build dependencies in a single layer
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     libopencv-dev \
     clang \
     libclang-dev \
-    cmake \
-    && rm -rf /var/lib/apt/lists/*
+    cmake
 
-# Create app directory
 WORKDIR /app
 
-# Copy manifests
-COPY Cargo.toml Cargo.lock ./
+# Copy dependency manifests first for better layer caching
+COPY Cargo.toml Cargo.lock build.rs ./
 
-# Copy source code
+# Create dummy source to cache dependencies
+RUN mkdir -p src && \
+    echo "fn main() {}" > src/main.rs && \
+    cargo build --release --locked && \
+    rm -rf src target/release/deps/manga_workflow*
+
+# Copy actual source code
 COPY src ./src
-COPY build.rs ./build.rs
 
-# Copy model files (if available)
-# Note: In production, fetch these from secure storage
+# Copy models (required for binary)
 COPY models ./models
 
-# Build release binary
-RUN cargo build --release --locked
+# Build release binary with cache mounts
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --locked && \
+    cp target/release/manga_workflow /app/manga_workflow
 
-# Runtime stage
+# ============================================================================
+# Runtime Stage
+# ============================================================================
 FROM debian:bookworm-slim
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+# OCI labels for compliance
+LABEL org.opencontainers.image.title="Manga Text Processor" \
+      org.opencontainers.image.description="High-performance Rust backend for manga text detection, translation, and rendering" \
+      org.opencontainers.image.vendor="manga_workflow" \
+      org.opencontainers.image.licenses="See LICENSE file" \
+      org.opencontainers.image.source="https://github.com/yourusername/manga_workflow"
+
+# Install minimal runtime dependencies
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     libopencv-core4.6 \
     libopencv-imgproc4.6 \
     libopencv-imgcodecs4.6 \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    wget && \
+    rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -m -u 1000 manga && \
-    mkdir -p /app/output /app/fonts && \
+# Create non-root user for security
+RUN useradd -m -u 1000 -s /bin/bash manga && \
+    mkdir -p /app/.cache /app/fonts && \
     chown -R manga:manga /app
 
-# Copy binary from builder
-COPY --from=builder /app/target/release/manga_workflow /usr/local/bin/manga_workflow
-
-# Copy fonts directory
-COPY --chown=manga:manga fonts /app/fonts
-
-USER manga
 WORKDIR /app
 
-# Expose port for web server
-EXPOSE 3000
+# Copy binary and required files
+COPY --from=builder --chown=manga:manga /app/manga_workflow /usr/local/bin/manga_workflow
+COPY --chown=manga:manga fonts ./fonts
+COPY --chown=manga:manga models ./models
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3000/health || exit 1
+# Switch to non-root user
+USER manga
 
-# Set environment variables
-ENV RUST_LOG=info
-ENV RUST_BACKTRACE=1
+# Expose default server port
+EXPOSE 1420
 
-# Run the binary
+# Health check using wget (more minimal than curl)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:1420/health || exit 1
+
+# Environment variables
+ENV SERVER_HOST=0.0.0.0 \
+    SERVER_PORT=1420 \
+    LOG_LEVEL=INFO \
+    RUST_BACKTRACE=1
+
+# Run the server
 ENTRYPOINT ["/usr/local/bin/manga_workflow"]
-CMD ["--help"]

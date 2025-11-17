@@ -1,0 +1,46 @@
+version: '3.9'
+
+services:
+  manga_workflow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: manga_workflow:latest
+    container_name: manga_workflow
+    restart: unless-stopped
+
+    ports:
+      - "1420:1420"
+
+    volumes:
+      # Mount environment config (create .env.local first)
+      - ./.env.local:/app/.env.local:ro
+      # Persistent cache for translations
+      - manga_cache:/app/.cache
+      # Optional: Mount output directory
+      # - ./output:/app/output
+
+    environment:
+      # Override settings here if needed
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "1420"
+      LOG_LEVEL: "INFO"
+
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:1420/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Resource limits (adjust based on your needs)
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+volumes:
+  manga_cache:
+    driver: local
