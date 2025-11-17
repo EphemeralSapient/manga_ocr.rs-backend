@@ -1,0 +1,80 @@
+[package]
+name = "manga_workflow"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web server
+axum = { version = "0.7", features = ["multipart"] }
+tokio = { version = "1.48", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Image processing
+image = { version = "0.25.8", default-features = false, features = ["png", "jpeg", "rayon"] }
+imageproc = "0.25"
+opencv = { version = "0.92", default-features = false, features = ["imgproc", "imgcodecs"] }
+ab_glyph = "0.2"
+unicode-segmentation = "1.12"
+font-kit = "0.14"
+ndarray = "0.16.1"
+cosmic-text = "0.14"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+base64 = "0.22"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "2.0"
+async-trait = "0.1"
+futures = "0.3"
+rand = "0.8"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rayon = "1.11"
+dotenvy = "0.15"
+
+# Performance & Optimization
+num_cpus = "1.17"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }  # Fast hashing for cache keys
+lru = "0.12"  # LRU cache implementation
+dashmap = "6.1"  # Concurrent hash map
+parking_lot = "0.12"  # Better sync primitives than std
+once_cell = "1.20"  # Lazy initialization
+
+# Rate limiting & Resilience
+governor = "0.7"  # Token bucket rate limiting
+tower = { version = "0.5", features = ["limit", "timeout", "retry"] }  # Enhanced tower features
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# ONNX Runtime - CPU only by default
+[dependencies.ort]
+version = "2.0.0-rc.10"
+default-features = true
+
+# Optional acceleration features
+# Users can enable these with: cargo build --features cuda
+# Or combine multiple: cargo build --features cuda,tensorrt
+[features]
+default = []
+
+# GPU acceleration features
+cuda = ["ort/cuda"]
+tensorrt = ["ort/tensorrt"]
+directml = ["ort/directml"]
+coreml = ["ort/coreml"]
+openvino = ["ort/openvino"]
+
+# Note: CUDA/TensorRT may not be available on all platforms
+# - Windows GNU: CUDA binaries not available, use DirectML instead
+# - macOS: Use CoreML for Apple Silicon
+# - Linux: CUDA/TensorRT/OpenVINO available

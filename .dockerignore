@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# CI/CD
+.github
+
+# Target directory
+target/
+**/target/
+
+# Output files
+output/
+*.png
+*.jpg
+*.json
+!models/*.onnx
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Documentation
+*.md
+!README.md
+docs/
+
+# Test files
+tests/
+benches/
+
+# Build artifacts
+**/*.rs.bk
+Cargo.lock
