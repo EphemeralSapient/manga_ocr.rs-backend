@@ -52,6 +52,47 @@ This service implements a 4-phase pipeline for processing manga pages:
 
 ### From Source
 
+<details>
+<summary><b>Linux: Install Rust</b></summary>
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+rustc --version
+```
+
+</details>
+
+<details>
+<summary><b>macOS: Install Rust</b></summary>
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+rustc --version
+```
+
+</details>
+
+<details>
+<summary><b>Windows: Install Rust (MSVC required, not GNU)</b></summary>
+
+```powershell
+# Install Rust via winget
+winget install --id=Rustlang.Rustup -e
+
+# During installation, select MSVC toolchain (default)
+# If prompted, install Visual Studio Build Tools
+
+# Verify MSVC target
+rustup default stable-msvc
+rustc --version
+```
+
+**Note:** This project requires MSVC toolchain. GNU toolchain will not work.
+
+</details>
+
 **Dependencies:**
 ```bash
 # Ubuntu/Debian

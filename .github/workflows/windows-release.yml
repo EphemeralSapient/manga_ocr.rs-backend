@@ -23,6 +23,10 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Setup vcpkg binary cache
+        run: |
+          echo "VCPKG_BINARY_SOURCES=clear;x-gha,readwrite" >> $env:GITHUB_ENV
+
       - name: Install OpenCV via vcpkg
         run: |
           vcpkg install opencv4:x64-windows
@@ -30,23 +34,19 @@ jobs:
           echo "OPENCV_LINK_PATHS=C:\vcpkg\installed\x64-windows\lib" >> $env:GITHUB_ENV
           echo "OPENCV_INCLUDE_PATHS=C:\vcpkg\installed\x64-windows\include" >> $env:GITHUB_ENV
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
-      - name: Cache cargo index
-        uses: actions/cache@v4
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: "release"
+          cache-on-failure: true
 
-      - name: Cache target directory
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
+      - name: Configure sccache
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $env:GITHUB_ENV
+          echo "RUSTC_WRAPPER=sccache" >> $env:GITHUB_ENV
 
       - name: Build release binary
         run: cargo build --release --target x86_64-pc-windows-msvc
