@@ -242,6 +242,6 @@ All configuration options are documented in `.env.example`. Copy it to `.env` an
 - **Text/Bubble Detector**: [ogkalu/comic-text-and-bubble-detector](https://huggingface.co/ogkalu/comic-text-and-bubble-detector)
 - **Segmentation Mask**: [kitsumed/yolov8m_seg-speech-bubble](https://huggingface.co/kitsumed/yolov8m_seg-speech-bubble)
 
-## License
+## Disclaimer
 
-See LICENSE file for details.
+This software is provided for educational and personal use only. It is not intended for commercial use or distribution. Users are responsible for ensuring they have appropriate rights to any content they process. This project is not associated with or endorsed by any copyright holders. Use at your own risk and respect intellectual property rights.
