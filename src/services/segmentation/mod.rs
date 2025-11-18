@@ -286,38 +286,24 @@ impl SegmentationService {
 
         let confidence_threshold = 0.25;
         let sigmoid_threshold = 0.5;
-        let mut valid_detections = 0;
         let loop_start = std::time::Instant::now();
 
-        // First pass: count valid detections
-        debug!("Scanning {} detections for confidence > {}", num_detections, confidence_threshold);
-        let scan_start = std::time::Instant::now();
+        // Single-pass: filter and process valid detections
+        // Pre-allocate mask buffer for reuse across detections (160x160 proto mask size)
+        let mut mask = Array2::<f32>::zeros((mask_h, mask_w));
+        let mut valid_detections = 0;
 
-        for i in 0..num_detections {
-            // Get confidence (5th element, index 4)
-            let conf = det_output[[4, i]];
-            if conf >= confidence_threshold {
-                valid_detections += 1;
-            }
-        }
-
-        debug!("Found {} valid detections in {:.2}ms",
-            valid_detections,
-            scan_start.elapsed().as_secs_f64() * 1000.0);
-
-        // Second pass: process only valid detections
-        let mut processed = 0;
         for i in 0..num_detections {
             // Get confidence (5th element, index 4)
             let conf = det_output[[4, i]];
             if conf < confidence_threshold {
-                continue;
+                continue; // Early skip - avoid processing low-confidence detections
             }
 
-            processed += 1;
+            valid_detections += 1;
 
-            if processed == 1 {
-                debug!("Processing first valid detection (#{} out of {}) - this should be fast!", i, num_detections);
+            if valid_detections == 1 {
+                debug!("Processing first valid detection (#{} out of {}) with confidence {:.3}", i, num_detections, conf);
             }
 
             // Get mask coefficients (elements 5-36, indices 5-36)
@@ -326,8 +312,8 @@ impl SegmentationService {
 
             // Generate mask: sigmoid(sum(coeffs * proto_masks, axis=0))
             // Python: mask = 1 / (1 + np.exp(-np.sum(proto_masks * coeffs[:, None, None], axis=0)))
-            // Use direct weighted sum approach like Python
-            let mut mask = Array2::<f32>::zeros((mask_h, mask_w));
+            // Reuse pre-allocated buffer - reset to zero
+            mask.fill(0.0);
 
             // Weighted sum: for each position (y,x), compute sum_k(coeffs[k] * proto_masks[k,y,x])
             for k in 0..num_protos {

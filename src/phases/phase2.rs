@@ -57,11 +57,14 @@ impl Phase2Pipeline {
 
         // Use pre-decoded image if available, otherwise load from bytes
         // OPTIMIZATION: Pre-decoded image eliminates redundant decoding across phases
-        let img = if let Some(ref decoded) = image_data.decoded_image {
-            (**decoded).clone()
+        // Use Arc reference instead of cloning the entire image (saves ~8MB per phase!)
+        let img_owned;
+        let img: &DynamicImage = if let Some(ref decoded) = image_data.decoded_image {
+            decoded.as_ref()
         } else {
-            image::load_from_memory(&image_data.image_bytes)
-                .context("Failed to load image")?
+            img_owned = image::load_from_memory(&image_data.image_bytes)
+                .context("Failed to load image")?;
+            &img_owned
         };
 
         // OPTIMIZATION: Hash source image once for all cache lookups

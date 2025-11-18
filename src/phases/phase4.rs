@@ -61,11 +61,14 @@ impl Phase4Pipeline {
 
         // Use pre-decoded image if available, otherwise load from bytes
         // OPTIMIZATION: Pre-decoded image eliminates redundant decoding across phases
-        let img = if let Some(ref decoded) = image_data.decoded_image {
-            (**decoded).clone()
+        // Use Arc reference instead of cloning the entire image (saves ~8MB per phase!)
+        let img_owned;
+        let img: &DynamicImage = if let Some(ref decoded) = image_data.decoded_image {
+            decoded.as_ref()
         } else {
-            image::load_from_memory(&image_data.image_bytes)
-                .context("Failed to load image")?
+            img_owned = image::load_from_memory(&image_data.image_bytes)
+                .context("Failed to load image")?;
+            &img_owned
         };
         let mut final_image = img.to_rgba8();
 
@@ -216,38 +219,45 @@ impl Phase4Pipeline {
             &translation.translated_text,
         ).await?;
 
-        // OPTIMIZATION: Parallelize alpha blending using rayon
+        // OPTIMIZATION: Parallelize alpha blending using rayon with pre-allocated buffer
         // For 640x640 region, this is 409,600 pixels. Parallel processing
         // provides ~10-15% speedup on multi-core systems.
-        // Process each row in parallel
-        let rows: Vec<Vec<Rgba<u8>>> = (0..height)
+        // Pre-allocate buffer and process rows in parallel
+        let total_pixels = (width * height) as usize;
+        let mut img_data = Vec::with_capacity(total_pixels * 4);
+
+        let row_data: Vec<Vec<u8>> = (0..height)
             .into_par_iter()
             .map(|y| {
-                (0..width).map(|x| {
+                let mut row_bytes = Vec::with_capacity((width * 4) as usize);
+                for x in 0..width {
                     let text_pixel = text_canvas.get_pixel(x, y);
                     if text_pixel[3] > 0 {
                         // Has alpha - blend it
                         let bg_pixel = cleaned_img.get_pixel(x, y);
                         let alpha = text_pixel[3] as f32 / 255.0;
 
-                        Rgba([
-                            ((text_pixel[0] as f32 * alpha) + (bg_pixel[0] as f32 * (1.0 - alpha))) as u8,
-                            ((text_pixel[1] as f32 * alpha) + (bg_pixel[1] as f32 * (1.0 - alpha))) as u8,
-                            ((text_pixel[2] as f32 * alpha) + (bg_pixel[2] as f32 * (1.0 - alpha))) as u8,
-                            255,
-                        ])
+                        row_bytes.push(((text_pixel[0] as f32 * alpha) + (bg_pixel[0] as f32 * (1.0 - alpha))) as u8);
+                        row_bytes.push(((text_pixel[1] as f32 * alpha) + (bg_pixel[1] as f32 * (1.0 - alpha))) as u8);
+                        row_bytes.push(((text_pixel[2] as f32 * alpha) + (bg_pixel[2] as f32 * (1.0 - alpha))) as u8);
+                        row_bytes.push(255u8);
                     } else {
                         // No alpha - keep background
-                        *cleaned_img.get_pixel(x, y)
+                        let bg = cleaned_img.get_pixel(x, y);
+                        row_bytes.push(bg[0]);
+                        row_bytes.push(bg[1]);
+                        row_bytes.push(bg[2]);
+                        row_bytes.push(bg[3]);
                     }
-                }).collect()
+                }
+                row_bytes
             })
             .collect();
 
-        // Flatten rows into single pixel buffer
-        let img_data: Vec<u8> = rows.into_iter()
-            .flat_map(|row| row.into_iter().flat_map(|p| p.0))
-            .collect();
+        // Efficiently flatten into pre-allocated buffer
+        for row in row_data {
+            img_data.extend_from_slice(&row);
+        }
 
         // Replace cleaned_img pixels with blended result
         cleaned_img = ImageBuffer::from_vec(width, height, img_data)

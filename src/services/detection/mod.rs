@@ -459,48 +459,40 @@ impl DetectionService {
         let inference_start = std::time::Instant::now();
 
         // Acquire session from pool and run inference
-        let (labels_shape_owned, labels_data, boxes_data, scores_data) = {
+        // OPTIMIZED: Process tensors in-place and only clone filtered results
+        let (label_0_detections, label_1_detections, label_2_detections, inference_time) = {
             let mut session = self.session_pool.acquire();  // No await - crossbeam is sync!
             let outputs = session.run(ort::inputs![
                 "images" => images_value,
                 "orig_target_sizes" => sizes_value
             ])?;
 
-            // Extract and immediately clone all data while session is borrowed
+            let inference_time = inference_start.elapsed();
+
+            // Extract tensor references (no cloning yet)
             let (labels_shape, labels_data) = outputs["labels"].try_extract_tensor::<i64>()?;
-            let labels_shape_owned = labels_shape.to_vec();
-            let labels_data_owned = labels_data.to_vec();
-
             let (_boxes_shape, boxes_data) = outputs["boxes"].try_extract_tensor::<f32>()?;
-            let boxes_data_owned = boxes_data.to_vec();
-
             let (_scores_shape, scores_data) = outputs["scores"].try_extract_tensor::<f32>()?;
-            let scores_data_owned = scores_data.to_vec();
 
-            // Drop outputs and return session to pool
-            drop(outputs);
-            self.session_pool.release(session);  // No await - crossbeam is sync!
+            let num_detections = labels_shape[1] as usize;
+            trace!("Raw detections from model: {}", num_detections);
 
-            (labels_shape_owned, labels_data_owned, boxes_data_owned, scores_data_owned)
-        };
+            let confidence_threshold = self.config.confidence_threshold();
+            let mut label_0_detections = Vec::new();
+            let mut label_1_detections = Vec::new();
+            let mut label_2_detections = Vec::new();
 
-        let inference_time = inference_start.elapsed();
-        debug!("✓ Inference completed in {:.2}ms", inference_time.as_secs_f64() * 1000.0);
+            // Process tensors in-place - only clone filtered detections
+            for i in 0..num_detections {
+                let label = labels_data[i];
+                let score = scores_data[i];
 
-        let num_detections = labels_shape_owned[1] as usize;
-        trace!("Raw detections from model: {}", num_detections);
+                // Early filter - skip low-confidence detections without allocating
+                if score < confidence_threshold {
+                    continue;
+                }
 
-        let confidence_threshold = self.config.confidence_threshold();
-        let mut label_0_detections = Vec::new();
-        let mut label_1_detections = Vec::new();
-        let mut label_2_detections = Vec::new();
-
-        // Split detections by label in a single pass
-        for i in 0..num_detections {
-            let label = labels_data[i];
-            let score = scores_data[i];
-
-            if score >= confidence_threshold {
+                // Only clone bbox data for high-confidence detections
                 let bbox = [
                     boxes_data[i * 4] as i32,
                     boxes_data[i * 4 + 1] as i32,
@@ -523,7 +515,15 @@ impl DetectionService {
                     _ => {} // Ignore unknown labels
                 }
             }
-        }
+
+            // Drop outputs and return session to pool
+            drop(outputs);
+            self.session_pool.release(session);  // No await - crossbeam is sync!
+
+            (label_0_detections, label_1_detections, label_2_detections, inference_time)
+        };
+
+        debug!("✓ Inference completed in {:.2}ms", inference_time.as_secs_f64() * 1000.0);
 
         let total_time = detection_start.elapsed();
         debug!(
@@ -564,45 +564,38 @@ impl DetectionService {
         let inference_start = std::time::Instant::now();
 
         // Acquire session from pool and run inference
-        let (labels_shape_owned, labels_data, boxes_data, scores_data) = {
+        // OPTIMIZED: Process tensors in-place and only clone filtered results
+        let (text_detections, inference_time) = {
             let mut session = self.session_pool.acquire();  // No await - crossbeam is sync!
             let outputs = session.run(ort::inputs![
                 "images" => images_value,
                 "orig_target_sizes" => sizes_value
             ])?;
 
-            // Extract and immediately clone all data while session is borrowed
+            let inference_time = inference_start.elapsed();
+
+            // Extract tensor references (no cloning yet)
             let (labels_shape, labels_data) = outputs["labels"].try_extract_tensor::<i64>()?;
-            let labels_shape_owned = labels_shape.to_vec();
-            let labels_data_owned = labels_data.to_vec();
-
             let (_boxes_shape, boxes_data) = outputs["boxes"].try_extract_tensor::<f32>()?;
-            let boxes_data_owned = boxes_data.to_vec();
-
             let (_scores_shape, scores_data) = outputs["scores"].try_extract_tensor::<f32>()?;
-            let scores_data_owned = scores_data.to_vec();
 
-            // Drop outputs and return session to pool
-            drop(outputs);
-            self.session_pool.release(session);  // No await - crossbeam is sync!
+            let num_detections = labels_shape[1] as usize;
+            trace!("Raw detections from model: {}", num_detections);
 
-            (labels_shape_owned, labels_data_owned, boxes_data_owned, scores_data_owned)
-        };
+            let confidence_threshold = self.config.confidence_threshold();
+            let mut text_detections = Vec::new();
 
-        let inference_time = inference_start.elapsed();
-        debug!("✓ Inference completed in {:.2}ms", inference_time.as_secs_f64() * 1000.0);
+            // Process tensors in-place - only clone filtered detections
+            for i in 0..num_detections {
+                let label = labels_data[i];
+                let score = scores_data[i];
 
-        let num_detections = labels_shape_owned[1] as usize;
-        trace!("Raw detections from model: {}", num_detections);
+                // Early filter - skip non-matching or low-confidence detections
+                if label != target_label || score < confidence_threshold {
+                    continue;
+                }
 
-        let confidence_threshold = self.config.confidence_threshold();
-        let mut text_detections = Vec::new();
-
-        for i in 0..num_detections {
-            let label = labels_data[i];
-            let score = scores_data[i];
-
-            if label == target_label && score >= confidence_threshold {
+                // Only clone bbox data for matching detections
                 let bbox = [
                     boxes_data[i * 4] as i32,
                     boxes_data[i * 4 + 1] as i32,
@@ -621,10 +614,18 @@ impl DetectionService {
                     text_regions: Vec::new(), // Will be filled later by detect_bubbles()
                 });
             }
-        }
+
+            // Drop outputs and return session to pool
+            drop(outputs);
+            self.session_pool.release(session);  // No await - crossbeam is sync!
+
+            (text_detections, inference_time)
+        };
+
+        debug!("✓ Inference completed in {:.2}ms", inference_time.as_secs_f64() * 1000.0);
 
         debug!("Filtered {} detections above confidence threshold {:.2}",
-            text_detections.len(), confidence_threshold);
+            text_detections.len(), self.config.confidence_threshold());
 
         let filtered = self.nms(text_detections);
 
