@@ -26,7 +26,23 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::{info, debug, trace};
 
 // Embed the ONNX model at compile time (INT8 quantized, ~42MB)
+// If LFS not checked out, this will be a small stub - load from runtime path instead
 static MODEL_BYTES: &[u8] = include_bytes!("../../../models/detector.onnx");
+
+/// Load model bytes from embedded or runtime path
+fn load_model_bytes(config: &Config) -> Result<Vec<u8>> {
+    // Check if embedded model is real (>10KB means it's not an LFS stub)
+    if MODEL_BYTES.len() > 10_000 {
+        debug!("Using embedded detector model ({} MB)", MODEL_BYTES.len() as f64 / 1_048_576.0);
+        Ok(MODEL_BYTES.to_vec())
+    } else {
+        // Load from runtime path
+        let path = &config.detection.detector_model_path;
+        debug!("Loading detector model from: {}", path);
+        std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("Failed to load detector model from {}: {}", path, e))
+    }
+}
 
 /// Session pool for concurrent inference
 pub struct SessionPool {
@@ -103,7 +119,7 @@ impl DetectionService {
         })
     }
 
-    fn try_forced_backend(backend: &str) -> Result<(String, Session)> {
+    fn try_forced_backend(backend: &str, model_bytes: &[u8]) -> Result<(String, Session)> {
         match backend {
             #[cfg(feature = "tensorrt")]
             "TENSORRT" => {
@@ -112,7 +128,7 @@ impl DetectionService {
                     .with_execution_providers([TensorRTExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized TensorRT backend");
                 Ok(("TensorRT (forced)".to_string(), session))
             }
@@ -128,7 +144,7 @@ impl DetectionService {
                     .with_execution_providers([CUDAExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized CUDA backend");
                 Ok(("CUDA (forced)".to_string(), session))
             }
@@ -148,7 +164,7 @@ impl DetectionService {
                     ])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized OpenVINO backend");
                 Ok(("OpenVINO-CPU (forced)".to_string(), session))
             }
@@ -164,7 +180,7 @@ impl DetectionService {
                     .with_execution_providers([DirectMLExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized DirectML backend");
                 Ok(("DirectML (forced)".to_string(), session))
             }
@@ -180,7 +196,7 @@ impl DetectionService {
                     .with_execution_providers([CoreMLExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized CoreML backend");
                 Ok(("CoreML (forced)".to_string(), session))
             }
@@ -195,7 +211,7 @@ impl DetectionService {
                     .with_execution_providers([CPUExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized CPU backend");
                 Ok(("CPU (forced)".to_string(), session))
             }
@@ -210,7 +226,9 @@ impl DetectionService {
     }
 
     fn initialize_with_acceleration(config: &Config) -> Result<(String, Session)> {
-        info!("Loading embedded ONNX model ({} bytes)...", MODEL_BYTES.len());
+        // Load model bytes (embedded or from runtime path)
+        let model_bytes = load_model_bytes(config)?;
+        info!("Loaded detector model ({:.1} MB)", model_bytes.len() as f64 / 1_048_576.0);
 
         // Check if a specific backend is forced via config
         if let Some(ref backend) = config.detection.inference_backend {
@@ -220,7 +238,7 @@ impl DetectionService {
                 }
                 forced_backend => {
                     info!("INFERENCE_BACKEND={}, forcing specific backend", forced_backend);
-                    return Self::try_forced_backend(forced_backend);
+                    return Self::try_forced_backend(forced_backend, &model_bytes);
                 }
             }
         }
@@ -235,7 +253,7 @@ impl DetectionService {
                 .and_then(|b| b.with_execution_providers([TensorRTExecutionProvider::default().build()]))
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(MODEL_BYTES))
+                .and_then(|b| b.commit_from_memory(&model_bytes))
             {
                 info!("✓ Using TensorRT acceleration");
                 return Ok(("TensorRT".to_string(), session));
@@ -249,7 +267,7 @@ impl DetectionService {
                 .and_then(|b| b.with_execution_providers([CUDAExecutionProvider::default().build()]))
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(MODEL_BYTES))
+                .and_then(|b| b.commit_from_memory(&model_bytes))
             {
                 info!("✓ Using CUDA acceleration");
                 return Ok(("CUDA".to_string(), session));
@@ -263,7 +281,7 @@ impl DetectionService {
                 .and_then(|b| b.with_execution_providers([CoreMLExecutionProvider::default().build()]))
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(MODEL_BYTES))
+                .and_then(|b| b.commit_from_memory(&model_bytes))
             {
                 info!("✓ Using CoreML acceleration (Apple Neural Engine)");
                 return Ok(("CoreML".to_string(), session));
@@ -277,7 +295,7 @@ impl DetectionService {
                 .and_then(|b| b.with_execution_providers([DirectMLExecutionProvider::default().build()]))
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(MODEL_BYTES))
+                .and_then(|b| b.commit_from_memory(&model_bytes))
             {
                 info!("✓ Using DirectML acceleration");
                 return Ok(("DirectML".to_string(), session));
@@ -295,7 +313,7 @@ impl DetectionService {
                 ]))
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(MODEL_BYTES))
+                .and_then(|b| b.commit_from_memory(&model_bytes))
             {
                 info!("✓ Using OpenVINO acceleration (Intel CPU optimizations)");
                 return Ok(("OpenVINO-CPU".to_string(), session));

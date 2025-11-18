@@ -19,7 +19,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          lfs: true
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -46,6 +45,10 @@ jobs:
           echo "OPENCV_LINK_PATHS=C:\opencv\build\x64\vc16\lib" >> $env:GITHUB_ENV
           echo "OPENCV_INCLUDE_PATHS=C:\opencv\build\include" >> $env:GITHUB_ENV
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -54,6 +57,8 @@ jobs:
 
       - name: Configure build environment
         run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> $env:GITHUB_ENV
+          echo "RUSTC_WRAPPER=sccache" >> $env:GITHUB_ENV
           echo "CARGO_INCREMENTAL=0" >> $env:GITHUB_ENV
           echo "CARGO_TERM_COLOR=always" >> $env:GITHUB_ENV
 

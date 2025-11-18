@@ -1,41 +1,36 @@
 use std::env;
 
 fn main() {
-    // Ensure both model files exist at compile time
     let detector_path = "models/detector.onnx";
     let mask_path = "models/mask.onnx";
-
-    // Check detector model
-    if !std::path::Path::new(detector_path).exists() {
-        panic!(
-            "Detection model not found at {}. \n\
-            Please copy the model file to this location before building.",
-            detector_path
-        );
-    }
-
-    // Check segmentation model
-    if !std::path::Path::new(mask_path).exists() {
-        panic!(
-            "Segmentation model not found at {}. \n\
-            Please copy the model file to this location before building.",
-            mask_path
-        );
-    }
 
     // Trigger rebuild if models change
     println!("cargo:rerun-if-changed={}", detector_path);
     println!("cargo:rerun-if-changed={}", mask_path);
 
-    // Show embedded model sizes
-    let detector_size = std::fs::metadata(detector_path).map(|m| m.len()).unwrap_or(0);
-    let mask_size = std::fs::metadata(mask_path).map(|m| m.len()).unwrap_or(0);
-    let total_size = detector_size + mask_size;
+    // Check if models exist and are real (not LFS stubs)
+    let detector_exists = std::path::Path::new(detector_path).exists();
+    let mask_exists = std::path::Path::new(mask_path).exists();
 
-    println!("cargo:warning=Embedding models into binary:");
-    println!("cargo:warning=  - detector.onnx: {:.1} MB", detector_size as f64 / 1_048_576.0);
-    println!("cargo:warning=  - mask.onnx: {:.1} MB", mask_size as f64 / 1_048_576.0);
-    println!("cargo:warning=  Total: {:.1} MB", total_size as f64 / 1_048_576.0);
+    if detector_exists && mask_exists {
+        let detector_size = std::fs::metadata(detector_path).map(|m| m.len()).unwrap_or(0);
+        let mask_size = std::fs::metadata(mask_path).map(|m| m.len()).unwrap_or(0);
+
+        // LFS stub files are tiny (~130 bytes), real models are 100MB+
+        if detector_size > 10_000 && mask_size > 10_000 {
+            let total_size = detector_size + mask_size;
+            println!("cargo:warning=Embedding models into binary:");
+            println!("cargo:warning=  - detector.onnx: {:.1} MB", detector_size as f64 / 1_048_576.0);
+            println!("cargo:warning=  - mask.onnx: {:.1} MB", mask_size as f64 / 1_048_576.0);
+            println!("cargo:warning=  Total: {:.1} MB", total_size as f64 / 1_048_576.0);
+        } else {
+            println!("cargo:warning=Models are LFS stubs - binary will load from runtime path");
+            println!("cargo:warning=Binary will be small (~25MB). Models must be provided at runtime.");
+        }
+    } else {
+        println!("cargo:warning=Models not found - binary will load from runtime path");
+        println!("cargo:warning=Binary will be small (~25MB). Models must be provided at runtime.");
+    }
 
     // Detect enabled acceleration features
     let mut enabled_features = Vec::new();

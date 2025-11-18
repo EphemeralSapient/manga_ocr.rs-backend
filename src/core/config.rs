@@ -18,6 +18,8 @@ pub struct DetectionConfig {
     pub iou_threshold: f32,
     pub target_size: u32,
     pub inference_backend: Option<String>,
+    pub detector_model_path: String,
+    pub mask_model_path: String,
 }
 
 /// API configuration
@@ -148,6 +150,10 @@ impl Config {
                     .ok()
                     .map(|s| s.trim().to_uppercase())
                     .filter(|s| !s.is_empty()),
+                detector_model_path: env::var("DETECTOR_MODEL_PATH")
+                    .unwrap_or_else(|_| "models/detector.onnx".to_string()),
+                mask_model_path: env::var("MASK_MODEL_PATH")
+                    .unwrap_or_else(|_| "models/mask.onnx".to_string()),
             },
             api: ApiConfig {
                 api_keys,

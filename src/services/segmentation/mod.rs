@@ -28,7 +28,23 @@ use tracing::{debug, info, instrument};
 use crate::core::config::Config;
 
 // Embed the mask model at compile time
+// If LFS not checked out, this will be a small stub - load from runtime path instead
 static MASK_MODEL_BYTES: &[u8] = include_bytes!("../../../models/mask.onnx");
+
+/// Load model bytes from embedded or runtime path
+fn load_model_bytes(config: &Config) -> Result<Vec<u8>> {
+    // Check if embedded model is real (>10KB means it's not an LFS stub)
+    if MASK_MODEL_BYTES.len() > 10_000 {
+        debug!("Using embedded mask model ({} MB)", MASK_MODEL_BYTES.len() as f64 / 1_048_576.0);
+        Ok(MASK_MODEL_BYTES.to_vec())
+    } else {
+        // Load from runtime path
+        let path = &config.detection.mask_model_path;
+        debug!("Loading mask model from: {}", path);
+        std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("Failed to load mask model from {}: {}", path, e))
+    }
+}
 
 /// Session pool for concurrent inference
 pub struct SegmentationSessionPool {
@@ -116,7 +132,9 @@ impl SegmentationService {
     }
 
     fn initialize_with_acceleration(config: &Config) -> Result<(String, Session)> {
-        info!("Loading embedded ONNX model ({} bytes)...", MASK_MODEL_BYTES.len());
+        // Load model bytes (embedded or from runtime path)
+        let model_bytes = load_model_bytes(config)?;
+        info!("Loaded mask model ({:.1} MB)", model_bytes.len() as f64 / 1_048_576.0);
 
         // Check if a specific backend is forced via config
         if let Some(ref backend) = config.detection.inference_backend {
@@ -126,7 +144,7 @@ impl SegmentationService {
                 }
                 forced_backend => {
                     info!("INFERENCE_BACKEND={}, forcing specific backend for segmentation", forced_backend);
-                    return Self::try_forced_backend(forced_backend);
+                    return Self::try_forced_backend(forced_backend, &model_bytes);
                 }
             }
         }
@@ -141,7 +159,7 @@ impl SegmentationService {
                 .and_then(|b| b.with_execution_providers([TensorRTExecutionProvider::default().build()]))
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(MASK_MODEL_BYTES))
+                .and_then(|b| b.commit_from_memory(model_bytes))
             {
                 info!("✓ Using TensorRT acceleration for segmentation");
                 return Ok(("TensorRT".to_string(), session));
@@ -155,7 +173,7 @@ impl SegmentationService {
                 .and_then(|b| b.with_execution_providers([CUDAExecutionProvider::default().build()]))
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(MASK_MODEL_BYTES))
+                .and_then(|b| b.commit_from_memory(model_bytes))
             {
                 info!("✓ Using CUDA acceleration for segmentation");
                 return Ok(("CUDA".to_string(), session));
@@ -169,7 +187,7 @@ impl SegmentationService {
                 .and_then(|b| b.with_execution_providers([CoreMLExecutionProvider::default().build()]))
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(MASK_MODEL_BYTES))
+                .and_then(|b| b.commit_from_memory(model_bytes))
             {
                 info!("✓ Using CoreML acceleration for segmentation (Apple Neural Engine)");
                 return Ok(("CoreML".to_string(), session));
@@ -183,7 +201,7 @@ impl SegmentationService {
                 .and_then(|b| b.with_execution_providers([DirectMLExecutionProvider::default().build()]))
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(MASK_MODEL_BYTES))
+                .and_then(|b| b.commit_from_memory(model_bytes))
             {
                 info!("✓ Using DirectML acceleration for segmentation");
                 return Ok(("DirectML".to_string(), session));
@@ -201,7 +219,7 @@ impl SegmentationService {
                 ]))
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(MASK_MODEL_BYTES))
+                .and_then(|b| b.commit_from_memory(model_bytes))
             {
                 info!("✓ Using OpenVINO acceleration for segmentation (Intel CPU optimizations)");
                 return Ok(("OpenVINO-CPU".to_string(), session));
@@ -213,13 +231,13 @@ impl SegmentationService {
             .with_execution_providers([CPUExecutionProvider::default().build()])?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(num_cpus::get())?
-            .commit_from_memory(MASK_MODEL_BYTES)?;
+            .commit_from_memory(model_bytes)?;
 
         info!("✓ Using CPU for segmentation (no hardware acceleration)");
         Ok(("CPU".to_string(), session))
     }
 
-    fn try_forced_backend(backend: &str) -> Result<(String, Session)> {
+    fn try_forced_backend(backend: &str, model_bytes: &[u8]) -> Result<(String, Session)> {
         match backend {
             #[cfg(feature = "tensorrt")]
             "TENSORRT" => {
@@ -228,7 +246,7 @@ impl SegmentationService {
                     .with_execution_providers([TensorRTExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MASK_MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized TensorRT backend for segmentation");
                 Ok(("TensorRT (forced)".to_string(), session))
             }
@@ -244,7 +262,7 @@ impl SegmentationService {
                     .with_execution_providers([CUDAExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MASK_MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized CUDA backend for segmentation");
                 Ok(("CUDA (forced)".to_string(), session))
             }
@@ -260,7 +278,7 @@ impl SegmentationService {
                     .with_execution_providers([CoreMLExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MASK_MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized CoreML backend for segmentation");
                 Ok(("CoreML (forced)".to_string(), session))
             }
@@ -276,7 +294,7 @@ impl SegmentationService {
                     .with_execution_providers([DirectMLExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MASK_MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized DirectML backend for segmentation");
                 Ok(("DirectML (forced)".to_string(), session))
             }
@@ -296,7 +314,7 @@ impl SegmentationService {
                     ])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MASK_MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized OpenVINO backend for segmentation");
                 Ok(("OpenVINO (forced)".to_string(), session))
             }
@@ -311,7 +329,7 @@ impl SegmentationService {
                     .with_execution_providers([CPUExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(MASK_MODEL_BYTES)?;
+                    .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized CPU backend for segmentation");
                 Ok(("CPU (forced)".to_string(), session))
             }
