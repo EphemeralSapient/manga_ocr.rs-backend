@@ -18,6 +18,10 @@ pub struct Phase4Pipeline {
     renderer: Arc<CosmicTextRenderer>,
 }
 
+// Font sizing constants for optimal comic readability
+const MIN_FONT_SIZE: f32 = 18.0; // Minimum font size for readability
+const MAX_FONT_SIZE: f32 = 32.0; // Maximum font size to prevent oversized text
+
 impl Phase4Pipeline {
     /// Create new Phase 4 pipeline
     pub fn new(config: Arc<Config>) -> Self {
@@ -59,33 +63,33 @@ impl Phase4Pipeline {
             .context("Failed to load image")?
             .to_rgba8();
 
-        // Create lookup maps for faster access
+        // Create lookup maps for faster access (usize keys for zero-cost lookups)
         let mut simple_translations_map = std::collections::HashMap::new();
         for (region_id, translation) in &phase2_output.simple_bg_translations {
-            simple_translations_map.insert(region_id.as_str(), translation);
+            simple_translations_map.insert(*region_id, translation);
         }
 
         let mut complex_translations_map = std::collections::HashMap::new();
         for (region_id, translation) in &phase2_output.complex_bg_translations {
-            complex_translations_map.insert(region_id.as_str(), translation);
+            complex_translations_map.insert(*region_id, translation);
         }
 
         let mut banana_map = std::collections::HashMap::new();
         for banana in &phase2_output.complex_bg_bananas {
-            banana_map.insert(banana.region_id.as_str(), banana);
+            banana_map.insert(banana.region_id, banana);
         }
 
         let mut cleaned_map = std::collections::HashMap::new();
         for (region_id, cleaned_bytes) in &phase3_output.cleaned_regions {
-            cleaned_map.insert(region_id.as_str(), cleaned_bytes);
+            cleaned_map.insert(*region_id, cleaned_bytes);
         }
 
         // Process each region
         for region in &phase1_output.regions {
-            let region_id = region.region_id.as_str();
+            let region_id = region.region_id;
 
             // Check if this region was processed with banana
-            if let Some(banana) = banana_map.get(region_id) {
+            if let Some(banana) = banana_map.get(&region_id) {
                 debug!("Compositing banana result for region {}", region_id);
                 self.composite_banana_result(&mut final_image, region, banana)?;
                 continue;
@@ -93,12 +97,12 @@ impl Phase4Pipeline {
 
             // Otherwise, composite cleaned image + rendered text
             let translation = simple_translations_map
-                .get(region_id)
-                .or_else(|| complex_translations_map.get(region_id))
+                .get(&region_id)
+                .or_else(|| complex_translations_map.get(&region_id))
                 .context(format!("No translation found for region {}", region_id))?;
 
             let cleaned_bytes = cleaned_map
-                .get(region_id)
+                .get(&region_id)
                 .context(format!("No cleaned image found for region {}", region_id))?;
 
             debug!(
@@ -123,6 +127,7 @@ impl Phase4Pipeline {
                 translation,
                 &local_label_1_regions,
             )
+            .await
             .context("Failed to composite rendered text")?;
         }
 
@@ -174,7 +179,7 @@ impl Phase4Pipeline {
     }
 
     /// Composite cleaned region + rendered text onto final image
-    fn composite_rendered_text(
+    async fn composite_rendered_text(
         &self,
         final_image: &mut RgbaImage,
         region: &CategorizedRegion,
@@ -203,7 +208,7 @@ impl Phase4Pipeline {
             height,
             local_label_1_regions,
             &translation.translated_text,
-        )?;
+        ).await?;
 
         // Composite text onto cleaned image with alpha blending
         for y in 0..height {
@@ -239,7 +244,7 @@ impl Phase4Pipeline {
     /// * `canvas_height` - Height of the region
     /// * `label_1_regions` - Text regions in local coordinates (relative to region bbox)
     /// * `text` - Text to render
-    fn render_text_for_region(
+    async fn render_text_for_region(
         &self,
         canvas_width: u32,
         canvas_height: u32,
@@ -282,17 +287,15 @@ impl Phase4Pipeline {
         // Use cosmic-text's built-in optimal font size finder
         // Optimized for comic readability
         let font_family = "arial";
-        let min_font_size = 18.0; // Increased from 14 for better readability
-        let max_font_size = 32.0; // Increased from 28 for larger text
 
         let font_size = self.renderer.find_optimal_font_size(
             text,
             font_family,
             available_width,
             available_height,
-            min_font_size,
-            max_font_size,
-        )?;
+            MIN_FONT_SIZE,
+            MAX_FONT_SIZE,
+        ).await?;
 
         debug!(
             "Dynamic font sizing: area={:.0}x{:.0}px, text_len={}, optimal={:.1}px",
@@ -317,7 +320,7 @@ impl Phase4Pipeline {
             font_family,
             font_size,
             Some(text_width),
-        )?;
+        ).await?;
 
         // Calculate centered position
         let center_offset_x = ((text_width - actual_text_width) / 2.0).max(0.0);
@@ -346,7 +349,7 @@ impl Phase4Pipeline {
             scaled_y,
             scaled_max_width,
             stroke_width,
-        )?;
+        ).await?;
 
         // Downscale back
         let final_canvas = image::imageops::resize(

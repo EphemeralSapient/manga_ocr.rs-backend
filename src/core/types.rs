@@ -63,7 +63,7 @@ pub enum BackgroundType {
 /// Categorized region for processing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategorizedRegion {
-    pub region_id: String, // Unique ID for this region
+    pub region_id: usize, // Unique sequential ID for this region (eliminates UUID heap allocations)
     pub page_index: usize,
     pub label: u8,
     pub bbox: [i32; 4],
@@ -84,16 +84,34 @@ pub struct Phase1Output {
 }
 
 /// OCR/Translation result for simple background
+/// Uses Arc<str> to avoid expensive string cloning on cache access
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OCRTranslation {
-    pub original_text: String,
-    pub translated_text: String,
+    #[serde(serialize_with = "serialize_arc_str", deserialize_with = "deserialize_arc_str")]
+    pub original_text: Arc<str>,
+    #[serde(serialize_with = "serialize_arc_str", deserialize_with = "deserialize_arc_str")]
+    pub translated_text: Arc<str>,
+}
+
+// Serde helpers for Arc<str>
+fn serialize_arc_str<S>(arc_str: &Arc<str>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(arc_str)
+}
+
+fn deserialize_arc_str<'de, D>(deserializer: D) -> Result<Arc<str>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(|s| Arc::from(s.as_str()))
 }
 
 /// Banana mode result for complex background
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BananaResult {
-    pub region_id: String,
+    pub region_id: usize,
     pub translated_image_bytes: Vec<u8>, // Translated image from API
 }
 
@@ -101,9 +119,9 @@ pub struct BananaResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Phase2Output {
     pub page_index: usize,
-    pub simple_bg_translations: Vec<(String, OCRTranslation)>, // (region_id, translation)
+    pub simple_bg_translations: Vec<(usize, OCRTranslation)>, // (region_id, translation)
     pub complex_bg_bananas: Vec<BananaResult>, // Only if banana mode enabled
-    pub complex_bg_translations: Vec<(String, OCRTranslation)>, // Only if banana mode disabled
+    pub complex_bg_translations: Vec<(usize, OCRTranslation)>, // Only if banana mode disabled
 }
 
 /// Phase 3 output: Text removed images
@@ -111,7 +129,7 @@ pub struct Phase2Output {
 pub struct Phase3Output {
     #[allow(dead_code)]
     pub page_index: usize,
-    pub cleaned_regions: Vec<(String, Vec<u8>)>, // (region_id, cleaned image bytes)
+    pub cleaned_regions: Vec<(usize, Vec<u8>)>, // (region_id, cleaned image bytes)
 }
 
 /// Phase 4 output: Final rendered image

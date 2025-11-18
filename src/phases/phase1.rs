@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use image::DynamicImage;
 use rayon::prelude::*;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{debug, instrument, warn};
-use uuid::Uuid;
 
 use crate::core::config::Config;
 use crate::services::detection::DetectionService;
@@ -134,6 +134,7 @@ impl Phase1Pipeline {
         // Process label 0 (speech bubbles) IN PARALLEL with rayon
         let rgb_img = img.to_rgb8();
         let threshold = self.config.simple_bg_white_threshold();
+        let region_id_counter = AtomicUsize::new(page_index * 10000); // Base ID on page index for uniqueness
 
         let l0_results: Vec<_> = label_0.par_iter().map(|l0| {
             // Find all label 1 regions within this label 0
@@ -159,7 +160,7 @@ impl Phase1Pipeline {
             let bg_type = Self::classify_background_fast(&rgb_img, l0.bbox, &children_l1, threshold);
 
             (CategorizedRegion {
-                region_id: Uuid::new_v4().to_string(),
+                region_id: region_id_counter.fetch_add(1, Ordering::Relaxed),
                 page_index,
                 label: 0,
                 bbox: l0.bbox,
@@ -192,7 +193,7 @@ impl Phase1Pipeline {
         // Process label 2 (free text) - always complex
         for l2 in label_2 {
             regions.push(CategorizedRegion {
-                region_id: Uuid::new_v4().to_string(),
+                region_id: region_id_counter.fetch_add(1, Ordering::Relaxed),
                 page_index,
                 label: 2,
                 bbox: l2.bbox,
@@ -235,26 +236,33 @@ impl Phase1Pipeline {
         let img_width = rgb.width() as i32;
         let img_height = rgb.height() as i32;
 
-        // Count white pixels in label 1 regions (parallel iteration)
+        // Count white pixels in label 1 regions (parallel iteration with optimized bounds)
         let (white_pixels, total_pixels): (usize, usize) = label_1_regions.par_iter()
             .map(|l1_bbox| {
                 let [l1_x1, l1_y1, l1_x2, l1_y2] = *l1_bbox;
-                let crop_x1 = l1_x1.max(x1).min(x2);
-                let crop_y1 = l1_y1.max(y1).min(y2);
-                let crop_x2 = l1_x2.max(x1).min(x2).min(img_width);
-                let crop_y2 = l1_y2.max(y1).min(y2).min(img_height);
+
+                // Pre-calculate and clamp bounds to valid range (eliminates per-pixel bounds checking)
+                let crop_x1 = l1_x1.max(x1).max(0).min(img_width) as u32;
+                let crop_y1 = l1_y1.max(y1).max(0).min(img_height) as u32;
+                let crop_x2 = l1_x2.min(x2).max(0).min(img_width) as u32;
+                let crop_y2 = l1_y2.min(y2).max(0).min(img_height) as u32;
+
+                // Early exit for invalid regions
+                if crop_x2 <= crop_x1 || crop_y2 <= crop_y1 {
+                    return (0, 0);
+                }
 
                 let mut local_white = 0usize;
                 let mut local_total = 0usize;
 
+                // No bounds checking needed - already validated above
                 for y in crop_y1..crop_y2 {
                     for x in crop_x1..crop_x2 {
-                        if x >= 0 && y >= 0 && x < img_width && y < img_height {
-                            local_total += 1;
-                            let pixel = rgb.get_pixel(x as u32, y as u32);
-                            if pixel[0] >= 240 && pixel[1] >= 240 && pixel[2] >= 240 {
-                                local_white += 1;
-                            }
+                        local_total += 1;
+                        let pixel = rgb.get_pixel(x, y);
+                        // Optimized: single comparison for all channels (white = RGB all >= 240)
+                        if pixel[0] >= 240 && pixel[1] >= 240 && pixel[2] >= 240 {
+                            local_white += 1;
                         }
                     }
                 }

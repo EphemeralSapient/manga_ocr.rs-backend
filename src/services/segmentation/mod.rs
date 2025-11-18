@@ -3,29 +3,13 @@
 use anyhow::{Context, Result};
 use image::{DynamicImage, ImageBuffer, Luma};
 use ndarray::{Array2, Array4, Axis};
-use ort::execution_providers::CPUExecutionProvider;
-
-#[cfg(feature = "cuda")]
-use ort::execution_providers::CUDAExecutionProvider;
-
-#[cfg(feature = "tensorrt")]
-use ort::execution_providers::TensorRTExecutionProvider;
-
-#[cfg(feature = "openvino")]
-use ort::execution_providers::OpenVINOExecutionProvider;
-
-#[cfg(all(target_os = "windows", feature = "directml"))]
-use ort::execution_providers::DirectMLExecutionProvider;
-
-#[cfg(all(target_os = "macos", feature = "coreml"))]
-use ort::execution_providers::CoreMLExecutionProvider;
-
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::Session;
 use std::sync::Arc;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::{debug, info, instrument};
 
 use crate::core::config::Config;
+use crate::services::onnx_builder;
 
 // Embed the mask model at compile time
 // If LFS not checked out, this will be a small stub - load from runtime path instead
@@ -151,231 +135,16 @@ impl SegmentationService {
                 model_bytes[0], model_bytes[1], model_bytes[2], model_bytes[3]);
         }
 
-        // Check if a specific backend is forced via config
-        if let Some(ref backend) = config.detection.inference_backend {
-            match backend.as_str() {
-                "AUTO" => {
-                    info!("INFERENCE_BACKEND=AUTO, using automatic detection");
-                }
-                forced_backend => {
-                    info!("INFERENCE_BACKEND={}, forcing specific backend for segmentation", forced_backend);
-                    return Self::try_forced_backend(forced_backend, &model_bytes);
-                }
-            }
-        }
+        // Use shared ONNX session builder (eliminates ~220 lines of duplication)
+        let model_size_mb = model_bytes.len() as f32 / 1_048_576.0;
+        let (backend, session) = onnx_builder::build_session_with_acceleration(
+            &model_bytes,
+            "segmentation",
+            model_size_mb
+        )?;
 
-        // Try hardware acceleration in order of preference
-        // Only attempt providers that are compiled in via Cargo features
 
-        // Try TensorRT (if feature enabled)
-        #[cfg(feature = "tensorrt")]
-        {
-            if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([TensorRTExecutionProvider::default().build()]))
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-                .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(model_bytes))
-            {
-                info!("✓ Using TensorRT acceleration for segmentation");
-                return Ok(("TensorRT".to_string(), session));
-            }
-        }
-
-        // Try CUDA (if feature enabled)
-        #[cfg(feature = "cuda")]
-        {
-            if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([CUDAExecutionProvider::default().build()]))
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-                .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(model_bytes))
-            {
-                info!("✓ Using CUDA acceleration for segmentation");
-                return Ok(("CUDA".to_string(), session));
-            }
-        }
-
-        // Try CoreML (Apple Silicon, if feature enabled)
-        #[cfg(all(target_os = "macos", feature = "coreml"))]
-        {
-            if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([CoreMLExecutionProvider::default().build()]))
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-                .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(model_bytes))
-            {
-                info!("✓ Using CoreML acceleration for segmentation (Apple Neural Engine)");
-                return Ok(("CoreML".to_string(), session));
-            }
-        }
-
-        // Try DirectML (Windows, if feature enabled)
-        #[cfg(all(target_os = "windows", feature = "directml"))]
-        {
-            if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([DirectMLExecutionProvider::default().build()]))
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-                .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(model_bytes))
-            {
-                info!("✓ Using DirectML acceleration for segmentation");
-                return Ok(("DirectML".to_string(), session));
-            }
-        }
-
-        // Try OpenVINO (Intel CPU optimization, if feature enabled)
-        #[cfg(feature = "openvino")]
-        {
-            if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([
-                    OpenVINOExecutionProvider::default()
-                        .with_device_type("CPU")
-                        .build()
-                ]))
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-                .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(model_bytes))
-            {
-                info!("✓ Using OpenVINO acceleration for segmentation (Intel CPU optimizations)");
-                return Ok(("OpenVINO-CPU".to_string(), session));
-            }
-        }
-
-        // Final fallback: Pure CPU (no acceleration)
-        let session = Session::builder()
-            .context("Failed to create ONNX session builder for segmentation")?
-            .with_execution_providers([CPUExecutionProvider::default().build()])
-            .context("Failed to configure CPU execution provider for segmentation")?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .context("Failed to set graph optimization level for segmentation")?
-            .with_intra_threads(num_cpus::get())
-            .context("Failed to configure intra-op threads for segmentation")?
-            .commit_from_memory(&model_bytes)
-            .context(format!(
-                "Failed to load mask ONNX model from memory ({:.1} MB). \
-                This usually indicates:\n  \
-                1. Model file corruption during transfer (verify with: ./verify_models.sh or verify_models.ps1)\n  \
-                2. ONNX Runtime version/platform mismatch\n  \
-                3. Model created with incompatible ONNX opset version\n  \
-                4. Platform-specific binary incompatibility ({}/{})\n  \
-                Solutions:\n  \
-                - Run checksum verification: ./verify_models.sh (Linux/Mac) or .\\verify_models.ps1 (Windows)\n  \
-                - Re-download/re-transfer the models if checksums fail\n  \
-                - Ensure the model was created with ONNX opset <= 18\n  \
-                - Check that the binary matches your platform",
-                model_bytes.len() as f64 / 1_048_576.0,
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            ))?;
-
-        info!("✓ Using CPU for segmentation (no hardware acceleration)");
-        Ok(("CPU".to_string(), session))
-    }
-
-    fn try_forced_backend(backend: &str, model_bytes: &[u8]) -> Result<(String, Session)> {
-        match backend {
-            #[cfg(feature = "tensorrt")]
-            "TENSORRT" => {
-                info!("Forcing TensorRT backend for segmentation...");
-                let session = Session::builder()?
-                    .with_execution_providers([TensorRTExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(&model_bytes)?;
-                info!("✓ Successfully initialized TensorRT backend for segmentation");
-                Ok(("TensorRT (forced)".to_string(), session))
-            }
-            #[cfg(not(feature = "tensorrt"))]
-            "TENSORRT" => {
-                anyhow::bail!("TensorRT backend not available. Rebuild with: cargo build --features tensorrt")
-            }
-
-            #[cfg(feature = "cuda")]
-            "CUDA" => {
-                info!("Forcing CUDA backend for segmentation...");
-                let session = Session::builder()?
-                    .with_execution_providers([CUDAExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(&model_bytes)?;
-                info!("✓ Successfully initialized CUDA backend for segmentation");
-                Ok(("CUDA (forced)".to_string(), session))
-            }
-            #[cfg(not(feature = "cuda"))]
-            "CUDA" => {
-                anyhow::bail!("CUDA backend not available. Rebuild with: cargo build --features cuda")
-            }
-
-            #[cfg(all(target_os = "macos", feature = "coreml"))]
-            "COREML" => {
-                info!("Forcing CoreML backend for segmentation...");
-                let session = Session::builder()?
-                    .with_execution_providers([CoreMLExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(&model_bytes)?;
-                info!("✓ Successfully initialized CoreML backend for segmentation");
-                Ok(("CoreML (forced)".to_string(), session))
-            }
-            #[cfg(not(all(target_os = "macos", feature = "coreml")))]
-            "COREML" => {
-                anyhow::bail!("CoreML backend not available. Only available on macOS with: cargo build --features coreml")
-            }
-
-            #[cfg(all(target_os = "windows", feature = "directml"))]
-            "DIRECTML" => {
-                info!("Forcing DirectML backend for segmentation...");
-                let session = Session::builder()?
-                    .with_execution_providers([DirectMLExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(&model_bytes)?;
-                info!("✓ Successfully initialized DirectML backend for segmentation");
-                Ok(("DirectML (forced)".to_string(), session))
-            }
-            #[cfg(not(all(target_os = "windows", feature = "directml")))]
-            "DIRECTML" => {
-                anyhow::bail!("DirectML backend not available. Only available on Windows with: cargo build --features directml")
-            }
-
-            #[cfg(feature = "openvino")]
-            "OPENVINO" => {
-                info!("Forcing OpenVINO backend for segmentation...");
-                let session = Session::builder()?
-                    .with_execution_providers([
-                        OpenVINOExecutionProvider::default()
-                            .with_device_type("CPU")
-                            .build()
-                    ])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(&model_bytes)?;
-                info!("✓ Successfully initialized OpenVINO backend for segmentation");
-                Ok(("OpenVINO (forced)".to_string(), session))
-            }
-            #[cfg(not(feature = "openvino"))]
-            "OPENVINO" => {
-                anyhow::bail!("OpenVINO backend not available. Rebuild with: cargo build --features openvino")
-            }
-
-            "CPU" => {
-                info!("Forcing CPU backend for segmentation...");
-                let session = Session::builder()?
-                    .with_execution_providers([CPUExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(&model_bytes)?;
-                info!("✓ Successfully initialized CPU backend for segmentation");
-                Ok(("CPU (forced)".to_string(), session))
-            }
-
-            _ => {
-                anyhow::bail!(
-                    "Unknown inference backend: {}. Supported: CUDA, TENSORRT, DIRECTML, COREML, OPENVINO, CPU",
-                    backend
-                )
-            }
-        }
+        Ok((backend, session))
     }
 
     /// Generate segmentation mask for an image

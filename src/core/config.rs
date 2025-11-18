@@ -54,8 +54,6 @@ pub struct BackgroundConfig {
 #[derive(Debug, Clone)]
 pub struct RenderingConfig {
     pub upscale_factor: u32,
-    #[allow(dead_code)]
-    pub padding_ratio: f32,
     pub text_stroke_enabled: bool,
     pub text_stroke_width: i32,
     pub blur_free_text: bool,
@@ -195,10 +193,6 @@ impl Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(3),
-                padding_ratio: env::var("PADDING_RATIO")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.05),
                 text_stroke_enabled: env::var("TEXT_STROKE_ENABLED")
                     .ok()
                     .and_then(|s| s.parse().ok())

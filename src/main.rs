@@ -137,9 +137,18 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Detailed statistics endpoint (JSON)
-async fn stats_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
+async fn stats_endpoint(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let snapshot = state.metrics.snapshot();
-    Json(serde_json::to_value(snapshot).unwrap())
+    serde_json::to_value(snapshot)
+        .map(Json)
+        .map_err(|e| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to serialize metrics: {}", e),
+            )
+        })
 }
 
 /// Process images endpoint

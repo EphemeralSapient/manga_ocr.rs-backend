@@ -186,13 +186,13 @@ impl ApiClient {
                 let batch_response: BatchOCRResponse = serde_json::from_str(translations_json)
                     .context("Failed to parse batch OCR response")?;
 
-                // Convert to OCRTranslation
+                // Convert to OCRTranslation with Arc<str> for efficient cloning
                 let results = batch_response
                     .translations
                     .into_iter()
                     .map(|t| OCRTranslation {
-                        original_text: t.original_text,
-                        translated_text: t.translated_text,
+                        original_text: Arc::from(t.original_text.as_str()),
+                        translated_text: Arc::from(t.translated_text.as_str()),
                     })
                     .collect();
 
@@ -223,7 +223,7 @@ impl ApiClient {
     #[instrument(skip(self, image_bytes), fields(region_id = region_id))]
     pub async fn banana_translate(
         &self,
-        region_id: String,
+        region_id: usize,
         image_bytes: Vec<u8>,
     ) -> Result<BananaResult> {
         debug!("Banana mode translation for region {}", region_id);

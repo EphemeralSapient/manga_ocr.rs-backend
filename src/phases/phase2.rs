@@ -131,7 +131,7 @@ impl Phase2Pipeline {
         img: &DynamicImage,
         regions: &[&CategorizedRegion],
         batch_size_m: usize,
-    ) -> Result<Vec<(String, OCRTranslation)>> {
+    ) -> Result<Vec<(usize, OCRTranslation)>> {
         let mut results = Vec::new();
 
         // Process in batches of M
@@ -140,7 +140,7 @@ impl Phase2Pipeline {
 
             // Extract image crops and check cache
             let mut image_bytes_batch = Vec::new();
-            let mut region_data: Vec<(String, Vec<u8>, [i32; 4])> = Vec::new();
+            let mut region_data: Vec<(usize, Vec<u8>, [i32; 4])> = Vec::new();
 
             for region in batch.iter() {
                 let [x1, y1, x2, y2] = region.bbox;
@@ -164,11 +164,11 @@ impl Phase2Pipeline {
                 // Check cache
                 if let Some(cached_translation) = self.cache.get(&cache_key) {
                     debug!("Cache HIT for region {}", region.region_id);
-                    results.push((region.region_id.clone(), cached_translation));
+                    results.push((region.region_id, cached_translation));
                 } else {
                     debug!("Cache MISS for region {}", region.region_id);
                     image_bytes_batch.push(png_bytes.clone());
-                    region_data.push((region.region_id.clone(), png_bytes, region.bbox));
+                    region_data.push((region.region_id, png_bytes, region.bbox));
                 }
             }
 
@@ -227,7 +227,7 @@ impl Phase2Pipeline {
                 )
                 .context("Failed to encode cropped image")?;
 
-            let region_id = region.region_id.clone();
+            let region_id = region.region_id;
             let api_client = Arc::clone(&self.api_client);
 
             // Spawn concurrent tasks for each banana call

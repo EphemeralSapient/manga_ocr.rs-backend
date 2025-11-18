@@ -4,7 +4,8 @@ use cosmic_text::{
     Weight as CosmicWeight, Wrap,
 };
 use image::{Rgba, RgbaImage};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 /// High-quality text renderer using cosmic-text
@@ -90,21 +91,6 @@ impl CosmicTextRenderer {
         }
     }
 
-    /// Parse RGB color string to cosmic-text Color
-    #[allow(dead_code)]
-    fn parse_rgb_color(color_str: &str) -> CosmicColor {
-        let parts: Vec<&str> = color_str.split(',').collect();
-        if parts.len() == 3 {
-            if let (Ok(r), Ok(g), Ok(b)) = (
-                parts[0].trim().parse::<u8>(),
-                parts[1].trim().parse::<u8>(),
-                parts[2].trim().parse::<u8>(),
-            ) {
-                return CosmicColor::rgba(r, g, b, 255);
-            }
-        }
-        CosmicColor::rgba(255, 255, 255, 255)
-    }
 
     /// Determine optimal stroke color based on fill color
     fn get_stroke_color(fill_color: Rgba<u8>) -> Rgba<u8> {
@@ -119,16 +105,14 @@ impl CosmicTextRenderer {
 
     /// Measure text dimensions with cosmic-text
     /// Returns (width, height) in pixels
-    #[allow(dead_code)]
-    pub fn measure_text(
+    pub async fn measure_text(
         &self,
         text: &str,
         font_family: &str,
         font_size: f32,
         max_width: Option<f32>,
     ) -> Result<(f32, f32)> {
-        let mut font_system = self.font_system.lock()
-            .expect("Font system mutex poisoned - indicates a panic in another thread");
+        let mut font_system = self.font_system.lock().await;
 
         let family = Self::parse_font_family(font_family);
         let weight = Self::is_bold_font(font_family);
@@ -163,8 +147,7 @@ impl CosmicTextRenderer {
     }
 
     /// Render text with advanced shaping and optional stroke
-    #[allow(dead_code)]
-    pub fn render_text(
+    pub async fn render_text(
         &self,
         img: &mut RgbaImage,
         text: &str,
@@ -199,20 +182,20 @@ impl CosmicTextRenderer {
                             x + offset_x,
                             y + offset_y,
                             max_width,
-                        )?;
+                        ).await?;
                     }
                 }
             }
         }
 
         // Render fill text
-        self.render_text_internal(img, text, font_family, font_size, color, x, y, max_width)?;
+        self.render_text_internal(img, text, font_family, font_size, color, x, y, max_width).await?;
 
         Ok(())
     }
 
     /// Internal text rendering implementation
-    fn render_text_internal(
+    async fn render_text_internal(
         &self,
         img: &mut RgbaImage,
         text: &str,
@@ -223,10 +206,8 @@ impl CosmicTextRenderer {
         y: i32,
         max_width: Option<f32>,
     ) -> Result<()> {
-        let mut font_system = self.font_system.lock()
-            .expect("Font system mutex poisoned - indicates a panic in another thread");
-        let mut swash_cache = self.swash_cache.lock()
-            .expect("Swash cache mutex poisoned - indicates a panic during text rendering");
+        let mut font_system = self.font_system.lock().await;
+        let mut swash_cache = self.swash_cache.lock().await;
 
         let family = Self::parse_font_family(font_family);
         let weight = Self::is_bold_font(font_family);
@@ -280,8 +261,7 @@ impl CosmicTextRenderer {
     }
 
     /// Render multi-line text with automatic layout
-    #[allow(dead_code)]
-    pub fn render_multiline_text(
+    pub async fn render_multiline_text(
         &self,
         img: &mut RgbaImage,
         text: &str,
@@ -298,8 +278,7 @@ impl CosmicTextRenderer {
         debug!("Rendering multi-line text: size={:.1}px, max_width={:.0}px, max_height={:.0}px",
                font_size, max_width, max_height);
 
-        let mut font_system = self.font_system.lock()
-            .expect("Font system mutex poisoned - indicates a panic in another thread");
+        let mut font_system = self.font_system.lock().await;
 
         let family = Self::parse_font_family(font_family);
         let weight = Self::is_bold_font(font_family);
@@ -359,21 +338,20 @@ impl CosmicTextRenderer {
                             x + offset_x,
                             y + y_offset + offset_y,
                             Some(max_width),
-                        )?;
+                        ).await?;
                     }
                 }
             }
         }
 
         // Render fill
-        self.render_text_internal(img, text, font_family, font_size, color, x, y + y_offset, Some(max_width))?;
+        self.render_text_internal(img, text, font_family, font_size, color, x, y + y_offset, Some(max_width)).await?;
 
         Ok(())
     }
 
     /// Find optimal font size to fit text in given dimensions
-    #[allow(dead_code)]
-    pub fn find_optimal_font_size(
+    pub async fn find_optimal_font_size(
         &self,
         text: &str,
         font_family: &str,
@@ -389,7 +367,7 @@ impl CosmicTextRenderer {
         // Binary search for optimal font size
         for _ in 0..25 {
             let mid = (low + high) / 2.0;
-            let (width, height) = self.measure_text(text, font_family, mid, Some(max_width))?;
+            let (width, height) = self.measure_text(text, font_family, mid, Some(max_width)).await?;
 
             if width <= max_width && height <= max_height {
                 best_size = mid;
@@ -405,7 +383,6 @@ impl CosmicTextRenderer {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub enum VerticalAlign {
     Top,
     Middle,

@@ -124,7 +124,12 @@ impl BatchOrchestrator {
 
             let task = tokio::spawn(async move {
                 // Acquire semaphore permit
-                let _permit = semaphore.acquire().await.expect("Semaphore closed");
+                let _permit = match semaphore.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        return Err(anyhow::anyhow!("Semaphore closed - orchestrator shutting down"));
+                    }
+                };
 
                 process_single_batch(phase1, phase2, phase3, phase4, batch).await
             });
@@ -306,10 +311,10 @@ async fn process_single_page(
     metrics.api_calls_complex = phase2_output.complex_bg_translations.len() / 5; // Approximation
 
     // Collect banana-processed region IDs
-    let banana_region_ids: Vec<String> = phase2_output
+    let banana_region_ids: Vec<usize> = phase2_output
         .complex_bg_bananas
         .iter()
-        .map(|b| b.region_id.clone())
+        .map(|b| b.region_id)
         .collect();
 
     // Phase 3: Text Removal

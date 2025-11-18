@@ -17,6 +17,10 @@ pub struct Phase3Pipeline {
     config: Arc<Config>,
 }
 
+// Mask erosion constants for text region refinement
+const EROSION_KERNEL_SIZE: i32 = 7;
+const EROSION_ITERATIONS: i32 = 4;
+
 impl Phase3Pipeline {
     /// Create new Phase 3 pipeline
     pub fn new(config: Arc<Config>) -> Self {
@@ -47,7 +51,7 @@ impl Phase3Pipeline {
         &self,
         image_data: &ImageData,
         phase1_output: &Phase1Output,
-        banana_processed_region_ids: &[String],
+        banana_processed_region_ids: &[usize],
     ) -> Result<Phase3Output> {
         debug!(
             "Phase 3: Text removal for page {}",
@@ -91,7 +95,7 @@ impl Phase3Pipeline {
                 .clean_region(&img, region, &seg_mask)
                 .context("Failed to clean region")?;
 
-            cleaned_regions.push((region.region_id.clone(), cleaned_bytes));
+            cleaned_regions.push((region.region_id, cleaned_bytes));
         }
 
         Ok(Phase3Output {
@@ -147,17 +151,22 @@ impl Phase3Pipeline {
         }
 
         // Erode label 1 mask (minimal_code.py lines 47-48)
-        let erosion_kernel = 7;
-        let erosion_iterations = 4;
-        let eroded_label_1_mask = self.opencv_erode(&label_1_mask, erosion_kernel, erosion_iterations)?;
+        let eroded_label_1_mask = self.opencv_erode(&label_1_mask, EROSION_KERNEL_SIZE, EROSION_ITERATIONS)?;
 
-        // Crop segmentation mask to region
+        // Crop segmentation mask to region (optimized with pre-calculated bounds)
+        let src_x1 = x1 as u32;
+        let src_y1 = y1 as u32;
+        let max_w = seg_mask.width().saturating_sub(src_x1);
+        let max_h = seg_mask.height().saturating_sub(src_y1);
+        let crop_w = width.min(max_w);
+        let crop_h = height.min(max_h);
+
         let mut seg_mask_cropped = ImageBuffer::<Luma<u8>, Vec<u8>>::new(width, height);
-        for y in 0..height {
-            for x in 0..width {
-                let src_x = (x1 as u32 + x).min(seg_mask.width() - 1);
-                let src_y = (y1 as u32 + y).min(seg_mask.height() - 1);
-                let pixel = seg_mask.get_pixel(src_x, src_y);
+
+        // Optimized: Only copy valid pixels, skip bounds checking in loop
+        for y in 0..crop_h {
+            for x in 0..crop_w {
+                let pixel = seg_mask.get_pixel(src_x1 + x, src_y1 + y);
                 seg_mask_cropped.put_pixel(x, y, *pixel);
             }
         }

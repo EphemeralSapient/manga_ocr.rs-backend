@@ -13,10 +13,28 @@ use crate::core::types::OCRTranslation;
 use crate::utils::Metrics;
 
 /// Cache entry for translation
+/// Uses Arc<str> to avoid expensive string cloning
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheEntry {
-    original_text: String,
-    translated_text: String,
+    #[serde(serialize_with = "serialize_arc_str", deserialize_with = "deserialize_arc_str")]
+    original_text: Arc<str>,
+    #[serde(serialize_with = "serialize_arc_str", deserialize_with = "deserialize_arc_str")]
+    translated_text: Arc<str>,
+}
+
+// Serde helpers for Arc<str>
+fn serialize_arc_str<S>(arc_str: &Arc<str>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(arc_str)
+}
+
+fn deserialize_arc_str<'de, D>(deserializer: D) -> Result<Arc<str>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(|s| Arc::from(s.as_str()))
 }
 
 /// Enhanced translation cache with async I/O, LRU eviction, and debounced persistence.
@@ -138,6 +156,7 @@ impl TranslationCache {
     }
 
     /// Get translation from cache
+    /// Arc<str> cloning is cheap (just increments ref count)
     pub fn get(&self, key: &str) -> Option<OCRTranslation> {
         let mut cache = self.inner.cache.write();
         let entry = cache.get(key)?;
@@ -147,17 +166,19 @@ impl TranslationCache {
             m.record_cache_hit();
         }
 
+        // Arc::clone is cheap - just increments the reference count
         Some(OCRTranslation {
-            original_text: entry.original_text.clone(),
-            translated_text: entry.translated_text.clone(),
+            original_text: Arc::clone(&entry.original_text),
+            translated_text: Arc::clone(&entry.translated_text),
         })
     }
 
     /// Store translation in cache (non-blocking with debounced persistence)
+    /// Arc<str> cloning is cheap (just increments ref count)
     pub fn put(&self, key: String, translation: &OCRTranslation) {
         let entry = CacheEntry {
-            original_text: translation.original_text.clone(),
-            translated_text: translation.translated_text.clone(),
+            original_text: Arc::clone(&translation.original_text),
+            translated_text: Arc::clone(&translation.translated_text),
         };
 
         {
@@ -287,8 +308,8 @@ mod tests {
         .unwrap();
 
         let translation = OCRTranslation {
-            original_text: "こんにちは".to_string(),
-            translated_text: "Hello".to_string(),
+            original_text: Arc::from("こんにちは"),
+            translated_text: Arc::from("Hello"),
         };
 
         let key = TranslationCache::generate_key(b"test_image_bytes", &[0, 0, 100, 100]);
@@ -296,7 +317,7 @@ mod tests {
 
         let retrieved = cache.get(&key);
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().translated_text, "Hello");
+        assert_eq!(retrieved.unwrap().translated_text.as_ref(), "Hello");
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all(".cache_test").await;
