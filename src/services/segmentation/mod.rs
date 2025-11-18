@@ -231,7 +231,7 @@ impl SegmentationService {
             .with_execution_providers([CPUExecutionProvider::default().build()])?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
             .with_intra_threads(num_cpus::get())?
-            .commit_from_memory(model_bytes)?;
+            .commit_from_memory(&model_bytes)?;
 
         info!("✓ Using CPU for segmentation (no hardware acceleration)");
         Ok(("CPU".to_string(), session))
@@ -246,7 +246,7 @@ impl SegmentationService {
                     .with_execution_providers([TensorRTExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
+                    .commit_from_memory(&model_bytes)?;
                 info!("✓ Successfully initialized TensorRT backend for segmentation");
                 Ok(("TensorRT (forced)".to_string(), session))
             }
@@ -262,7 +262,7 @@ impl SegmentationService {
                     .with_execution_providers([CUDAExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
+                    .commit_from_memory(&model_bytes)?;
                 info!("✓ Successfully initialized CUDA backend for segmentation");
                 Ok(("CUDA (forced)".to_string(), session))
             }
@@ -278,7 +278,7 @@ impl SegmentationService {
                     .with_execution_providers([CoreMLExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
+                    .commit_from_memory(&model_bytes)?;
                 info!("✓ Successfully initialized CoreML backend for segmentation");
                 Ok(("CoreML (forced)".to_string(), session))
             }
@@ -294,7 +294,7 @@ impl SegmentationService {
                     .with_execution_providers([DirectMLExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
+                    .commit_from_memory(&model_bytes)?;
                 info!("✓ Successfully initialized DirectML backend for segmentation");
                 Ok(("DirectML (forced)".to_string(), session))
             }
@@ -314,7 +314,7 @@ impl SegmentationService {
                     ])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
+                    .commit_from_memory(&model_bytes)?;
                 info!("✓ Successfully initialized OpenVINO backend for segmentation");
                 Ok(("OpenVINO (forced)".to_string(), session))
             }
@@ -329,7 +329,7 @@ impl SegmentationService {
                     .with_execution_providers([CPUExecutionProvider::default().build()])?
                     .with_optimization_level(GraphOptimizationLevel::Level3)?
                     .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
+                    .commit_from_memory(&model_bytes)?;
                 info!("✓ Successfully initialized CPU backend for segmentation");
                 Ok(("CPU (forced)".to_string(), session))
             }
