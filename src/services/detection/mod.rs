@@ -1,6 +1,6 @@
 use crate::core::config::Config;
 use crate::core::types::BubbleDetection;
-use crate::services::onnx_builder::{self, OnnxSessionPool};
+use crate::services::onnx_builder::OnnxSessionPool;
 use anyhow::{Result, Context};
 use image::DynamicImage;
 use ndarray::{Array2, Array4};

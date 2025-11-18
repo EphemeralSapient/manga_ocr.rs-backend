@@ -75,6 +75,7 @@ impl ApiClient {
     ///
     /// # Arguments
     /// * `image_bytes_batch` - Vector of image bytes to process
+    /// * `model_override` - Optional model name to override the default from config
     ///
     /// # Returns
     /// Vector of OCRTranslation results
@@ -82,6 +83,7 @@ impl ApiClient {
     pub async fn ocr_translate_batch(
         &self,
         image_bytes_batch: Vec<Vec<u8>>,
+        model_override: Option<&str>,
     ) -> Result<Vec<OCRTranslation>> {
         debug!("OCR/Translation batch of {} images", image_bytes_batch.len());
 
@@ -101,7 +103,7 @@ impl ApiClient {
             .context("No healthy API keys available")?;
 
         // Prepare request
-        let model = self.config.ocr_translation_model();
+        let model = model_override.unwrap_or_else(|| self.config.ocr_translation_model());
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
             model, api_key
@@ -223,6 +225,7 @@ impl ApiClient {
     /// # Arguments
     /// * `region_id` - Unique region identifier
     /// * `image_bytes` - Image bytes of the region
+    /// * `model_override` - Optional model name to override the default from config
     ///
     /// # Returns
     /// BananaResult with translated image
@@ -231,6 +234,7 @@ impl ApiClient {
         &self,
         region_id: usize,
         image_bytes: Vec<u8>,
+        model_override: Option<&str>,
     ) -> Result<BananaResult> {
         debug!("Banana mode translation for region {}", region_id);
 
@@ -250,7 +254,7 @@ impl ApiClient {
             .context("No healthy API keys available")?;
 
         // Prepare request
-        let model = self.config.banana_image_model();
+        let model = model_override.unwrap_or_else(|| self.config.banana_image_model());
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
             model, api_key

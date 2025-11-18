@@ -247,40 +247,92 @@ class MangaClient:
         regions_table.add_column("Metric", style="cyan", no_wrap=True)
         regions_table.add_column("Value", style="magenta", justify="right")
 
+        regions_table.add_row("Total Images", str(analytics.get('total_images', 0)))
         regions_table.add_row("Total Regions", str(analytics.get('total_regions', 0)))
         regions_table.add_row("Simple Background", str(analytics.get('simple_bg_count', 0)))
         regions_table.add_row("Complex Background", str(analytics.get('complex_bg_count', 0)))
+
+        # Validation warnings
+        warnings = analytics.get('validation_warnings', 0)
+        if warnings > 0:
+            regions_table.add_row("⚠️  Validation Warnings", str(warnings))
 
         # API calls
         api_simple = analytics.get('api_calls_simple', 0)
         api_complex = analytics.get('api_calls_complex', 0)
         api_banana = analytics.get('api_calls_banana', 0)
-        regions_table.add_row("API Calls", f"{api_simple} + {api_complex} + {api_banana} = {api_simple + api_complex + api_banana}")
+        regions_table.add_row("API Calls (OCR Simple)", str(api_simple))
+        regions_table.add_row("API Calls (OCR Complex)", str(api_complex))
+        regions_table.add_row("API Calls (Banana)", str(api_banana))
+        regions_table.add_row("API Calls (Total)", str(api_simple + api_complex + api_banana))
+
+        # Token usage
+        input_tokens = analytics.get('input_tokens', 0)
+        output_tokens = analytics.get('output_tokens', 0)
+        if input_tokens > 0 or output_tokens > 0:
+            regions_table.add_row("Input Tokens", f"{input_tokens:,}")
+            regions_table.add_row("Output Tokens", f"{output_tokens:,}")
+            regions_table.add_row("Total Tokens", f"{input_tokens + output_tokens:,}")
 
         # Cache stats
         cache_hits = analytics.get('cache_hits', 0)
         cache_misses = analytics.get('cache_misses', 0)
         total_cache = cache_hits + cache_misses
         cache_rate = f"{(cache_hits/total_cache*100):.1f}%" if total_cache > 0 else "N/A"
-        regions_table.add_row("Cache", f"{cache_hits}/{total_cache} ({cache_rate})")
+        regions_table.add_row("Cache Hits", str(cache_hits))
+        regions_table.add_row("Cache Misses", str(cache_misses))
+        regions_table.add_row("Cache Hit Rate", cache_rate)
 
         # Timing table
         timing_table = Table(title="⏱️  Phase Timings", box=box.ROUNDED, border_style="green")
         timing_table.add_column("Phase", style="green")
         timing_table.add_column("Time", style="yellow", justify="right")
+        timing_table.add_column("Percentage", style="cyan", justify="right")
 
-        timing_table.add_row("Phase 1 (Detection)", f"{analytics.get('phase1_time_ms', 0):.0f} ms")
-        timing_table.add_row("Phase 2 (Segmentation)", f"{analytics.get('phase2_time_ms', 0):.0f} ms")
-        timing_table.add_row("Phase 3 (Translation)", f"{analytics.get('phase3_time_ms', 0):.0f} ms")
-        timing_table.add_row("Phase 4 (Rendering)", f"{analytics.get('phase4_time_ms', 0):.0f} ms")
+        phase1_time = analytics.get('phase1_time_ms', 0)
+        phase2_time = analytics.get('phase2_time_ms', 0)
+        phase3_time = analytics.get('phase3_time_ms', 0)
+        phase4_time = analytics.get('phase4_time_ms', 0)
+        total_time = analytics.get('total_time_ms', 0)
 
-        total_time = sum([
-            analytics.get('phase1_time_ms', 0),
-            analytics.get('phase2_time_ms', 0),
-            analytics.get('phase3_time_ms', 0),
-            analytics.get('phase4_time_ms', 0)
-        ])
-        timing_table.add_row("[bold]Total[/bold]", f"[bold]{total_time:.0f} ms ({total_time/1000:.2f}s)[/bold]")
+        # If total_time is not provided, calculate from phases
+        if total_time == 0:
+            total_time = phase1_time + phase2_time + phase3_time + phase4_time
+
+        timing_table.add_row(
+            "Phase 1 (Detection)",
+            f"{phase1_time:.0f} ms",
+            f"{(phase1_time/total_time*100):.1f}%" if total_time > 0 else "N/A"
+        )
+        timing_table.add_row(
+            "Phase 2 (Translation)",
+            f"{phase2_time:.0f} ms",
+            f"{(phase2_time/total_time*100):.1f}%" if total_time > 0 else "N/A"
+        )
+        timing_table.add_row(
+            "Phase 3 (Text Removal)",
+            f"{phase3_time:.0f} ms",
+            f"{(phase3_time/total_time*100):.1f}%" if total_time > 0 else "N/A"
+        )
+        timing_table.add_row(
+            "Phase 4 (Rendering)",
+            f"{phase4_time:.0f} ms",
+            f"{(phase4_time/total_time*100):.1f}%" if total_time > 0 else "N/A"
+        )
+
+        # Additional timing metrics
+        inference_time = analytics.get('inference_time_ms', 0)
+        api_wait_time = analytics.get('api_wait_time_ms', 0)
+        if inference_time > 0:
+            timing_table.add_row("Inference Time", f"{inference_time:.0f} ms", "")
+        if api_wait_time > 0:
+            timing_table.add_row("API Wait Time", f"{api_wait_time:.0f} ms", "")
+
+        timing_table.add_row(
+            "[bold]Total Processing[/bold]",
+            f"[bold]{total_time:.0f} ms ({total_time/1000:.2f}s)[/bold]",
+            "[bold]100%[/bold]"
+        )
 
         self.console.print()
         self.console.print(regions_table)
@@ -445,6 +497,8 @@ Examples:
     parser.add_argument('-f', '--font', default='arial', help='Font family (default: arial)')
     parser.add_argument('-s', '--server', default='http://localhost:1429', help='Server URL (default: http://localhost:1429)')
     parser.add_argument('--no-wait', action='store_true', help='Skip server health check')
+    parser.add_argument('--ocr-model', type=str, help='OCR/Translation model override (e.g., gemini-2.5-flash)')
+    parser.add_argument('--banana-model', type=str, help='Banana image model override (e.g., gemini-2.5-flash-image)')
 
     args = parser.parse_args()
 
@@ -466,6 +520,10 @@ Examples:
         sys.exit(1)
 
     config = {"font_family": args.font}
+    if args.ocr_model:
+        config["ocr_translation_model"] = args.ocr_model
+    if args.banana_model:
+        config["banana_image_model"] = args.banana_model
 
     # Process
     console.print()

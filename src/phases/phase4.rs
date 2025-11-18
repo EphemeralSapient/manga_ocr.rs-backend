@@ -44,11 +44,13 @@ impl Phase4Pipeline {
     /// * `phase1_output` - Detection/categorization
     /// * `phase2_output` - Translation results
     /// * `phase3_output` - Cleaned regions
+    /// * `font_family` - Font family for rendering text (e.g., "arial", "comic-sans")
     ///
     /// # Returns:
     /// Phase4Output with final rendered image
     #[instrument(skip(self, image_data, phase1_output, phase2_output, phase3_output), fields(
-        page_index = phase1_output.page_index
+        page_index = phase1_output.page_index,
+        font_family = font_family
     ))]
     pub async fn execute(
         &self,
@@ -56,6 +58,7 @@ impl Phase4Pipeline {
         phase1_output: &Phase1Output,
         phase2_output: &Phase2Output,
         phase3_output: &Phase3Output,
+        font_family: &str,
     ) -> Result<Phase4Output> {
         debug!("Phase 4: Text insertion for page {}", phase1_output.page_index);
 
@@ -135,6 +138,7 @@ impl Phase4Pipeline {
                 cleaned_bytes,
                 translation,
                 &local_label_1_regions,
+                font_family,
             )
             .await
             .context("Failed to composite rendered text")?;
@@ -195,6 +199,7 @@ impl Phase4Pipeline {
         cleaned_bytes: &[u8],
         translation: &OCRTranslation,
         local_label_1_regions: &[[i32; 4]],
+        font_family: &str,
     ) -> Result<()> {
         // Load cleaned region image
         let mut cleaned_img = image::load_from_memory(cleaned_bytes)
@@ -217,6 +222,7 @@ impl Phase4Pipeline {
             height,
             local_label_1_regions,
             &translation.translated_text,
+            font_family,
         ).await?;
 
         // OPTIMIZATION: Parallelize alpha blending using rayon with pre-allocated buffer
@@ -282,6 +288,7 @@ impl Phase4Pipeline {
         canvas_height: u32,
         label_1_regions: &[[i32; 4]],
         text: &str,
+        font_family: &str,
     ) -> Result<RgbaImage> {
         // Create transparent canvas for early return only
         let empty_canvas = ImageBuffer::from_pixel(
@@ -318,8 +325,6 @@ impl Phase4Pipeline {
 
         // Use cosmic-text's built-in optimal font size finder
         // Optimized for comic readability
-        let font_family = "arial";
-
         let font_size = self.renderer.find_optimal_font_size(
             text,
             font_family,

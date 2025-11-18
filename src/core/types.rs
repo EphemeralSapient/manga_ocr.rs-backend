@@ -19,7 +19,17 @@ pub struct AppState {
 /// Request configuration for batch processing
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ProcessingConfig {
-    // Empty for now - will contain processing options in the future
+    /// Font family for rendering translated text (e.g., "arial", "comic-sans")
+    /// If not provided, defaults to "arial"
+    pub font_family: Option<String>,
+
+    /// OCR/Translation model override (e.g., "gemini-2.5-flash")
+    /// If not provided, uses the model from environment config
+    pub ocr_translation_model: Option<String>,
+
+    /// Banana mode image model override (e.g., "gemini-2.5-flash-image")
+    /// If not provided, uses the model from environment config
+    pub banana_image_model: Option<String>,
 }
 
 /// Detection label for region classification

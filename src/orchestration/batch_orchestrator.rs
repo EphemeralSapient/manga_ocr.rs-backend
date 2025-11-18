@@ -88,7 +88,7 @@ impl BatchOrchestrator {
     pub async fn process_batch(
         &self,
         images: Vec<ImageData>,
-        _config: &ProcessingConfig,
+        config: &ProcessingConfig,
     ) -> Result<BatchResult> {
         let start_time = Instant::now();
         let total_images = images.len();
@@ -115,12 +115,20 @@ impl BatchOrchestrator {
         // Process batches in parallel
         let mut tasks = Vec::new();
 
+        // Extract config overrides (default to None if not provided)
+        let font_family = config.font_family.clone().unwrap_or_else(|| "arial".to_string());
+        let ocr_model = config.ocr_translation_model.clone();
+        let banana_model = config.banana_image_model.clone();
+
         for batch in batches {
             let phase1 = Arc::clone(&self.phase1);
             let phase2 = Arc::clone(&self.phase2);
             let phase3 = Arc::clone(&self.phase3);
             let phase4 = Arc::clone(&self.phase4);
             let semaphore = Arc::clone(&self.batch_semaphore);
+            let font_family = font_family.clone();
+            let ocr_model = ocr_model.clone();
+            let banana_model = banana_model.clone();
 
             let task = tokio::spawn(async move {
                 // Acquire semaphore permit
@@ -131,7 +139,17 @@ impl BatchOrchestrator {
                     }
                 };
 
-                process_single_batch(phase1, phase2, phase3, phase4, batch).await
+                process_single_batch(
+                    phase1,
+                    phase2,
+                    phase3,
+                    phase4,
+                    batch,
+                    &font_family,
+                    ocr_model.as_deref(),
+                    banana_model.as_deref(),
+                )
+                .await
             });
 
             tasks.push(task);
@@ -214,6 +232,9 @@ async fn process_single_batch(
     phase3: Arc<Phase3Pipeline>,
     phase4: Arc<Phase4Pipeline>,
     batch: ImageBatch,
+    font_family: &str,
+    ocr_model_override: Option<&str>,
+    banana_model_override: Option<&str>,
 ) -> Result<(Vec<PageResult>, PerformanceMetrics)> {
     debug!("Processing batch {} with {} images", batch.batch_id, batch.images.len());
 
@@ -229,6 +250,9 @@ async fn process_single_batch(
             &phase3,
             &phase4,
             image_data,
+            font_family,
+            ocr_model_override,
+            banana_model_override,
         )
         .await
         {
@@ -280,6 +304,9 @@ async fn process_single_page(
     phase3: &Phase3Pipeline,
     phase4: &Phase4Pipeline,
     image_data: &ImageData,
+    font_family: &str,
+    ocr_model_override: Option<&str>,
+    banana_model_override: Option<&str>,
 ) -> Result<(PerformanceMetrics, Vec<u8>)> {
     let mut metrics = PerformanceMetrics::default();
 
@@ -318,7 +345,7 @@ async fn process_single_page(
     // Phase 2: API Calls
     let p2_start = Instant::now();
     let phase2_output = phase2
-        .execute(&optimized_image_data, &phase1_output)
+        .execute(&optimized_image_data, &phase1_output, ocr_model_override, banana_model_override)
         .await
         .context("Phase 2 failed")?;
     metrics.phase2_time = p2_start.elapsed();
@@ -344,7 +371,7 @@ async fn process_single_page(
     // Phase 4: Text Insertion
     let p4_start = Instant::now();
     let phase4_output = phase4
-        .execute(&optimized_image_data, &phase1_output, &phase2_output, &phase3_output)
+        .execute(&optimized_image_data, &phase1_output, &phase2_output, &phase3_output, font_family)
         .await
         .context("Phase 4 failed")?;
     metrics.phase4_time = p4_start.elapsed();

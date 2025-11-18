@@ -158,7 +158,7 @@ impl Config {
                 ocr_translation_model: env::var("OCR_TRANSLATION_MODEL")
                     .unwrap_or_else(|_| "gemini-2.5-flash".to_string()),
                 banana_image_model: env::var("BANANA_IMAGE_MODEL")
-                    .unwrap_or_else(|_| "gemini-2.0-flash-image".to_string()),
+                    .unwrap_or_else(|_| "gemini-2.5-flash-image".to_string()),
                 banana_mode_enabled: env::var("BANANA_MODE_ENABLED")
                     .ok()
                     .and_then(|s| s.parse().ok())

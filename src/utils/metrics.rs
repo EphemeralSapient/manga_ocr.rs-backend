@@ -32,10 +32,12 @@ impl CircularBuffer {
         self.data.iter().copied().collect()
     }
 
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.data.len()
     }
