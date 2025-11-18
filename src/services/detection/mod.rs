@@ -1,6 +1,6 @@
 use crate::core::config::Config;
 use crate::core::types::BubbleDetection;
-use anyhow::Result;
+use anyhow::{Result, Context};
 use image::DynamicImage;
 use ndarray::{Array2, Array4};
 use ort::execution_providers::CPUExecutionProvider;
@@ -230,6 +230,24 @@ impl DetectionService {
         let model_bytes = load_model_bytes(config)?;
         info!("Loaded detector model ({:.1} MB)", model_bytes.len() as f64 / 1_048_576.0);
 
+        // Validate ONNX model header
+        if model_bytes.len() < 100 {
+            anyhow::bail!(
+                "Model file is too small ({} bytes). This might be a Git LFS stub. \
+                Please ensure Git LFS is installed and the model is properly checked out.",
+                model_bytes.len()
+            );
+        }
+
+        // Check for valid ONNX protobuf header (should start with model version info)
+        if model_bytes.len() >= 4 {
+            debug!("Model header bytes: {:02x} {:02x} {:02x} {:02x}",
+                model_bytes[0], model_bytes[1], model_bytes[2], model_bytes[3]);
+        }
+
+        // Log environment info
+        info!("Platform: {}/{}", std::env::consts::OS, std::env::consts::ARCH);
+
         // Check if a specific backend is forced via config
         if let Some(ref backend) = config.detection.inference_backend {
             match backend.as_str() {
@@ -321,11 +339,31 @@ impl DetectionService {
         }
 
         // Final fallback: Pure CPU (no acceleration)
-        let session = Session::builder()?
-            .with_execution_providers([CPUExecutionProvider::default().build()])?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(num_cpus::get())?
-            .commit_from_memory(MODEL_BYTES)?;
+        let session = Session::builder()
+            .context("Failed to create ONNX session builder")?
+            .with_execution_providers([CPUExecutionProvider::default().build()])
+            .context("Failed to configure CPU execution provider")?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .context("Failed to set graph optimization level")?
+            .with_intra_threads(num_cpus::get())
+            .context("Failed to configure intra-op threads")?
+            .commit_from_memory(&model_bytes)
+            .context(format!(
+                "Failed to load ONNX model from memory ({:.1} MB). \
+                This usually indicates:\n  \
+                1. Model file corruption during transfer (verify with: ./verify_models.sh or verify_models.ps1)\n  \
+                2. ONNX Runtime version/platform mismatch\n  \
+                3. Model created with incompatible ONNX opset version\n  \
+                4. Platform-specific binary incompatibility ({}/{})\n  \
+                Solutions:\n  \
+                - Run checksum verification: ./verify_models.sh (Linux/Mac) or .\\verify_models.ps1 (Windows)\n  \
+                - Re-download/re-transfer the models if checksums fail\n  \
+                - Ensure the model was created with ONNX opset <= 18\n  \
+                - Check that the binary matches your platform",
+                model_bytes.len() as f64 / 1_048_576.0,
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ))?;
 
         info!("✓ Using CPU (no hardware acceleration)");
         Ok(("CPU".to_string(), session))
