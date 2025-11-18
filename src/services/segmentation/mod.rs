@@ -5,11 +5,10 @@ use image::{DynamicImage, ImageBuffer, Luma};
 use ndarray::{Array2, Array4, Axis};
 use ort::session::Session;
 use std::sync::Arc;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::{debug, info, instrument};
 
 use crate::core::config::Config;
-use crate::services::onnx_builder;
+use crate::services::onnx_builder::{self, OnnxSessionPool};
 
 // Embed the mask model at compile time
 // If LFS not checked out, this will be a small stub - load from runtime path instead
@@ -30,26 +29,9 @@ fn load_model_bytes(config: &Config) -> Result<Vec<u8>> {
     }
 }
 
-/// Session pool for concurrent inference
-pub struct SegmentationSessionPool {
-    sender: Sender<Session>,
-    receiver: Arc<tokio::sync::Mutex<Receiver<Session>>>,
-}
-
-impl SegmentationSessionPool {
-    async fn acquire(&self) -> Session {
-        let mut receiver = self.receiver.lock().await;
-        receiver.recv().await.expect("Session pool exhausted")
-    }
-
-    async fn release(&self, session: Session) {
-        self.sender.send(session).await.expect("Failed to return session to pool");
-    }
-}
-
 /// Segmentation service for generating text region masks
 pub struct SegmentationService {
-    session_pool: Arc<SegmentationSessionPool>,
+    session_pool: Arc<OnnxSessionPool>,
     target_size: u32,
     #[allow(dead_code)]
     device_type: String,
@@ -72,11 +54,11 @@ impl SegmentationService {
         // Create first session to determine device type
         let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
 
-        // Create channel for session pool
-        let (sender, receiver) = channel(pool_size);
+        // Create generic ONNX session pool (lock-free, high performance)
+        let session_pool = OnnxSessionPool::new(pool_size);
 
         // Send first session to pool
-        sender.send(first_session).await
+        session_pool.sender().send(first_session)
             .map_err(|_| anyhow::anyhow!("Failed to initialize session pool"))?;
 
         // Create remaining sessions IN PARALLEL for faster startup
@@ -96,15 +78,13 @@ impl SegmentationService {
             for task in tasks {
                 let (_, session) = task.await
                     .map_err(|e| anyhow::anyhow!("Failed to spawn session creation: {}", e))??;
-                sender.send(session).await
+                session_pool.sender().send(session)
                     .map_err(|_| anyhow::anyhow!("Failed to add session to pool"))?;
             }
         }
 
-        let session_pool = Arc::new(SegmentationSessionPool {
-            sender,
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-        });
+        // Wrap in Arc for sharing across threads
+        let session_pool = Arc::new(session_pool);
 
         info!("✓ Segmentation: {} ({} sessions)", device_type, pool_size);
 
@@ -184,7 +164,7 @@ impl SegmentationService {
 
         // Acquire session from pool, run inference, and extract data
         let (det_output, proto_masks) = {
-            let mut session = self.session_pool.acquire().await;
+            let mut session = self.session_pool.acquire();  // No await - crossbeam is sync!
             let outputs = session
                 .run(ort::inputs!["images" => images_value])?;
 
@@ -211,7 +191,7 @@ impl SegmentationService {
 
             // Drop outputs and return session to pool
             drop(outputs);
-            self.session_pool.release(session).await;
+            self.session_pool.release(session);  // No await - crossbeam is sync!
 
             (det_output, proto_masks)
         };

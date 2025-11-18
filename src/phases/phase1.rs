@@ -55,9 +55,14 @@ impl Phase1Pipeline {
             image_data.index, image_data.filename
         );
 
-        // Load image
-        let img = image::load_from_memory(&image_data.image_bytes)
-            .context("Failed to load image")?;
+        // Use pre-decoded image if available, otherwise load from bytes
+        // OPTIMIZATION: Pre-decoded image eliminates redundant decoding across phases
+        let img = if let Some(ref decoded) = image_data.decoded_image {
+            (**decoded).clone()
+        } else {
+            image::load_from_memory(&image_data.image_bytes)
+                .context("Failed to load image")?
+        };
 
         // Step 1 & 2: Run detection and segmentation IN PARALLEL
         // This is a MASSIVE optimization - both models run simultaneously!
@@ -236,39 +241,83 @@ impl Phase1Pipeline {
         let img_width = rgb.width() as i32;
         let img_height = rgb.height() as i32;
 
-        // Count white pixels in label 1 regions (parallel iteration with optimized bounds)
-        let (white_pixels, total_pixels): (usize, usize) = label_1_regions.par_iter()
-            .map(|l1_bbox| {
+        // OPTIMIZATION: Adaptive parallelization based on total region area
+        // Rayon has overhead - only use it for large total areas
+        let total_area: i32 = label_1_regions
+            .iter()
+            .map(|bbox| {
+                let width = (bbox[2] - bbox[0]).max(0);
+                let height = (bbox[3] - bbox[1]).max(0);
+                width * height
+            })
+            .sum();
+
+        const PARALLEL_THRESHOLD: i32 = 10_000; // ~100x100 pixels
+
+        let (white_pixels, total_pixels): (usize, usize) = if total_area > PARALLEL_THRESHOLD {
+            // Large regions: Use parallel processing
+            label_1_regions.par_iter()
+                .map(|l1_bbox| {
+                    let [l1_x1, l1_y1, l1_x2, l1_y2] = *l1_bbox;
+
+                    // Pre-calculate and clamp bounds to valid range (eliminates per-pixel bounds checking)
+                    let crop_x1 = l1_x1.max(x1).max(0).min(img_width) as u32;
+                    let crop_y1 = l1_y1.max(y1).max(0).min(img_height) as u32;
+                    let crop_x2 = l1_x2.min(x2).max(0).min(img_width) as u32;
+                    let crop_y2 = l1_y2.min(y2).max(0).min(img_height) as u32;
+
+                    // Early exit for invalid regions
+                    if crop_x2 <= crop_x1 || crop_y2 <= crop_y1 {
+                        return (0, 0);
+                    }
+
+                    let mut local_white = 0usize;
+                    let mut local_total = 0usize;
+
+                    // No bounds checking needed - already validated above
+                    for y in crop_y1..crop_y2 {
+                        for x in crop_x1..crop_x2 {
+                            local_total += 1;
+                            let pixel = rgb.get_pixel(x, y);
+                            // Optimized: single comparison for all channels (white = RGB all >= 240)
+                            if pixel[0] >= 240 && pixel[1] >= 240 && pixel[2] >= 240 {
+                                local_white += 1;
+                            }
+                        }
+                    }
+                    (local_white, local_total)
+                })
+                .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        } else {
+            // Small regions: Use sequential processing (less overhead)
+            let mut white = 0usize;
+            let mut total = 0usize;
+
+            for l1_bbox in label_1_regions {
                 let [l1_x1, l1_y1, l1_x2, l1_y2] = *l1_bbox;
 
-                // Pre-calculate and clamp bounds to valid range (eliminates per-pixel bounds checking)
                 let crop_x1 = l1_x1.max(x1).max(0).min(img_width) as u32;
                 let crop_y1 = l1_y1.max(y1).max(0).min(img_height) as u32;
                 let crop_x2 = l1_x2.min(x2).max(0).min(img_width) as u32;
                 let crop_y2 = l1_y2.min(y2).max(0).min(img_height) as u32;
 
-                // Early exit for invalid regions
                 if crop_x2 <= crop_x1 || crop_y2 <= crop_y1 {
-                    return (0, 0);
+                    continue;
                 }
 
-                let mut local_white = 0usize;
-                let mut local_total = 0usize;
-
-                // No bounds checking needed - already validated above
                 for y in crop_y1..crop_y2 {
                     for x in crop_x1..crop_x2 {
-                        local_total += 1;
+                        total += 1;
                         let pixel = rgb.get_pixel(x, y);
-                        // Optimized: single comparison for all channels (white = RGB all >= 240)
                         if pixel[0] >= 240 && pixel[1] >= 240 && pixel[2] >= 240 {
-                            local_white += 1;
+                            white += 1;
                         }
                     }
                 }
-                (local_white, local_total)
-            })
-            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            }
+
+            (white, total)
+        };
 
         if total_pixels == 0 {
             return BackgroundType::Complex;
@@ -282,77 +331,6 @@ impl Phase1Pipeline {
             BackgroundType::Simple
         } else {
             BackgroundType::Complex
-        }
-    }
-
-    /// Legacy classify_background (kept for compatibility if needed)
-    #[allow(dead_code)]
-    fn classify_background(
-        &self,
-        img: &DynamicImage,
-        label_0_bbox: [i32; 4],
-        label_1_regions: &[[i32; 4]],
-    ) -> Result<BackgroundType> {
-        let [x1, y1, x2, y2] = label_0_bbox;
-        let width = (x2 - x1).max(1) as u32;
-        let height = (y2 - y1).max(1) as u32;
-
-        // Crop to label 0 region
-        let cropped = img.crop_imm(x1 as u32, y1 as u32, width, height);
-        let rgb = cropped.to_rgb8();
-
-        // Count white pixels in label 1 regions
-        let mut total_pixels = 0;
-        let mut white_pixels = 0;
-        let white_threshold = 240u8;
-
-        for l1_bbox in label_1_regions {
-            let [l1_x1, l1_y1, l1_x2, l1_y2] = *l1_bbox;
-            // Convert to cropped coordinates
-            let crop_x1 = ((l1_x1 - x1).max(0)) as u32;
-            let crop_y1 = ((l1_y1 - y1).max(0)) as u32;
-            let crop_x2 = ((l1_x2 - x1).min(width as i32)) as u32;
-            let crop_y2 = ((l1_y2 - y1).min(height as i32)) as u32;
-
-            for y in crop_y1..crop_y2 {
-                for x in crop_x1..crop_x2 {
-                    if x < width && y < height {
-                        total_pixels += 1;
-                        let pixel = rgb.get_pixel(x, y);
-                        if pixel[0] >= white_threshold
-                            && pixel[1] >= white_threshold
-                            && pixel[2] >= white_threshold
-                        {
-                            white_pixels += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        if total_pixels == 0 {
-            return Ok(BackgroundType::Complex);
-        }
-
-        let white_ratio = white_pixels as f32 / total_pixels as f32;
-        let threshold = self.config.simple_bg_white_threshold();
-
-        if white_ratio >= threshold {
-            debug!(
-                "Simple background: {:.1}% white ({}/{})",
-                white_ratio * 100.0,
-                white_pixels,
-                total_pixels
-            );
-            Ok(BackgroundType::Simple)
-        } else {
-            debug!(
-                "Complex background: {:.1}% white ({}/{})",
-                white_ratio * 100.0,
-                white_pixels,
-                total_pixels
-            );
-            Ok(BackgroundType::Complex)
         }
     }
 }

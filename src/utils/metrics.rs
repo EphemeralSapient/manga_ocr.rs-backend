@@ -1,9 +1,45 @@
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Circular buffer with fixed capacity to prevent unbounded memory growth
+/// OPTIMIZATION: Replaces unbounded Vec that was causing slow memory leak
+struct CircularBuffer {
+    data: VecDeque<u64>,
+    max_size: usize,
+}
+
+impl CircularBuffer {
+    fn new(max_size: usize) -> Self {
+        Self {
+            data: VecDeque::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    fn push(&mut self, value: u64) {
+        if self.data.len() >= self.max_size {
+            self.data.pop_front();
+        }
+        self.data.push_back(value);
+    }
+
+    fn as_slice(&self) -> Vec<u64> {
+        self.data.iter().copied().collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+}
 
 /// Global metrics collector for the application.
 ///
@@ -21,7 +57,9 @@ struct MetricsInner {
     api_calls_failed: AtomicUsize,
     api_tokens_input: AtomicU64,
     api_tokens_output: AtomicU64,
-    api_latency_ms: RwLock<Vec<u64>>,
+    /// OPTIMIZATION: Bounded to last 10,000 entries to prevent unbounded memory growth
+    /// At ~8 bytes per entry, this caps memory at ~80KB for latencies
+    api_latency_ms: RwLock<CircularBuffer>,
 
     // Cache Metrics
     cache_hits: AtomicUsize,
@@ -29,10 +67,12 @@ struct MetricsInner {
     cache_size: AtomicUsize,
 
     // Phase Metrics
-    phase1_duration_ms: RwLock<Vec<u64>>,
-    phase2_duration_ms: RwLock<Vec<u64>>,
-    phase3_duration_ms: RwLock<Vec<u64>>,
-    phase4_duration_ms: RwLock<Vec<u64>>,
+    /// OPTIMIZATION: Each phase buffer capped at 10,000 entries (~80KB each, ~320KB total)
+    /// This prevents slow memory leak while keeping sufficient data for statistics
+    phase1_duration_ms: RwLock<CircularBuffer>,
+    phase2_duration_ms: RwLock<CircularBuffer>,
+    phase3_duration_ms: RwLock<CircularBuffer>,
+    phase4_duration_ms: RwLock<CircularBuffer>,
 
     // Batch Metrics
     batches_processed: AtomicUsize,
@@ -48,6 +88,10 @@ struct MetricsInner {
     start_time: Instant,
 }
 
+/// Maximum number of latency/duration samples to keep in memory
+/// This prevents unbounded memory growth while keeping enough data for accurate statistics
+const MAX_SAMPLES: usize = 10_000;
+
 impl Metrics {
     pub fn new() -> Self {
         Self {
@@ -57,14 +101,14 @@ impl Metrics {
                 api_calls_failed: AtomicUsize::new(0),
                 api_tokens_input: AtomicU64::new(0),
                 api_tokens_output: AtomicU64::new(0),
-                api_latency_ms: RwLock::new(Vec::new()),
+                api_latency_ms: RwLock::new(CircularBuffer::new(MAX_SAMPLES)),
                 cache_hits: AtomicUsize::new(0),
                 cache_misses: AtomicUsize::new(0),
                 cache_size: AtomicUsize::new(0),
-                phase1_duration_ms: RwLock::new(Vec::new()),
-                phase2_duration_ms: RwLock::new(Vec::new()),
-                phase3_duration_ms: RwLock::new(Vec::new()),
-                phase4_duration_ms: RwLock::new(Vec::new()),
+                phase1_duration_ms: RwLock::new(CircularBuffer::new(MAX_SAMPLES)),
+                phase2_duration_ms: RwLock::new(CircularBuffer::new(MAX_SAMPLES)),
+                phase3_duration_ms: RwLock::new(CircularBuffer::new(MAX_SAMPLES)),
+                phase4_duration_ms: RwLock::new(CircularBuffer::new(MAX_SAMPLES)),
                 batches_processed: AtomicUsize::new(0),
                 images_processed: AtomicUsize::new(0),
                 endpoint_counters: DashMap::new(),
@@ -139,30 +183,31 @@ impl Metrics {
     // Get snapshot for reporting
     pub fn snapshot(&self) -> MetricsSnapshot {
         let api_latency = self.inner.api_latency_ms.read();
-        let api_latency_avg = if !api_latency.is_empty() {
-            api_latency.iter().sum::<u64>() / api_latency.len() as u64
+        let api_latency_data = api_latency.as_slice();
+        let api_latency_avg = if !api_latency_data.is_empty() {
+            api_latency_data.iter().sum::<u64>() / api_latency_data.len() as u64
         } else {
             0
         };
-        let api_latency_p50 = percentile(&api_latency, 0.5);
-        let api_latency_p95 = percentile(&api_latency, 0.95);
-        let api_latency_p99 = percentile(&api_latency, 0.99);
+        let api_latency_p50 = percentile(&api_latency_data, 0.5);
+        let api_latency_p95 = percentile(&api_latency_data, 0.95);
+        let api_latency_p99 = percentile(&api_latency_data, 0.99);
         drop(api_latency);
 
         let phase1_durations = self.inner.phase1_duration_ms.read();
-        let phase1_avg = avg(&phase1_durations);
+        let phase1_avg = avg(&phase1_durations.as_slice());
         drop(phase1_durations);
 
         let phase2_durations = self.inner.phase2_duration_ms.read();
-        let phase2_avg = avg(&phase2_durations);
+        let phase2_avg = avg(&phase2_durations.as_slice());
         drop(phase2_durations);
 
         let phase3_durations = self.inner.phase3_duration_ms.read();
-        let phase3_avg = avg(&phase3_durations);
+        let phase3_avg = avg(&phase3_durations.as_slice());
         drop(phase3_durations);
 
         let phase4_durations = self.inner.phase4_duration_ms.read();
-        let phase4_avg = avg(&phase4_durations);
+        let phase4_avg = avg(&phase4_durations.as_slice());
         drop(phase4_durations);
 
         let cache_hits = self.inner.cache_hits.load(Ordering::Relaxed);

@@ -1,5 +1,6 @@
 use crate::core::config::Config;
 use crate::core::types::BubbleDetection;
+use crate::services::onnx_builder::{self, OnnxSessionPool};
 use anyhow::{Result, Context};
 use image::DynamicImage;
 use ndarray::{Array2, Array4};
@@ -7,7 +8,6 @@ use ort::execution_providers::CPUExecutionProvider;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Value;
 use std::sync::Arc;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::{info, debug, trace};
 
 // Embed the ONNX model at compile time (INT8 quantized, ~42MB)
@@ -29,25 +29,8 @@ fn load_model_bytes(config: &Config) -> Result<Vec<u8>> {
     }
 }
 
-/// Session pool for concurrent inference
-pub struct SessionPool {
-    sender: Sender<Session>,
-    receiver: Arc<tokio::sync::Mutex<Receiver<Session>>>,
-}
-
-impl SessionPool {
-    async fn acquire(&self) -> Session {
-        let mut receiver = self.receiver.lock().await;
-        receiver.recv().await.expect("Session pool exhausted")
-    }
-
-    async fn release(&self, session: Session) {
-        self.sender.send(session).await.expect("Failed to return session to pool");
-    }
-}
-
 pub struct DetectionService {
-    session_pool: Arc<SessionPool>,
+    session_pool: Arc<OnnxSessionPool>,
     config: Arc<Config>,
     device_type: String,
 }
@@ -61,11 +44,11 @@ impl DetectionService {
         // Create first session to determine device type
         let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
 
-        // Create channel for session pool
-        let (sender, receiver) = channel(pool_size);
+        // Create generic ONNX session pool (lock-free, high performance)
+        let session_pool = OnnxSessionPool::new(pool_size);
 
-        // Send first session to pool
-        sender.send(first_session).await
+        // Send first session to pool (synchronous - no await needed)
+        session_pool.sender().send(first_session)
             .map_err(|_| anyhow::anyhow!("Failed to initialize session pool"))?;
 
         // Create remaining sessions IN PARALLEL for faster startup
@@ -85,15 +68,13 @@ impl DetectionService {
             for task in tasks {
                 let (_, session) = task.await
                     .map_err(|e| anyhow::anyhow!("Failed to spawn session creation: {}", e))??;
-                sender.send(session).await
+                session_pool.sender().send(session)
                     .map_err(|_| anyhow::anyhow!("Failed to add session to pool"))?;
             }
         }
 
-        let session_pool = Arc::new(SessionPool {
-            sender,
-            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
-        });
+        // Wrap in Arc for sharing across threads
+        let session_pool = Arc::new(session_pool);
 
         info!("✓ Detection: {} ({} sessions)", device_type, pool_size);
 
@@ -479,7 +460,7 @@ impl DetectionService {
 
         // Acquire session from pool and run inference
         let (labels_shape_owned, labels_data, boxes_data, scores_data) = {
-            let mut session = self.session_pool.acquire().await;
+            let mut session = self.session_pool.acquire();  // No await - crossbeam is sync!
             let outputs = session.run(ort::inputs![
                 "images" => images_value,
                 "orig_target_sizes" => sizes_value
@@ -498,7 +479,7 @@ impl DetectionService {
 
             // Drop outputs and return session to pool
             drop(outputs);
-            self.session_pool.release(session).await;
+            self.session_pool.release(session);  // No await - crossbeam is sync!
 
             (labels_shape_owned, labels_data_owned, boxes_data_owned, scores_data_owned)
         };
@@ -584,7 +565,7 @@ impl DetectionService {
 
         // Acquire session from pool and run inference
         let (labels_shape_owned, labels_data, boxes_data, scores_data) = {
-            let mut session = self.session_pool.acquire().await;
+            let mut session = self.session_pool.acquire();  // No await - crossbeam is sync!
             let outputs = session.run(ort::inputs![
                 "images" => images_value,
                 "orig_target_sizes" => sizes_value
@@ -603,7 +584,7 @@ impl DetectionService {
 
             // Drop outputs and return session to pool
             drop(outputs);
-            self.session_pool.release(session).await;
+            self.session_pool.release(session);  // No await - crossbeam is sync!
 
             (labels_shape_owned, labels_data_owned, boxes_data_owned, scores_data_owned)
         };
