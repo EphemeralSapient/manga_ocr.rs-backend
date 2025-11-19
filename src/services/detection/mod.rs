@@ -47,9 +47,10 @@ pub struct DetectionService {
 
 impl DetectionService {
     pub async fn new(config: Arc<Config>) -> Result<Self> {
-        // Determine pool size: use num_cpus or MAX_CONCURRENT_BATCHES (whichever is smaller)
-        let pool_size = std::cmp::min(num_cpus::get(), config.max_concurrent_batches());
-        debug!("Creating detection session pool with {} sessions", pool_size);
+        // Single session for static memory usage (~42 MB)
+        // Multiple concurrent requests will wait for session availability
+        let pool_size = 1;
+        debug!("Creating detection session with {} session(s) for static memory", pool_size);
 
         // Create first session to determine device type
         let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
@@ -86,7 +87,7 @@ impl DetectionService {
         // Wrap in Arc for sharing across threads
         let session_pool = Arc::new(session_pool);
 
-        info!("✓ Detection: {} ({} sessions)", device_type, pool_size);
+        info!("✓ Detection: {} (1 session, ~42 MB static)", device_type);
 
         Ok(Self {
             session_pool,

@@ -47,9 +47,10 @@ impl SegmentationService {
     /// Result containing the segmentation service or an error
     #[instrument(skip(config), fields(target_size = config.target_size()))]
     pub async fn new(config: Arc<Config>) -> Result<Self> {
-        // Determine pool size: use num_cpus or MAX_CONCURRENT_BATCHES (whichever is smaller)
-        let pool_size = std::cmp::min(num_cpus::get(), config.max_concurrent_batches());
-        debug!("Creating segmentation session pool with {} sessions", pool_size);
+        // Single session for static memory usage (~40 MB)
+        // Multiple concurrent requests will wait for session availability
+        let pool_size = 1;
+        debug!("Creating segmentation session with {} session(s) for static memory", pool_size);
 
         // Create first session to determine device type
         let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
@@ -86,7 +87,7 @@ impl SegmentationService {
         // Wrap in Arc for sharing across threads
         let session_pool = Arc::new(session_pool);
 
-        info!("✓ Segmentation: {} ({} sessions)", device_type, pool_size);
+        info!("✓ Segmentation: {} (1 session, ~40 MB static)", device_type);
 
         Ok(Self {
             session_pool,

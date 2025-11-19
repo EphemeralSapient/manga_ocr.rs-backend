@@ -172,7 +172,7 @@ impl Config {
                 batch_size_n: env::var("BATCH_SIZE_N")
                     .ok()
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(10),
+                    .unwrap_or(5),
                 api_batch_size_m: env::var("API_BATCH_SIZE_M")
                     .ok()
                     .and_then(|s| s.parse().ok())

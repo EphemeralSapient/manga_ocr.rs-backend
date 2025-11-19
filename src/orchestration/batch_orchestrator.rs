@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine};
+use futures::future::join_all;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -222,7 +223,7 @@ impl BatchOrchestrator {
     }
 }
 
-/// Process a single batch (images processed sequentially within batch)
+/// Process a single batch (images processed IN PARALLEL within batch)
 async fn process_single_batch(
     phase1: Arc<Phase1Pipeline>,
     phase2: Arc<Phase2Pipeline>,
@@ -232,62 +233,103 @@ async fn process_single_batch(
     config: &ProcessingConfig,
     app_config: &Config,
 ) -> Result<(Vec<PageResult>, PerformanceMetrics)> {
-    debug!("Processing batch {} with {} images", batch.batch_id, batch.images.len());
+    debug!("Processing batch {} with {} images IN PARALLEL", batch.batch_id, batch.images.len());
+
+    // Spawn all image processing tasks concurrently
+    let config = Arc::new(config.clone());
+    let app_config = Arc::new(app_config.clone());
+
+    let tasks: Vec<_> = batch.images.into_iter().map(|image_data| {
+        let phase1 = Arc::clone(&phase1);
+        let phase2 = Arc::clone(&phase2);
+        let phase3 = Arc::clone(&phase3);
+        let phase4 = Arc::clone(&phase4);
+        let config = Arc::clone(&config);
+        let app_config = Arc::clone(&app_config);
+
+        tokio::spawn(async move {
+            let page_start = Instant::now();
+            let index = image_data.index;
+            let filename = image_data.filename.clone();
+
+            let result: Result<(PageResult, PerformanceMetrics)> = match process_single_page(
+                &phase1,
+                &phase2,
+                &phase3,
+                &phase4,
+                &image_data,
+                &config,
+                &app_config,
+            )
+            .await
+            {
+                Ok((page_metrics, final_image_bytes)) => {
+                    let processing_time_ms = page_start.elapsed().as_secs_f64() * 1000.0;
+
+                    // Convert to base64 data URL
+                    let base64_image = general_purpose::STANDARD.encode(&final_image_bytes);
+                    let data_url = format!("data:image/png;base64,{}", base64_image);
+
+                    Ok((
+                        PageResult {
+                            index,
+                            filename,
+                            success: true,
+                            processing_time_ms,
+                            error: None,
+                            data_url: Some(data_url),
+                        },
+                        page_metrics,
+                    ))
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to process page {} ({}): {:?}",
+                        index,
+                        filename,
+                        e
+                    );
+
+                    Ok((
+                        PageResult {
+                            index,
+                            filename,
+                            success: false,
+                            processing_time_ms: page_start.elapsed().as_secs_f64() * 1000.0,
+                            error: Some(e.to_string()),
+                            data_url: None,
+                        },
+                        PerformanceMetrics::default(),
+                    ))
+                }
+            };
+            result
+        })
+    }).collect();
+
+    // Wait for all tasks to complete and collect results
+    let task_results = join_all(tasks).await;
 
     let mut results = Vec::new();
     let mut metrics = PerformanceMetrics::default();
 
-    for image_data in &batch.images {
-        let page_start = Instant::now();
-
-        match process_single_page(
-            &phase1,
-            &phase2,
-            &phase3,
-            &phase4,
-            image_data,
-            config,
-            app_config,
-        )
-        .await
-        {
-            Ok((page_metrics, final_image_bytes)) => {
-                let processing_time_ms = page_start.elapsed().as_secs_f64() * 1000.0;
-
-                // Convert to base64 data URL
-                let base64_image = general_purpose::STANDARD.encode(&final_image_bytes);
-                let data_url = format!("data:image/png;base64,{}", base64_image);
-
-                results.push(PageResult {
-                    index: image_data.index,
-                    filename: image_data.filename.clone(),
-                    success: true,
-                    processing_time_ms,
-                    error: None,
-                    data_url: Some(data_url),
-                });
-
+    for task_result in task_results {
+        match task_result {
+            Ok(Ok((page_result, page_metrics))) => {
+                results.push(page_result);
                 metrics.merge(page_metrics);
             }
+            Ok(Err(e)) => {
+                tracing::error!("Page processing error: {:?}", e);
+            }
             Err(e) => {
-                tracing::error!(
-                    "Failed to process page {} ({}): {:?}",
-                    image_data.index,
-                    image_data.filename,
-                    e
-                );
-
-                results.push(PageResult {
-                    index: image_data.index,
-                    filename: image_data.filename.clone(),
-                    success: false,
-                    processing_time_ms: page_start.elapsed().as_secs_f64() * 1000.0,
-                    error: Some(e.to_string()),
-                    data_url: None,
-                });
+                tracing::error!("Task join error: {:?}", e);
             }
         }
     }
+
+    // Sort results by index to maintain order
+    results.sort_by_key(|r| r.index);
 
     Ok((results, metrics))
 }
