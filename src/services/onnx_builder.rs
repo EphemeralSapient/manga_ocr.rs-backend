@@ -6,7 +6,23 @@ use anyhow::{Context, Result};
 use crossbeam::channel::{bounded, Receiver, Sender};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::execution_providers::CPUExecutionProvider;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
+
+/// Calculate optimal thread count for ONNX Runtime CPU inference.
+///
+/// Research shows that using all CPU cores can actually HURT performance on Windows
+/// due to thread synchronization overhead. Capping at 6 threads showed 2x speedup
+/// in benchmarks on 8-core Windows systems.
+///
+/// Reference: https://github.com/microsoft/onnxruntime/issues/3713
+fn optimal_intra_op_threads() -> usize {
+    let total_cores = num_cpus::get();
+    // Cap at 6 threads to avoid synchronization overhead (especially on Windows)
+    // Use at least 1 thread
+    let optimal = std::cmp::min(6, total_cores).max(1);
+    debug!("CPU threads: {} total cores, using {} for inference", total_cores, optimal);
+    optimal
+}
 
 // Import acceleration providers based on features
 #[cfg(feature = "tensorrt")]
@@ -96,7 +112,8 @@ pub fn build_session_with_acceleration(
         if let Ok(session) = Session::builder()
             .and_then(|b| b.with_execution_providers([TensorRTExecutionProvider::default().build()]))
             .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-            .and_then(|b| b.with_intra_threads(num_cpus::get()))
+            .and_then(|b| b.with_intra_threads(optimal_intra_op_threads()))
+            .and_then(|b| b.with_inter_threads(1))
             .and_then(|b| b.commit_from_memory(model_bytes))
         {
             info!("✓ Using TensorRT acceleration for {}", model_name);
@@ -110,7 +127,8 @@ pub fn build_session_with_acceleration(
         if let Ok(session) = Session::builder()
             .and_then(|b| b.with_execution_providers([CUDAExecutionProvider::default().build()]))
             .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-            .and_then(|b| b.with_intra_threads(num_cpus::get()))
+            .and_then(|b| b.with_intra_threads(optimal_intra_op_threads()))
+            .and_then(|b| b.with_inter_threads(1))
             .and_then(|b| b.commit_from_memory(model_bytes))
         {
             info!("✓ Using CUDA acceleration for {}", model_name);
@@ -124,7 +142,8 @@ pub fn build_session_with_acceleration(
         if let Ok(session) = Session::builder()
             .and_then(|b| b.with_execution_providers([CoreMLExecutionProvider::default().build()]))
             .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-            .and_then(|b| b.with_intra_threads(num_cpus::get()))
+            .and_then(|b| b.with_intra_threads(optimal_intra_op_threads()))
+            .and_then(|b| b.with_inter_threads(1))
             .and_then(|b| b.commit_from_memory(model_bytes))
         {
             info!("✓ Using CoreML acceleration for {} (Apple Neural Engine)", model_name);
@@ -138,7 +157,8 @@ pub fn build_session_with_acceleration(
         if let Ok(session) = Session::builder()
             .and_then(|b| b.with_execution_providers([DirectMLExecutionProvider::default().build()]))
             .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-            .and_then(|b| b.with_intra_threads(num_cpus::get()))
+            .and_then(|b| b.with_intra_threads(optimal_intra_op_threads()))
+            .and_then(|b| b.with_inter_threads(1))
             .and_then(|b| b.commit_from_memory(model_bytes))
         {
             info!("✓ Using DirectML acceleration for {}", model_name);
@@ -156,7 +176,8 @@ pub fn build_session_with_acceleration(
                     .build()
             ]))
             .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-            .and_then(|b| b.with_intra_threads(num_cpus::get()))
+            .and_then(|b| b.with_intra_threads(optimal_intra_op_threads()))
+            .and_then(|b| b.with_inter_threads(1))
             .and_then(|b| b.commit_from_memory(model_bytes))
         {
             info!("✓ Using OpenVINO acceleration for {} (Intel CPU optimizations)", model_name);
@@ -171,8 +192,10 @@ pub fn build_session_with_acceleration(
         .context(format!("Failed to configure CPU execution provider for {}", model_name))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .context(format!("Failed to set graph optimization level for {}", model_name))?
-        .with_intra_threads(num_cpus::get())
+        .with_intra_threads(optimal_intra_op_threads())
         .context(format!("Failed to configure intra-op threads for {}", model_name))?
+        .with_inter_threads(1)
+        .context(format!("Failed to configure inter-op threads for {}", model_name))?
         .commit_from_memory(model_bytes)
         .context(format!(
             "Failed to load {} ONNX model from memory ({:.1} MB). \
@@ -205,8 +228,10 @@ fn try_forced_backend(
                 .context("Failed to configure CUDA provider")?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
                 .context("Failed to set optimization level")?
-                .with_intra_threads(num_cpus::get())
-                .context("Failed to configure threads")?
+                .with_intra_threads(optimal_intra_op_threads())
+                .context("Failed to configure intra-op threads")?
+                .with_inter_threads(1)
+                .context("Failed to configure inter-op threads")?
                 .commit_from_memory(model_bytes)
                 .context("Failed to load model with CUDA")?;
             info!("✓ Forced CUDA backend for {}", model_name);
@@ -221,8 +246,10 @@ fn try_forced_backend(
                 .context("Failed to configure TensorRT provider")?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
                 .context("Failed to set optimization level")?
-                .with_intra_threads(num_cpus::get())
-                .context("Failed to configure threads")?
+                .with_intra_threads(optimal_intra_op_threads())
+                .context("Failed to configure intra-op threads")?
+                .with_inter_threads(1)
+                .context("Failed to configure inter-op threads")?
                 .commit_from_memory(model_bytes)
                 .context("Failed to load model with TensorRT")?;
             info!("✓ Forced TensorRT backend for {}", model_name);
@@ -236,8 +263,10 @@ fn try_forced_backend(
                 .context("Failed to configure CPU provider")?
                 .with_optimization_level(GraphOptimizationLevel::Level3)
                 .context("Failed to set optimization level")?
-                .with_intra_threads(num_cpus::get())
-                .context("Failed to configure threads")?
+                .with_intra_threads(optimal_intra_op_threads())
+                .context("Failed to configure intra-op threads")?
+                .with_inter_threads(1)
+                .context("Failed to configure inter-op threads")?
                 .commit_from_memory(model_bytes)
                 .context("Failed to load model with CPU")?;
             info!("✓ Forced CPU backend for {}", model_name);

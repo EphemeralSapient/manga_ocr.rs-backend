@@ -45,6 +45,7 @@ impl Phase4Pipeline {
     /// * `phase2_output` - Translation results
     /// * `phase3_output` - Cleaned regions
     /// * `font_family` - Font family for rendering text (e.g., "arial", "comic-sans")
+    /// * `text_stroke` - Whether to add stroke/outline to text
     ///
     /// # Returns:
     /// Phase4Output with final rendered image
@@ -59,6 +60,7 @@ impl Phase4Pipeline {
         phase2_output: &Phase2Output,
         phase3_output: &Phase3Output,
         font_family: &str,
+        text_stroke: bool,
     ) -> Result<Phase4Output> {
         debug!("Phase 4: Text insertion for page {}", phase1_output.page_index);
 
@@ -139,6 +141,7 @@ impl Phase4Pipeline {
                 translation,
                 &local_label_1_regions,
                 font_family,
+                text_stroke,
             )
             .await
             .context("Failed to composite rendered text")?;
@@ -200,6 +203,7 @@ impl Phase4Pipeline {
         translation: &OCRTranslation,
         local_label_1_regions: &[[i32; 4]],
         font_family: &str,
+        text_stroke: bool,
     ) -> Result<()> {
         // Load cleaned region image
         let mut cleaned_img = image::load_from_memory(cleaned_bytes)
@@ -223,6 +227,7 @@ impl Phase4Pipeline {
             local_label_1_regions,
             &translation.translated_text,
             font_family,
+            text_stroke,
         ).await?;
 
         // OPTIMIZATION: Parallelize alpha blending using rayon with pre-allocated buffer
@@ -282,6 +287,8 @@ impl Phase4Pipeline {
     /// * `canvas_height` - Height of the region
     /// * `label_1_regions` - Text regions in local coordinates (relative to region bbox)
     /// * `text` - Text to render
+    /// * `font_family` - Font family to use
+    /// * `text_stroke` - Whether to add stroke/outline to text
     async fn render_text_for_region(
         &self,
         canvas_width: u32,
@@ -289,6 +296,7 @@ impl Phase4Pipeline {
         label_1_regions: &[[i32; 4]],
         text: &str,
         font_family: &str,
+        text_stroke: bool,
     ) -> Result<RgbaImage> {
         // Create transparent canvas for early return only
         let empty_canvas = ImageBuffer::from_pixel(
@@ -369,8 +377,8 @@ impl Phase4Pipeline {
         let scaled_font_size = font_size * upscale_factor as f32;
         let scaled_max_width = Some(text_width * upscale_factor as f32);
 
-        // Use stroke if enabled in config
-        let stroke_width = if self.config.text_stroke_enabled() {
+        // Use stroke if enabled
+        let stroke_width = if text_stroke {
             Some(self.config.text_stroke_width() * upscale_factor as i32)
         } else {
             None

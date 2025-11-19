@@ -231,10 +231,8 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        // Validate API keys
-        if self.api.api_keys.is_empty() {
-            return Err(ConfigError::NoApiKeys);
-        }
+        // Note: API keys validation removed - keys can be provided via API request from extension
+        // if not set in .env
 
         // Validate detection thresholds
         if !(0.0..=1.0).contains(&self.detection.confidence_threshold) {

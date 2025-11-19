@@ -17,6 +17,7 @@ pub struct AppState {
 }
 
 /// Request configuration for batch processing
+/// All fields are optional - if not provided, defaults from .env are used
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ProcessingConfig {
     /// Font family for rendering translated text (e.g., "arial", "comic-sans")
@@ -30,6 +31,41 @@ pub struct ProcessingConfig {
     /// Banana mode image model override (e.g., "gemini-2.5-flash-image")
     /// If not provided, uses the model from environment config
     pub banana_image_model: Option<String>,
+
+    /// API keys override (array of Gemini API keys)
+    /// If not provided, uses GEMINI_API_KEYS from .env
+    #[serde(rename = "apiKeys")]
+    pub api_keys: Option<Vec<String>>,
+
+    /// Include free-standing text (label 2) in processing
+    /// If not provided, defaults to false
+    #[serde(rename = "includeFreeText")]
+    pub include_free_text: Option<bool>,
+
+    /// Enable banana mode for complex backgrounds
+    /// If not provided, uses BANANA_MODE_ENABLED from .env
+    #[serde(rename = "bananaMode")]
+    pub banana_mode: Option<bool>,
+
+    /// Enable text stroke/outline for better readability
+    /// If not provided, uses TEXT_STROKE_ENABLED from .env
+    #[serde(rename = "textStroke")]
+    pub text_stroke: Option<bool>,
+
+    /// Apply blur to free text backgrounds
+    /// If not provided, uses BLUR_FREE_TEXT from .env
+    #[serde(rename = "blurFreeTextBg")]
+    pub blur_free_text_bg: Option<bool>,
+
+    /// Enable translation cache
+    /// If not provided, defaults to true
+    #[serde(rename = "cache")]
+    pub cache_enabled: Option<bool>,
+
+    /// Include detailed metrics in response
+    /// If not provided, defaults to true
+    #[serde(rename = "metricsDetail")]
+    pub metrics_detail: Option<bool>,
 }
 
 /// Detection label for region classification

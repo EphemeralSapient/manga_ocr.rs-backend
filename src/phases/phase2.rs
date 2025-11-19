@@ -41,6 +41,8 @@ impl Phase2Pipeline {
     /// # Arguments:
     /// * `ocr_model_override` - Optional OCR/translation model name override
     /// * `banana_model_override` - Optional banana mode image model name override
+    /// * `banana_mode` - Whether to use banana mode for complex backgrounds
+    /// * `cache_enabled` - Whether to use translation cache
     ///
     /// # Returns
     /// Phase2Output with translations
@@ -54,6 +56,8 @@ impl Phase2Pipeline {
         phase1_output: &Phase1Output,
         ocr_model_override: Option<&str>,
         banana_model_override: Option<&str>,
+        banana_mode: bool,
+        cache_enabled: bool,
     ) -> Result<Phase2Output> {
         debug!(
             "Phase 2: Processing {} regions for page {}",
@@ -89,7 +93,6 @@ impl Phase2Pipeline {
             complex_regions.len()
         );
 
-        let banana_mode = self.config.banana_mode_enabled();
         let batch_size_m = self.config.api_batch_size_m();
 
         // Process simple and complex backgrounds IN PARALLEL for maximum performance
@@ -97,7 +100,7 @@ impl Phase2Pipeline {
             // Process simple backgrounds (always use OCR/translation)
             async {
                 if !simple_regions.is_empty() {
-                    self.process_simple_backgrounds(&img, source_image_hash, &simple_regions, batch_size_m, ocr_model_override)
+                    self.process_simple_backgrounds(&img, source_image_hash, &simple_regions, batch_size_m, ocr_model_override, cache_enabled)
                         .await
                         .context("Failed to process simple backgrounds")
                 } else {
@@ -115,7 +118,7 @@ impl Phase2Pipeline {
                             .context("Failed to process complex backgrounds with banana")
                     } else {
                         // Use OCR/translation (batched)
-                        self.process_simple_backgrounds(&img, source_image_hash, &complex_regions, batch_size_m, ocr_model_override)
+                        self.process_simple_backgrounds(&img, source_image_hash, &complex_regions, batch_size_m, ocr_model_override, cache_enabled)
                             .await
                             .map(|translations| (Vec::new(), translations))
                             .context("Failed to process complex backgrounds with OCR")
@@ -145,6 +148,7 @@ impl Phase2Pipeline {
     /// * `regions` - Regions to process
     /// * `batch_size_m` - Number of images per API call
     /// * `model_override` - Optional model name to override the default from config
+    /// * `cache_enabled` - Whether to use translation cache
     ///
     /// # Returns:
     /// Vector of (region_id, OCRTranslation)
@@ -155,6 +159,7 @@ impl Phase2Pipeline {
         regions: &[&CategorizedRegion],
         batch_size_m: usize,
         model_override: Option<&str>,
+        cache_enabled: bool,
     ) -> Result<Vec<(usize, OCRTranslation)>> {
         let mut results = Vec::new();
 
@@ -174,14 +179,19 @@ impl Phase2Pipeline {
                     &region.bbox,
                 );
 
-                // Check cache BEFORE expensive cropping/encoding
-                if let Some(cached_translation) = self.cache.get(cache_key) {
-                    debug!("Cache HIT for region {} (skipped crop/encode)", region.region_id);
-                    results.push((region.region_id, cached_translation));
-                } else {
-                    debug!("Cache MISS for region {} (will crop/encode)", region.region_id);
-                    region_data.push((region.region_id, region.bbox));
+                // Check cache BEFORE expensive cropping/encoding (only if cache enabled)
+                if cache_enabled {
+                    if let Some(cached_translation) = self.cache.get(cache_key) {
+                        debug!("Cache HIT for region {} (skipped crop/encode)", region.region_id);
+                        results.push((region.region_id, cached_translation));
+                        continue;
+                    }
                 }
+
+                debug!("Cache {} for region {} (will crop/encode)",
+                    if cache_enabled { "MISS" } else { "DISABLED" },
+                    region.region_id);
+                region_data.push((region.region_id, region.bbox));
             }
 
             // Only crop/encode for cache misses (HUGE savings on cache hits!)
@@ -218,8 +228,10 @@ impl Phase2Pipeline {
                     .zip(translations.into_iter())
                 {
                     // Use source_image_hash for cache key consistency
-                    let cache_key = TranslationCache::generate_key_from_source(source_image_hash, &bbox);
-                    self.cache.put(cache_key, &translation);
+                    if cache_enabled {
+                        let cache_key = TranslationCache::generate_key_from_source(source_image_hash, &bbox);
+                        self.cache.put(cache_key, &translation);
+                    }
                     results.push((region_id, translation));
                 }
             }

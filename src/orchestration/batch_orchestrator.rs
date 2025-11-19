@@ -115,10 +115,9 @@ impl BatchOrchestrator {
         // Process batches in parallel
         let mut tasks = Vec::new();
 
-        // Extract config overrides (default to None if not provided)
-        let font_family = config.font_family.clone().unwrap_or_else(|| "arial".to_string());
-        let ocr_model = config.ocr_translation_model.clone();
-        let banana_model = config.banana_image_model.clone();
+        // Clone config for spawned tasks
+        let config = Arc::new(config.clone());
+        let app_config = Arc::clone(&self.config);
 
         for batch in batches {
             let phase1 = Arc::clone(&self.phase1);
@@ -126,9 +125,8 @@ impl BatchOrchestrator {
             let phase3 = Arc::clone(&self.phase3);
             let phase4 = Arc::clone(&self.phase4);
             let semaphore = Arc::clone(&self.batch_semaphore);
-            let font_family = font_family.clone();
-            let ocr_model = ocr_model.clone();
-            let banana_model = banana_model.clone();
+            let config = Arc::clone(&config);
+            let app_config = Arc::clone(&app_config);
 
             let task = tokio::spawn(async move {
                 // Acquire semaphore permit
@@ -145,9 +143,8 @@ impl BatchOrchestrator {
                     phase3,
                     phase4,
                     batch,
-                    &font_family,
-                    ocr_model.as_deref(),
-                    banana_model.as_deref(),
+                    &config,
+                    &app_config,
                 )
                 .await
             });
@@ -232,9 +229,8 @@ async fn process_single_batch(
     phase3: Arc<Phase3Pipeline>,
     phase4: Arc<Phase4Pipeline>,
     batch: ImageBatch,
-    font_family: &str,
-    ocr_model_override: Option<&str>,
-    banana_model_override: Option<&str>,
+    config: &ProcessingConfig,
+    app_config: &Config,
 ) -> Result<(Vec<PageResult>, PerformanceMetrics)> {
     debug!("Processing batch {} with {} images", batch.batch_id, batch.images.len());
 
@@ -250,9 +246,8 @@ async fn process_single_batch(
             &phase3,
             &phase4,
             image_data,
-            font_family,
-            ocr_model_override,
-            banana_model_override,
+            config,
+            app_config,
         )
         .await
         {
@@ -304,11 +299,20 @@ async fn process_single_page(
     phase3: &Phase3Pipeline,
     phase4: &Phase4Pipeline,
     image_data: &ImageData,
-    font_family: &str,
-    ocr_model_override: Option<&str>,
-    banana_model_override: Option<&str>,
+    config: &ProcessingConfig,
+    app_config: &Config,
 ) -> Result<(PerformanceMetrics, Vec<u8>)> {
     let mut metrics = PerformanceMetrics::default();
+
+    // Extract config with defaults from app_config
+    let font_family = config.font_family.clone().unwrap_or_else(|| "arial".to_string());
+    let ocr_model_override = config.ocr_translation_model.as_deref();
+    let banana_model_override = config.banana_image_model.as_deref();
+    let include_free_text = config.include_free_text.unwrap_or(false);
+    let banana_mode = config.banana_mode.unwrap_or(app_config.banana_mode_enabled());
+    let text_stroke = config.text_stroke.unwrap_or(app_config.text_stroke_enabled());
+    let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
+    let cache_enabled = config.cache_enabled.unwrap_or(true);
 
     // OPTIMIZATION: Load image once for all phases to avoid redundant decoding
     // Image decoding is expensive (5-50ms), and we were doing it 4 times per image.
@@ -328,10 +332,16 @@ async fn process_single_page(
 
     // Phase 1: Detection & Categorization
     let p1_start = Instant::now();
-    let phase1_output = phase1
+    let mut phase1_output = phase1
         .execute(&optimized_image_data)
         .await
         .context("Phase 1 failed")?;
+
+    // Filter out label 2 (free text) if not included
+    if !include_free_text {
+        phase1_output.regions.retain(|r| r.label != 2);
+    }
+
     metrics.phase1_time = p1_start.elapsed();
     metrics.total_regions = phase1_output.regions.len();
     metrics.simple_bg_count = phase1_output
@@ -345,7 +355,14 @@ async fn process_single_page(
     // Phase 2: API Calls
     let p2_start = Instant::now();
     let phase2_output = phase2
-        .execute(&optimized_image_data, &phase1_output, ocr_model_override, banana_model_override)
+        .execute(
+            &optimized_image_data,
+            &phase1_output,
+            ocr_model_override,
+            banana_model_override,
+            banana_mode,
+            cache_enabled,
+        )
         .await
         .context("Phase 2 failed")?;
     metrics.phase2_time = p2_start.elapsed();
@@ -363,7 +380,7 @@ async fn process_single_page(
     // Phase 3: Text Removal
     let p3_start = Instant::now();
     let phase3_output = phase3
-        .execute(&optimized_image_data, &phase1_output, &banana_region_ids)
+        .execute(&optimized_image_data, &phase1_output, &banana_region_ids, blur_free_text)
         .await
         .context("Phase 3 failed")?;
     metrics.phase3_time = p3_start.elapsed();
@@ -371,7 +388,14 @@ async fn process_single_page(
     // Phase 4: Text Insertion
     let p4_start = Instant::now();
     let phase4_output = phase4
-        .execute(&optimized_image_data, &phase1_output, &phase2_output, &phase3_output, font_family)
+        .execute(
+            &optimized_image_data,
+            &phase1_output,
+            &phase2_output,
+            &phase3_output,
+            &font_family,
+            text_stroke,
+        )
         .await
         .context("Phase 4 failed")?;
     metrics.phase4_time = p4_start.elapsed();

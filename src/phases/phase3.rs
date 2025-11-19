@@ -40,6 +40,7 @@ impl Phase3Pipeline {
     /// * `image_data` - Original image data
     /// * `phase1_output` - Phase 1 detection/categorization results
     /// * `banana_processed_region_ids` - IDs of regions processed with banana (skip these)
+    /// * `blur_free_text` - Whether to blur free text regions (label 2) instead of white fill
     ///
     /// # Returns:
     /// Phase3Output with cleaned region images
@@ -52,6 +53,7 @@ impl Phase3Pipeline {
         image_data: &ImageData,
         phase1_output: &Phase1Output,
         banana_processed_region_ids: &[usize],
+        blur_free_text: bool,
     ) -> Result<Phase3Output> {
         debug!(
             "Phase 3: Text removal for page {}",
@@ -100,7 +102,7 @@ impl Phase3Pipeline {
             );
 
             let cleaned_bytes = self
-                .clean_region(&img, region, &seg_mask)
+                .clean_region(&img, region, &seg_mask, blur_free_text)
                 .context("Failed to clean region")?;
 
             cleaned_regions.push((region.region_id, cleaned_bytes));
@@ -124,6 +126,7 @@ impl Phase3Pipeline {
         img: &DynamicImage,
         region: &CategorizedRegion,
         seg_mask: &ImageBuffer<Luma<u8>, Vec<u8>>,
+        blur_free_text: bool,
     ) -> Result<Vec<u8>> {
         let [x1, y1, x2, y2] = region.bbox;
         let width = (x2 - x1).max(1) as u32;
@@ -134,7 +137,7 @@ impl Phase3Pipeline {
 
         // Special handling for label 2 (free text): fill or blur entire bbox
         if region.label == 2 {
-            return self.clean_free_text_region(cropped);
+            return self.clean_free_text_region(cropped, blur_free_text);
         }
 
         // Create label 1 mask for this region
@@ -274,8 +277,8 @@ impl Phase3Pipeline {
     }
 
     /// Clean free text (label 2) region: white fill or blur entire bbox
-    fn clean_free_text_region(&self, mut img: image::RgbaImage) -> Result<Vec<u8>> {
-        if self.config.blur_free_text() {
+    fn clean_free_text_region(&self, mut img: image::RgbaImage, blur_free_text: bool) -> Result<Vec<u8>> {
+        if blur_free_text {
             // Blur the entire region
             let blur_radius = self.config.blur_radius();
             img = image::imageops::blur(&img, blur_radius);
