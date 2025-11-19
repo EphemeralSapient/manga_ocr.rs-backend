@@ -17,9 +17,16 @@ use tracing::{info, warn, debug};
 /// Reference: https://github.com/microsoft/onnxruntime/issues/3713
 fn optimal_intra_op_threads() -> usize {
     let total_cores = num_cpus::get();
-    // Cap at 6 threads to avoid synchronization overhead (especially on Windows)
-    // Use at least 1 thread
+
+    // Platform-specific optimization:
+    // - Windows: Cap at 6 threads due to synchronization overhead
+    // - Linux/macOS: Use all physical cores for maximum throughput
+    #[cfg(target_os = "windows")]
     let optimal = std::cmp::min(6, total_cores).max(1);
+
+    #[cfg(not(target_os = "windows"))]
+    let optimal = total_cores.max(1);
+
     debug!("CPU threads: {} total cores, using {} for inference", total_cores, optimal);
     optimal
 }

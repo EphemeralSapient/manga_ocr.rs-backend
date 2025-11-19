@@ -16,7 +16,7 @@ jobs:
     runs-on: windows-2025  # Faster I/O with Dev Drive support
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
@@ -94,7 +94,7 @@ jobs:
 
       - name: Create Release
         if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: manga_workflow-${{ steps.get_version.outputs.version }}-windows-x86_64.zip
           draft: false
