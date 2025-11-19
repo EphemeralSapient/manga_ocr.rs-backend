@@ -5,6 +5,16 @@ use anyhow::{Result, Context};
 use image::DynamicImage;
 use ndarray::{Array2, Array4};
 use ort::execution_providers::CPUExecutionProvider;
+#[cfg(feature = "cuda")]
+use ort::execution_providers::CUDAExecutionProvider;
+#[cfg(feature = "tensorrt")]
+use ort::execution_providers::TensorRTExecutionProvider;
+#[cfg(all(target_os = "windows", feature = "directml"))]
+use ort::execution_providers::DirectMLExecutionProvider;
+#[cfg(all(target_os = "macos", feature = "coreml"))]
+use ort::execution_providers::CoreMLExecutionProvider;
+#[cfg(feature = "openvino")]
+use ort::execution_providers::OpenVINOExecutionProvider;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Value;
 use std::sync::Arc;
