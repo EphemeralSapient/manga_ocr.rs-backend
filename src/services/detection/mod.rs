@@ -189,16 +189,19 @@ impl DetectionService {
             #[cfg(all(target_os = "windows", feature = "directml"))]
             "DIRECTML" => {
                 info!("Forcing DirectML backend...");
-                // DirectML REQUIRES specific session configuration (GitHub #16564)
+                // DirectML with CPU fallback for unsupported operations
                 let session = Session::builder()?
-                    .with_execution_providers([DirectMLExecutionProvider::default().build()])?
+                    .with_execution_providers([
+                        CPUExecutionProvider::default().build(),
+                        DirectMLExecutionProvider::default().build()
+                    ])?
                     .with_parallel_execution(false)?   // REQUIRED: Sequential execution
                     .with_memory_pattern(false)?       // REQUIRED: Disable memory pattern
                     .with_optimization_level(GraphOptimizationLevel::Level1)?
                     .with_intra_threads(num_cpus::get())?
                     .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized DirectML backend");
-                Ok(("DirectML (forced)".to_string(), session))
+                info!("✓ Successfully initialized DirectML backend (with CPU fallback)");
+                Ok(("DirectML+CPU (forced)".to_string(), session))
             }
             #[cfg(not(all(target_os = "windows", feature = "directml")))]
             "DIRECTML" => {
@@ -325,18 +328,20 @@ impl DetectionService {
         // Try DirectML (Windows, if feature enabled)
         #[cfg(all(target_os = "windows", feature = "directml"))]
         {
-            // DirectML REQUIRES specific session configuration (GitHub #16564)
-            // Python ONNX Runtime sets these automatically, but C++/Rust requires manual configuration
+            // DirectML with CPU fallback for unsupported operations
             if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([DirectMLExecutionProvider::default().build()]))
+                .and_then(|b| b.with_execution_providers([
+                    CPUExecutionProvider::default().build(),
+                    DirectMLExecutionProvider::default().build()
+                ]))
                 .and_then(|b| b.with_parallel_execution(false))  // REQUIRED: Sequential execution
                 .and_then(|b| b.with_memory_pattern(false))      // REQUIRED: Disable memory pattern
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level1))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
                 .and_then(|b| b.commit_from_memory(&model_bytes))
             {
-                info!("✓ Using DirectML acceleration");
-                return Ok(("DirectML".to_string(), session));
+                info!("✓ Using DirectML acceleration (with CPU fallback)");
+                return Ok(("DirectML+CPU".to_string(), session));
             }
         }
 

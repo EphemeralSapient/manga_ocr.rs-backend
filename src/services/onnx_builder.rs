@@ -261,11 +261,14 @@ pub fn build_session_with_acceleration(
     // Try DirectML (Windows, if feature enabled)
     #[cfg(all(target_os = "windows", feature = "directml"))]
     {
-        // DirectML REQUIRES specific session configuration (GitHub #16564)
-        // Python ONNX Runtime sets these automatically, but C++/Rust requires manual configuration
-        // CRITICAL: Must disable memory pattern and use sequential execution
+        // DirectML with CPU fallback for unsupported operations (e.g., Softmax in transformers)
+        // GitHub issues: #8118, #15255, #16564, #20575
+        // DirectML doesn't support all operations - CPU fallback is REQUIRED for transformer models
         if let Ok(session) = Session::builder()
-            .and_then(|b| b.with_execution_providers([DirectMLExecutionProvider::default().build()]))
+            .and_then(|b| b.with_execution_providers([
+                CPUExecutionProvider::default().build(),      // Fallback for unsupported ops
+                DirectMLExecutionProvider::default().build()  // Primary GPU acceleration
+            ]))
             .and_then(|b| b.with_parallel_execution(false))  // REQUIRED: Sequential execution
             .and_then(|b| b.with_memory_pattern(false))      // REQUIRED: Disable memory pattern
             .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level1))
@@ -273,8 +276,8 @@ pub fn build_session_with_acceleration(
             .and_then(|b| b.with_inter_threads(1))
             .and_then(|b| b.commit_from_memory(model_bytes))
         {
-            info!("✓ Using DirectML acceleration for {}", model_name);
-            return Ok(("DirectML".to_string(), session));
+            info!("✓ Using DirectML acceleration for {} (with CPU fallback)", model_name);
+            return Ok(("DirectML+CPU".to_string(), session));
         }
     }
 
