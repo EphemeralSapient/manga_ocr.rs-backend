@@ -189,9 +189,11 @@ impl DetectionService {
             #[cfg(all(target_os = "windows", feature = "directml"))]
             "DIRECTML" => {
                 info!("Forcing DirectML backend...");
+                // DirectML has issues with Level3 optimizations (FusedMatMulActivation errors)
+                // Use Level1 for better compatibility
                 let session = Session::builder()?
                     .with_execution_providers([DirectMLExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
+                    .with_optimization_level(GraphOptimizationLevel::Level1)?
                     .with_intra_threads(num_cpus::get())?
                     .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized DirectML backend");
@@ -322,9 +324,11 @@ impl DetectionService {
         // Try DirectML (Windows, if feature enabled)
         #[cfg(all(target_os = "windows", feature = "directml"))]
         {
+            // DirectML has issues with Level3 optimizations (FusedMatMulActivation errors)
+            // Use Level1 for better compatibility
             if let Ok(session) = Session::builder()
                 .and_then(|b| b.with_execution_providers([DirectMLExecutionProvider::default().build()]))
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
+                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level1))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
                 .and_then(|b| b.commit_from_memory(&model_bytes))
             {
