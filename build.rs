@@ -36,16 +36,17 @@ fn main() {
     let target = env::var("TARGET").unwrap_or_default();
 
     // Detect enabled acceleration features
-    let mut enabled_features = Vec::new();
+    let mut gpu_features = Vec::new();
+    let mut cpu_features = Vec::new();
 
     if env::var("CARGO_FEATURE_CUDA").is_ok() {
-        enabled_features.push("CUDA");
+        gpu_features.push("CUDA");
     }
     if env::var("CARGO_FEATURE_TENSORRT").is_ok() {
-        enabled_features.push("TensorRT");
+        gpu_features.push("TensorRT");
     }
     if env::var("CARGO_FEATURE_DIRECTML").is_ok() {
-        enabled_features.push("DirectML");
+        gpu_features.push("DirectML");
 
         // Copy DirectML.dll to output directory (fixes version mismatch with System32)
         // Windows ships old DirectML 1.8, ONNX Runtime needs 1.15.4+
@@ -75,22 +76,30 @@ fn main() {
         }
     }
     if env::var("CARGO_FEATURE_COREML").is_ok() {
-        enabled_features.push("CoreML");
+        gpu_features.push("CoreML");
     }
     if env::var("CARGO_FEATURE_OPENVINO").is_ok() {
-        enabled_features.push("OpenVINO");
+        cpu_features.push("OpenVINO");
+    }
+    if env::var("CARGO_FEATURE_XNNPACK").is_ok() {
+        cpu_features.push("XNNPACK");
     }
 
-    if enabled_features.is_empty() {
-        println!("cargo:warning=Building with CPU-only inference (no GPU acceleration)");
-        println!("cargo:warning=To enable GPU: cargo build --features cuda (or directml on Windows)");
-    } else {
-        println!("cargo:warning=GPU acceleration enabled: {}", enabled_features.join(", "));
+    // Print acceleration status
+    if !gpu_features.is_empty() {
+        println!("cargo:warning=GPU acceleration enabled: {}", gpu_features.join(", "));
+    }
+    if !cpu_features.is_empty() {
+        println!("cargo:warning=CPU acceleration enabled: {}", cpu_features.join(", "));
+    }
+    if gpu_features.is_empty() && cpu_features.is_empty() {
+        println!("cargo:warning=Building with CPU-only inference (no acceleration)");
+        println!("cargo:warning=To enable acceleration: cargo build --features cuda (or directml/xnnpack)");
     }
 
     // Platform-specific warnings (target already defined above)
 
-    if target.contains("windows-gnu") && enabled_features.contains(&"CUDA") {
+    if target.contains("windows-gnu") && gpu_features.contains(&"CUDA") {
         println!("cargo:warning=WARNING: CUDA binaries may not be available for Windows GNU target");
         println!("cargo:warning=Consider using DirectML instead: cargo build --features directml");
     }

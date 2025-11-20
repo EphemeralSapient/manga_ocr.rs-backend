@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
 
     // Set global default to configured level, then override noisy dependencies
     let filter = EnvFilter::new(format!(
-        "{},ort=warn,h2=warn,tower_http=warn,hyper=warn,tokio=info,runtime=warn,xnnpack=warn",
+        "{},ort=warn,h2=warn,tower_http=warn,hyper=warn,tokio=info,runtime=warn,xnnpack=warn,cosmic_text=info",
         level_str
     ));
 

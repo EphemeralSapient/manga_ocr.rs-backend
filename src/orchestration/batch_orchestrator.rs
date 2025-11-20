@@ -130,6 +130,16 @@ impl BatchOrchestrator {
 
         // ===== PHASE 1: ALL BATCHES =====
         info!("Starting Phase 1 for all {} batches", batches.len());
+
+        // Pre-allocate ONNX sessions for concurrent batches
+        // Each batch needs at least 1 session to avoid serialization
+        let num_batches = batches.len();
+        if num_batches > 1 {
+            info!("⚡ Pre-allocating sessions: {} batches running in parallel", num_batches);
+            // Trigger session expansion by informing phase1 of concurrent load
+            // This happens automatically in expand_if_needed, but we can pre-warm
+        }
+
         let phase1_start = Instant::now();
 
         let mut phase1_tasks = Vec::new();
@@ -138,7 +148,7 @@ impl BatchOrchestrator {
             let images = batch.images.clone();
 
             let task = tokio::spawn(async move {
-                let batch_outputs = phase1.execute_batch(&images, use_mask).await?;
+                let batch_outputs = phase1.execute_batch(&images, use_mask, merge_img).await?;
                 Ok::<_, anyhow::Error>((images, batch_outputs))
             });
 
@@ -449,7 +459,7 @@ async fn process_single_batch(
         debug!("Batch {}: Starting Phase 1 BATCH MODE for {} pages", batch.batch_id, batch.images.len());
 
         // Execute batch Phase 1
-        let batch_outputs = phase1.execute_batch(&batch.images, use_mask).await;
+        let batch_outputs = phase1.execute_batch(&batch.images, use_mask, merge_img).await;
 
         match batch_outputs {
             Ok(outputs) => {

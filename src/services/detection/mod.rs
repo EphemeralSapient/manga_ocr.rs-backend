@@ -176,18 +176,16 @@ impl DetectionService {
             #[cfg(all(target_os = "windows", feature = "directml"))]
             "DIRECTML" => {
                 info!("Forcing DirectML backend...");
-                // DirectML with CPU fallback for unsupported operations
+                // DirectML with CPU fallback, full optimizations (DirectML 1.15.4+)
                 let session = Session::builder()?
                     .with_execution_providers([
                         CPUExecutionProvider::default().build(),
                         DirectMLExecutionProvider::default().build()
                     ])?
-                    .with_parallel_execution(false)?   // REQUIRED: Sequential execution
-                    .with_memory_pattern(false)?       // REQUIRED: Disable memory pattern
-                    .with_optimization_level(GraphOptimizationLevel::Level1)?
+                    .with_optimization_level(GraphOptimizationLevel::Level3)?  // Full optimization
                     .with_intra_threads(num_cpus::get())?
                     .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized DirectML backend (with CPU fallback)");
+                info!("✓ Successfully initialized DirectML backend (with CPU fallback, Level3 optimizations)");
                 Ok(("DirectML+CPU (forced)".to_string(), session))
             }
             #[cfg(not(all(target_os = "windows", feature = "directml")))]
@@ -403,23 +401,42 @@ impl DetectionService {
     }
 
     /// Expand session pool if under capacity (lazy allocation)
+    /// Expands aggressively when high contention detected
     fn expand_if_needed(&self) {
         let available = self.session_pool.available();
         let in_use = self.session_pool.in_use();
         let total = available + in_use;
 
-        // If all sessions busy and under capacity, create a new one
-        if available == 0 && total < self.max_sessions {
-            debug!("🔄 [LAZY EXPANSION] Detection pool under pressure: {}/{} sessions, creating new session",
-                   total, self.max_sessions);
+        // Aggressive expansion: create multiple sessions if under pressure
+        // - No available sessions + low total = create 2-3 sessions for parallelism
+        // - Some available but high load = create 1 session
+        let sessions_to_create = if available == 0 && total < self.max_sessions {
+            // High contention: create multiple sessions for better parallelism
+            let headroom = self.max_sessions - total;
+            std::cmp::min(3, headroom) // Create up to 3 sessions at once
+        } else {
+            0
+        };
 
-            // Create new session in blocking task (we're already in async context)
-            if let Ok((_, new_session)) = Self::initialize_with_acceleration(&self.config) {
-                self.session_pool.add_session(new_session);
-                info!("✓ Expanded detection pool: {}/{} sessions ({}  MB used)",
-                      total + 1, self.max_sessions, (total + 1) * 42);
-            } else {
-                debug!("⚠️  Failed to create additional detection session");
+        if sessions_to_create > 0 {
+            debug!("🔄 [LAZY EXPANSION] Detection pool under pressure: {}/{} sessions, creating {} new sessions",
+                   total, self.max_sessions, sessions_to_create);
+
+            // Create sessions in parallel for faster startup
+            let mut created = 0;
+            for _ in 0..sessions_to_create {
+                if let Ok((_, new_session)) = Self::initialize_with_acceleration(&self.config) {
+                    self.session_pool.add_session(new_session);
+                    created += 1;
+                } else {
+                    debug!("⚠️  Failed to create additional detection session");
+                    break;
+                }
+            }
+
+            if created > 0 {
+                info!("✓ Expanded detection pool: {}/{} sessions ({} MB used)",
+                      total + created, self.max_sessions, (total + created) * 42);
             }
         }
     }

@@ -165,23 +165,38 @@ impl SegmentationService {
     }
 
     /// Expand session pool if under capacity (lazy allocation)
+    /// Expands aggressively when high contention detected
     fn expand_if_needed(&self) {
         let available = self.session_pool.available();
         let in_use = self.session_pool.in_use();
         let total = available + in_use;
 
-        // If all sessions busy and under capacity, create a new one
-        if available == 0 && total < self.max_sessions {
-            debug!("🔄 [LAZY EXPANSION] Segmentation pool under pressure: {}/{} sessions, creating new session",
-                   total, self.max_sessions);
+        // Aggressive expansion: create multiple sessions if under pressure
+        let sessions_to_create = if available == 0 && total < self.max_sessions {
+            let headroom = self.max_sessions - total;
+            std::cmp::min(3, headroom) // Create up to 3 sessions at once
+        } else {
+            0
+        };
 
-            // Create new session
-            if let Ok((_, new_session)) = Self::initialize_with_acceleration(&self.config) {
-                self.session_pool.add_session(new_session);
+        if sessions_to_create > 0 {
+            debug!("🔄 [LAZY EXPANSION] Segmentation pool under pressure: {}/{} sessions, creating {} new sessions",
+                   total, self.max_sessions, sessions_to_create);
+
+            let mut created = 0;
+            for _ in 0..sessions_to_create {
+                if let Ok((_, new_session)) = Self::initialize_with_acceleration(&self.config) {
+                    self.session_pool.add_session(new_session);
+                    created += 1;
+                } else {
+                    debug!("⚠️  Failed to create additional segmentation session");
+                    break;
+                }
+            }
+
+            if created > 0 {
                 info!("✓ Expanded segmentation pool: {}/{} sessions ({} MB used)",
-                      total + 1, self.max_sessions, (total + 1) * 40);
-            } else {
-                debug!("⚠️  Failed to create additional segmentation session");
+                      total + created, self.max_sessions, (total + created) * 40);
             }
         }
     }

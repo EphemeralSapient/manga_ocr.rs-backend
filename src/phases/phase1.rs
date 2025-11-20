@@ -142,17 +142,23 @@ impl Phase1Pipeline {
     /// Execute Phase 1 on multiple images using batch inference
     ///
     /// This is more efficient than calling execute() multiple times when merge_img is enabled.
-    /// Detection runs in a single batched ONNX inference pass.
-    /// Segmentation is skipped if use_mask is false.
-    pub async fn execute_batch(&self, images: &[ImageData], use_mask: bool) -> Result<Vec<Phase1Output>> {
+    /// Batch execution: supports both batched and parallel modes
+    /// - merge_img=true: Single batched ONNX inference (faster for multiple images)
+    /// - merge_img=false: Individual ONNX inferences in parallel (uses multiple sessions)
+    /// - use_mask: Enable/disable segmentation mask generation
+    pub async fn execute_batch(&self, images: &[ImageData], use_mask: bool, merge_img: bool) -> Result<Vec<Phase1Output>> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
 
-        debug!("Phase 1 BATCH: Processing {} images with batched detection", images.len());
+        if merge_img {
+            debug!("Phase 1 BATCH MODE: Processing {} images with SINGLE batched ONNX inference", images.len());
+        } else {
+            debug!("Phase 1 PARALLEL MODE: Processing {} images with INDIVIDUAL inferences", images.len());
+        }
         let batch_start = std::time::Instant::now();
 
-        // Prepare images for batch detection
+        // Prepare images
         let mut decoded_images: Vec<DynamicImage> = Vec::with_capacity(images.len());
         for image_data in images {
             let img = if let Some(ref decoded) = image_data.decoded_image {
@@ -164,19 +170,44 @@ impl Phase1Pipeline {
             decoded_images.push(img);
         }
 
-        // Create references for batch detection
-        let batch_refs: Vec<(&DynamicImage, usize)> = decoded_images
-            .iter()
-            .zip(images.iter())
-            .map(|(img, data)| (img, data.index))
-            .collect();
-
-        // Run batch detection (single ONNX inference for all images)
-        debug!("Running batched detection for {} images...", images.len());
+        // Run detection: batched or parallel based on merge_img setting
         let detection_start = std::time::Instant::now();
-        let batch_detections = self.detector.detect_all_labels_batch(&batch_refs).await
-            .context("Batch detection failed")?;
-        debug!("✓ Batch detection completed in {:.2}ms", detection_start.elapsed().as_secs_f64() * 1000.0);
+        let batch_detections: Vec<(Vec<_>, Vec<_>, Vec<_>)> = if merge_img {
+            // BATCH MODE: Single ONNX inference for all images
+            debug!("Running BATCHED detection (single ONNX call for {} images)...", images.len());
+            let batch_refs: Vec<(&DynamicImage, usize)> = decoded_images
+                .iter()
+                .zip(images.iter())
+                .map(|(img, data)| (img, data.index))
+                .collect();
+
+            self.detector.detect_all_labels_batch(&batch_refs).await
+                .context("Batch detection failed")?
+        } else {
+            // PARALLEL MODE: Individual ONNX inferences (uses multiple sessions)
+            debug!("Running PARALLEL detection ({} individual ONNX calls)...", images.len());
+            let detection_tasks: Vec<_> = decoded_images
+                .iter()
+                .zip(images.iter())
+                .map(|(img, data)| {
+                    let detector = Arc::clone(&self.detector);
+                    let img_ref = img;
+                    let index = data.index;
+                    async move {
+                        detector.detect_all_labels(img_ref, index).await
+                    }
+                })
+                .collect();
+
+            futures::future::join_all(detection_tasks)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        debug!("✓ Detection completed in {:.2}ms (mode: {})",
+               detection_start.elapsed().as_secs_f64() * 1000.0,
+               if merge_img { "BATCH" } else { "PARALLEL" });
 
         // Run segmentation in parallel for each image (only if use_mask is true)
         let segmentation_results: Vec<Result<Vec<u8>, anyhow::Error>> = if use_mask {
