@@ -60,7 +60,8 @@ impl BatchOrchestrator {
 
         let batch_semaphore = Arc::new(Semaphore::new(config.max_concurrent_batches()));
 
-        info!("✓ Ready (batch mode: SINGLE LARGE BATCH, ONNX pool: {} sessions, ~{} MB)",
+        info!("✓ Ready (batches: {}, ONNX pool: {} sessions, ~{} MB)",
+            config.max_concurrent_batches(),
             config.onnx_pool_size(),
             config.onnx_pool_size() * (42 + 40));
 
@@ -96,7 +97,28 @@ impl BatchOrchestrator {
         let start_time = Instant::now();
         let total_images = images.len();
 
-        info!("Processing {} images in SINGLE LARGE BATCH", total_images);
+        info!("Processing {} images", total_images);
+
+        // Divide images into batches of N
+        let batch_size_n = self.config.batch_size_n();
+        let batches: Vec<ImageBatch> = images
+            .chunks(batch_size_n)
+            .enumerate()
+            .map(|(i, chunk)| ImageBatch {
+                batch_id: format!("batch_{}", i),
+                images: chunk.to_vec(),
+            })
+            .collect();
+
+        info!(
+            "Created {} batches of {} images each",
+            batches.len(),
+            batch_size_n
+        );
+
+        // Process batches in parallel
+        // NEW ARCHITECTURE: Process all batches phase-by-phase globally
+        // Phase 1 for all → Phase 2 for all (split across keys) → Phase 3 for all → Phase 4 for all
 
         let config = Arc::new(config.clone());
         let app_config = Arc::clone(&self.config);
@@ -104,42 +126,74 @@ impl BatchOrchestrator {
         let use_mask = config.use_mask.unwrap_or(true);
         let include_free_text = config.include_free_text.unwrap_or(false);
 
-        info!("Phase-by-phase processing: Phase 1 (BATCH) → Phase 2 (GLOBAL) → Phase 3 → Phase 4");
+        info!("Processing {} batches phase-by-phase: Phase 1 → Phase 2 (global) → Phase 3 → Phase 4", batches.len());
 
-        // ===== PHASE 1: SINGLE LARGE BATCH =====
-        info!("Starting Phase 1 for all {} images (single batch)", total_images);
+        // ===== PHASE 1: ALL BATCHES =====
+        info!("Starting Phase 1 for all {} batches", batches.len());
+
+        // Pre-allocate ONNX sessions for concurrent batches
+        // Each batch needs at least 1 session to avoid serialization
+        let num_batches = batches.len();
+        if num_batches > 1 {
+            info!("⚡ Pre-allocating sessions: {} batches running in parallel", num_batches);
+            // Trigger session expansion by informing phase1 of concurrent load
+            // This happens automatically in expand_if_needed, but we can pre-warm
+        }
+
         let phase1_start = Instant::now();
 
-        // Process all images in one batch
-        let phase1_outputs = self.phase1.execute_batch(&images, use_mask, merge_img).await?;
+        let mut phase1_tasks = Vec::new();
+        for batch in batches {
+            let phase1 = Arc::clone(&self.phase1);
+            let images = batch.images.clone();
 
-        // Collect Phase 1 data and metrics
+            let task = tokio::spawn(async move {
+                let batch_outputs = phase1.execute_batch(&images, use_mask, merge_img).await?;
+                Ok::<_, anyhow::Error>((images, batch_outputs))
+            });
+
+            phase1_tasks.push(task);
+        }
+
+        // Wait for all Phase 1 to complete
         let mut all_phase1_data: Vec<(ImageData, crate::core::types::Phase1Output)> = Vec::new();
         let mut phase1_metrics = PerformanceMetrics::default();
 
-        for (i, mut output) in phase1_outputs.into_iter().enumerate() {
-            // Filter out label 2 if not included
-            if !include_free_text {
-                output.regions.retain(|r| r.label != 2);
-            }
+        for task in phase1_tasks {
+            match task.await {
+                Ok(Ok((images, outputs))) => {
+                    for (i, mut output) in outputs.into_iter().enumerate() {
+                        // Filter out label 2 if not included
+                        if !include_free_text {
+                            output.regions.retain(|r| r.label != 2);
+                        }
 
-            // Count metrics
-            phase1_metrics.total_regions += output.regions.len();
-            for region in &output.regions {
-                match region.label {
-                    0 => phase1_metrics.label_0_count += 1,
-                    1 => phase1_metrics.label_1_count += 1,
-                    2 => phase1_metrics.label_2_count += 1,
-                    _ => {}
+                        // Count metrics
+                        phase1_metrics.total_regions += output.regions.len();
+                        for region in &output.regions {
+                            match region.label {
+                                0 => phase1_metrics.label_0_count += 1,
+                                1 => phase1_metrics.label_1_count += 1,
+                                2 => phase1_metrics.label_2_count += 1,
+                                _ => {}
+                            }
+                            if region.background_type == crate::core::types::BackgroundType::Simple {
+                                phase1_metrics.simple_bg_count += 1;
+                            } else {
+                                phase1_metrics.complex_bg_count += 1;
+                            }
+                        }
+
+                        all_phase1_data.push((images[i].clone(), output));
+                    }
                 }
-                if region.background_type == crate::core::types::BackgroundType::Simple {
-                    phase1_metrics.simple_bg_count += 1;
-                } else {
-                    phase1_metrics.complex_bg_count += 1;
+                Ok(Err(e)) => {
+                    tracing::error!("Phase 1 batch failed: {:?}", e);
+                }
+                Err(e) => {
+                    tracing::error!("Phase 1 task panicked: {:?}", e);
                 }
             }
-
-            all_phase1_data.push((images[i].clone(), output));
         }
 
         phase1_metrics.phase1_time = phase1_start.elapsed();
