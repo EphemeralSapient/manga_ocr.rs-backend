@@ -47,10 +47,10 @@ impl SegmentationService {
     /// Result containing the segmentation service or an error
     #[instrument(skip(config), fields(target_size = config.target_size()))]
     pub async fn new(config: Arc<Config>) -> Result<Self> {
-        // Single session for static memory usage (~40 MB)
-        // Multiple concurrent requests will wait for session availability
-        let pool_size = 1;
-        debug!("Creating segmentation session with {} session(s) for static memory", pool_size);
+        // Configurable pool size for inference parallelism
+        // Default 4 sessions = ~160 MB, provides 4x throughput vs single session
+        let pool_size = config.onnx_pool_size();
+        debug!("Creating segmentation session pool with {} session(s)", pool_size);
 
         // Create first session to determine device type
         let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
@@ -87,7 +87,7 @@ impl SegmentationService {
         // Wrap in Arc for sharing across threads
         let session_pool = Arc::new(session_pool);
 
-        info!("✓ Segmentation: {} (1 session, ~40 MB static)", device_type);
+        info!("✓ Segmentation: {} ({} sessions, ~{} MB)", device_type, pool_size, pool_size * 40);
 
         Ok(Self {
             session_pool,

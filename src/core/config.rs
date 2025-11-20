@@ -41,6 +41,8 @@ pub struct BatchConfig {
     pub api_batch_size_m: usize,
     /// Maximum number of batches to process concurrently
     pub max_concurrent_batches: usize,
+    /// Number of ONNX sessions per model (controls inference parallelism)
+    pub onnx_pool_size: usize,
 }
 
 /// Background classification configuration
@@ -181,6 +183,10 @@ impl Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(100),
+                onnx_pool_size: env::var("ONNX_POOL_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(8), // Default 8 for maximum parallelism with ~656MB memory
             },
             background: BackgroundConfig {
                 simple_bg_white_threshold: env::var("SIMPLE_BG_WHITE_THRESHOLD")
@@ -365,6 +371,10 @@ impl Config {
 
     pub fn max_concurrent_batches(&self) -> usize {
         self.batch.max_concurrent_batches
+    }
+
+    pub fn onnx_pool_size(&self) -> usize {
+        self.batch.onnx_pool_size
     }
 
     pub fn simple_bg_white_threshold(&self) -> f32 {

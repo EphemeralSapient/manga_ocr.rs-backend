@@ -47,10 +47,10 @@ pub struct DetectionService {
 
 impl DetectionService {
     pub async fn new(config: Arc<Config>) -> Result<Self> {
-        // Single session for static memory usage (~42 MB)
-        // Multiple concurrent requests will wait for session availability
-        let pool_size = 1;
-        debug!("Creating detection session with {} session(s) for static memory", pool_size);
+        // Configurable pool size for inference parallelism
+        // Default 4 sessions = ~168 MB, provides 4x throughput vs single session
+        let pool_size = config.onnx_pool_size();
+        debug!("Creating detection session pool with {} session(s)", pool_size);
 
         // Create first session to determine device type
         let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
@@ -87,7 +87,7 @@ impl DetectionService {
         // Wrap in Arc for sharing across threads
         let session_pool = Arc::new(session_pool);
 
-        info!("✓ Detection: {} (1 session, ~42 MB static)", device_type);
+        info!("✓ Detection: {} ({} sessions, ~{} MB)", device_type, pool_size, pool_size * 42);
 
         Ok(Self {
             session_pool,

@@ -93,14 +93,12 @@ impl Phase2Pipeline {
             complex_regions.len()
         );
 
-        let batch_size_m = self.config.api_batch_size_m();
-
         // Process simple and complex backgrounds IN PARALLEL for maximum performance
         let (simple_bg_translations, complex_bg_result) = tokio::join!(
             // Process simple backgrounds (always use OCR/translation)
             async {
                 if !simple_regions.is_empty() {
-                    self.process_simple_backgrounds(&img, source_image_hash, &simple_regions, batch_size_m, ocr_model_override, cache_enabled)
+                    self.process_simple_backgrounds(&img, source_image_hash, &simple_regions, ocr_model_override, cache_enabled)
                         .await
                         .context("Failed to process simple backgrounds")
                 } else {
@@ -117,8 +115,8 @@ impl Phase2Pipeline {
                             .map(|bananas| (bananas, Vec::new()))
                             .context("Failed to process complex backgrounds with banana")
                     } else {
-                        // Use OCR/translation (batched)
-                        self.process_simple_backgrounds(&img, source_image_hash, &complex_regions, batch_size_m, ocr_model_override, cache_enabled)
+                        // Use OCR/translation (all regions in single call)
+                        self.process_simple_backgrounds(&img, source_image_hash, &complex_regions, ocr_model_override, cache_enabled)
                             .await
                             .map(|translations| (Vec::new(), translations))
                             .context("Failed to process complex backgrounds with OCR")
@@ -140,13 +138,12 @@ impl Phase2Pipeline {
         })
     }
 
-    /// Process simple backgrounds with OCR/translation API (batched with caching)
+    /// Process simple backgrounds with OCR/translation API (ALL regions in single call)
     ///
     /// # Arguments:
     /// * `img` - Source image
     /// * `source_image_hash` - xxHash3 of the source image bytes (for cache keys)
     /// * `regions` - Regions to process
-    /// * `batch_size_m` - Number of images per API call
     /// * `model_override` - Optional model name to override the default from config
     /// * `cache_enabled` - Whether to use translation cache
     ///
@@ -157,83 +154,81 @@ impl Phase2Pipeline {
         img: &DynamicImage,
         source_image_hash: u64,
         regions: &[&CategorizedRegion],
-        batch_size_m: usize,
         model_override: Option<&str>,
         cache_enabled: bool,
     ) -> Result<Vec<(usize, OCRTranslation)>> {
         let mut results = Vec::new();
 
-        // Process in batches of M
-        for batch in regions.chunks(batch_size_m) {
-            debug!("Processing batch of {} simple backgrounds", batch.len());
+        debug!("Processing {} regions in SINGLE API call", regions.len());
 
-            // Check cache FIRST (before cropping/encoding) - MAJOR OPTIMIZATION
-            // Generate cache keys from source image hash + bbox (no cropping needed!)
-            let mut image_bytes_batch = Vec::new();
-            let mut region_data: Vec<(usize, [i32; 4])> = Vec::new();
+        // Check cache FIRST (before cropping/encoding) - MAJOR OPTIMIZATION
+        // Generate cache keys from source image hash + bbox (no cropping needed!)
+        let mut image_bytes_batch = Vec::new();
+        let mut region_data: Vec<(usize, [i32; 4])> = Vec::new();
 
-            for region in batch.iter() {
-                // Generate cache key from source image hash + bbox (ultra-fast)
-                let cache_key = TranslationCache::generate_key_from_source(
-                    source_image_hash,
-                    &region.bbox,
-                );
+        for region in regions.iter() {
+            // Generate cache key from source image hash + bbox (ultra-fast)
+            let cache_key = TranslationCache::generate_key_from_source(
+                source_image_hash,
+                &region.bbox,
+            );
 
-                // Check cache BEFORE expensive cropping/encoding (only if cache enabled)
-                if cache_enabled {
-                    if let Some(cached_translation) = self.cache.get(cache_key) {
-                        debug!("Cache HIT for region {} (skipped crop/encode)", region.region_id);
-                        results.push((region.region_id, cached_translation));
-                        continue;
-                    }
+            // Check cache BEFORE expensive cropping/encoding (only if cache enabled)
+            if cache_enabled {
+                if let Some(cached_translation) = self.cache.get(cache_key) {
+                    debug!("Cache HIT for region {} (skipped crop/encode)", region.region_id);
+                    results.push((region.region_id, cached_translation));
+                    continue;
                 }
-
-                debug!("Cache {} for region {} (will crop/encode)",
-                    if cache_enabled { "MISS" } else { "DISABLED" },
-                    region.region_id);
-                region_data.push((region.region_id, region.bbox));
             }
 
-            // Only crop/encode for cache misses (HUGE savings on cache hits!)
-            if !region_data.is_empty() {
-                for (_region_id, bbox) in &region_data {
-                    let [x1, y1, x2, y2] = bbox;
-                    let width = (x2 - x1).max(1) as u32;
-                    let height = (y2 - y1).max(1) as u32;
+            debug!("Cache {} for region {} (will crop/encode)",
+                if cache_enabled { "MISS" } else { "DISABLED" },
+                region.region_id);
+            region_data.push((region.region_id, region.bbox));
+        }
 
-                    let cropped = img.crop_imm(*x1 as u32, *y1 as u32, width, height);
+        // Only crop/encode for cache misses (HUGE savings on cache hits!)
+        if !region_data.is_empty() {
+            for (_region_id, bbox) in &region_data {
+                let [x1, y1, x2, y2] = bbox;
+                let width = (x2 - x1).max(1) as u32;
+                let height = (y2 - y1).max(1) as u32;
 
-                    // Convert to PNG bytes
-                    let mut png_bytes = Vec::new();
-                    cropped
-                        .write_to(
-                            &mut std::io::Cursor::new(&mut png_bytes),
-                            image::ImageFormat::Png,
-                        )
-                        .context("Failed to encode cropped image")?;
+                let cropped = img.crop_imm(*x1 as u32, *y1 as u32, width, height);
 
-                    image_bytes_batch.push(png_bytes);
+                // Convert to PNG bytes
+                let mut png_bytes = Vec::new();
+                cropped
+                    .write_to(
+                        &mut std::io::Cursor::new(&mut png_bytes),
+                        image::ImageFormat::Png,
+                    )
+                    .context("Failed to encode cropped image")?;
+
+                image_bytes_batch.push(png_bytes);
+            }
+
+            debug!("Sending {} regions to API in single call", image_bytes_batch.len());
+
+            // Call API for ALL uncached regions in SINGLE call
+            let translations = self
+                .api_client
+                .ocr_translate_batch(image_bytes_batch, model_override)
+                .await
+                .context("OCR/translation API call failed")?;
+
+            // Store in cache and results
+            for ((region_id, bbox), translation) in region_data
+                .into_iter()
+                .zip(translations.into_iter())
+            {
+                // Use source_image_hash for cache key consistency
+                if cache_enabled {
+                    let cache_key = TranslationCache::generate_key_from_source(source_image_hash, &bbox);
+                    self.cache.put(cache_key, &translation);
                 }
-
-                // Call API for uncached regions
-                let translations = self
-                    .api_client
-                    .ocr_translate_batch(image_bytes_batch, model_override)
-                    .await
-                    .context("OCR/translation API call failed")?;
-
-                // Store in cache and results
-                for ((region_id, bbox), translation) in region_data
-                    .into_iter()
-                    .zip(translations.into_iter())
-                {
-                    // Use source_image_hash for cache key consistency
-                    if cache_enabled {
-                        let cache_key = TranslationCache::generate_key_from_source(source_image_hash, &bbox);
-                        self.cache.put(cache_key, &translation);
-                    }
-                    results.push((region_id, translation));
-                }
+                results.push((region_id, translation));
             }
         }
 

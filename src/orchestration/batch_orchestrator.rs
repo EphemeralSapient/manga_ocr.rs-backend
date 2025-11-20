@@ -60,7 +60,10 @@ impl BatchOrchestrator {
 
         let batch_semaphore = Arc::new(Semaphore::new(config.max_concurrent_batches()));
 
-        info!("✓ Ready (batches: {}, pool: {} sessions)", config.max_concurrent_batches(), std::cmp::min(num_cpus::get(), config.max_concurrent_batches()));
+        info!("✓ Ready (batches: {}, ONNX pool: {} sessions, ~{} MB)",
+            config.max_concurrent_batches(),
+            config.onnx_pool_size(),
+            config.onnx_pool_size() * (42 + 40));
 
         Ok(Self {
             config,
@@ -223,7 +226,8 @@ impl BatchOrchestrator {
     }
 }
 
-/// Process a single batch (images processed IN PARALLEL within batch)
+/// Process a single batch with PHASE-LEVEL SYNCHRONIZATION
+/// All pages complete Phase 1 before any start Phase 2, etc.
 async fn process_single_batch(
     phase1: Arc<Phase1Pipeline>,
     phase2: Arc<Phase2Pipeline>,
@@ -233,99 +237,216 @@ async fn process_single_batch(
     config: &ProcessingConfig,
     app_config: &Config,
 ) -> Result<(Vec<PageResult>, PerformanceMetrics)> {
-    debug!("Processing batch {} with {} images IN PARALLEL", batch.batch_id, batch.images.len());
+    debug!("Processing batch {} with {} images (phase-synchronized)", batch.batch_id, batch.images.len());
 
-    // Spawn all image processing tasks concurrently
     let config = Arc::new(config.clone());
     let app_config = Arc::new(app_config.clone());
+    let page_starts: Vec<_> = batch.images.iter().map(|_| Instant::now()).collect();
 
-    let tasks: Vec<_> = batch.images.into_iter().map(|image_data| {
+    // ===== PHASE 1: All pages in parallel =====
+    debug!("Batch {}: Starting Phase 1 for all {} pages", batch.batch_id, batch.images.len());
+    let phase1_tasks: Vec<_> = batch.images.iter().map(|image_data| {
         let phase1 = Arc::clone(&phase1);
-        let phase2 = Arc::clone(&phase2);
-        let phase3 = Arc::clone(&phase3);
-        let phase4 = Arc::clone(&phase4);
-        let config = Arc::clone(&config);
         let app_config = Arc::clone(&app_config);
+        let config = Arc::clone(&config);
+        let image_data = image_data.clone();
 
         tokio::spawn(async move {
-            let page_start = Instant::now();
-            let index = image_data.index;
-            let filename = image_data.filename.clone();
+            let include_free_text = config.include_free_text.unwrap_or(false);
 
-            let result: Result<(PageResult, PerformanceMetrics)> = match process_single_page(
-                &phase1,
-                &phase2,
-                &phase3,
-                &phase4,
-                &image_data,
-                &config,
-                &app_config,
-            )
-            .await
-            {
-                Ok((page_metrics, final_image_bytes)) => {
-                    let processing_time_ms = page_start.elapsed().as_secs_f64() * 1000.0;
-
-                    // Convert to base64 data URL
-                    let base64_image = general_purpose::STANDARD.encode(&final_image_bytes);
-                    let data_url = format!("data:image/png;base64,{}", base64_image);
-
-                    Ok((
-                        PageResult {
-                            index,
-                            filename,
-                            success: true,
-                            processing_time_ms,
-                            error: None,
-                            data_url: Some(data_url),
-                        },
-                        page_metrics,
-                    ))
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to process page {} ({}): {:?}",
-                        index,
-                        filename,
-                        e
-                    );
-
-                    Ok((
-                        PageResult {
-                            index,
-                            filename,
-                            success: false,
-                            processing_time_ms: page_start.elapsed().as_secs_f64() * 1000.0,
-                            error: Some(e.to_string()),
-                            data_url: None,
-                        },
-                        PerformanceMetrics::default(),
-                    ))
-                }
+            // Load decoded image
+            let decoded_image = if let Some(ref img) = image_data.decoded_image {
+                Arc::clone(img)
+            } else {
+                Arc::new(image::load_from_memory(&image_data.image_bytes)?)
             };
-            result
+
+            let mut optimized_image_data = image_data.clone();
+            optimized_image_data.decoded_image = Some(decoded_image);
+
+            let mut phase1_output = phase1.execute(&optimized_image_data).await?;
+
+            // Filter out label 2 if not included
+            if !include_free_text {
+                phase1_output.regions.retain(|r| r.label != 2);
+            }
+
+            Ok::<_, anyhow::Error>((optimized_image_data, phase1_output))
         })
     }).collect();
 
-    // Wait for all tasks to complete and collect results
-    let task_results = join_all(tasks).await;
+    let phase1_results = join_all(phase1_tasks).await;
+    debug!("Batch {}: Phase 1 complete for all pages", batch.batch_id);
 
+    // Collect Phase 1 outputs
+    let mut phase1_data: Vec<(ImageData, crate::core::types::Phase1Output)> = Vec::new();
+    let mut failed_pages: Vec<(usize, String, String)> = Vec::new();
+
+    for (i, result) in phase1_results.into_iter().enumerate() {
+        match result {
+            Ok(Ok(data)) => phase1_data.push(data),
+            Ok(Err(e)) => {
+                let img = &batch.images[i];
+                failed_pages.push((img.index, img.filename.clone(), e.to_string()));
+            }
+            Err(e) => {
+                let img = &batch.images[i];
+                failed_pages.push((img.index, img.filename.clone(), e.to_string()));
+            }
+        }
+    }
+
+    // ===== PHASE 2: All pages in parallel =====
+    debug!("Batch {}: Starting Phase 2 for {} pages", batch.batch_id, phase1_data.len());
+    let phase2_tasks: Vec<_> = phase1_data.iter().map(|(image_data, phase1_output)| {
+        let phase2 = Arc::clone(&phase2);
+        let config = Arc::clone(&config);
+        let app_config = Arc::clone(&app_config);
+        let image_data = image_data.clone();
+        let phase1_output = phase1_output.clone();
+
+        tokio::spawn(async move {
+            let ocr_model_override = config.ocr_translation_model.as_deref();
+            let banana_model_override = config.banana_image_model.as_deref();
+            let banana_mode = config.banana_mode.unwrap_or(app_config.banana_mode_enabled());
+            let cache_enabled = config.cache_enabled.unwrap_or(true);
+
+            let phase2_output = phase2
+                .execute(&image_data, &phase1_output, ocr_model_override, banana_model_override, banana_mode, cache_enabled)
+                .await?;
+
+            Ok::<_, anyhow::Error>((image_data, phase1_output, phase2_output))
+        })
+    }).collect();
+
+    let phase2_results = join_all(phase2_tasks).await;
+    debug!("Batch {}: Phase 2 complete for all pages", batch.batch_id);
+
+    // Collect Phase 2 outputs
+    let mut phase2_data: Vec<(ImageData, crate::core::types::Phase1Output, crate::core::types::Phase2Output)> = Vec::new();
+
+    for result in phase2_results {
+        match result {
+            Ok(Ok(data)) => phase2_data.push(data),
+            Ok(Err(e)) => tracing::error!("Phase 2 error: {:?}", e),
+            Err(e) => tracing::error!("Phase 2 task error: {:?}", e),
+        }
+    }
+
+    // ===== PHASE 3: All pages in parallel =====
+    debug!("Batch {}: Starting Phase 3 for {} pages", batch.batch_id, phase2_data.len());
+    let phase3_tasks: Vec<_> = phase2_data.iter().map(|(image_data, phase1_output, phase2_output)| {
+        let phase3 = Arc::clone(&phase3);
+        let config = Arc::clone(&config);
+        let app_config = Arc::clone(&app_config);
+        let image_data = image_data.clone();
+        let phase1_output = phase1_output.clone();
+        let phase2_output = phase2_output.clone();
+
+        tokio::spawn(async move {
+            let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
+
+            let banana_region_ids: Vec<usize> = phase2_output
+                .complex_bg_bananas
+                .iter()
+                .map(|b| b.region_id)
+                .collect();
+
+            let phase3_output = phase3
+                .execute(&image_data, &phase1_output, &banana_region_ids, blur_free_text)
+                .await?;
+
+            Ok::<_, anyhow::Error>((image_data, phase1_output, phase2_output, phase3_output))
+        })
+    }).collect();
+
+    let phase3_results = join_all(phase3_tasks).await;
+    debug!("Batch {}: Phase 3 complete for all pages", batch.batch_id);
+
+    // Collect Phase 3 outputs
+    let mut phase3_data: Vec<(ImageData, crate::core::types::Phase1Output, crate::core::types::Phase2Output, crate::core::types::Phase3Output)> = Vec::new();
+
+    for result in phase3_results {
+        match result {
+            Ok(Ok(data)) => phase3_data.push(data),
+            Ok(Err(e)) => tracing::error!("Phase 3 error: {:?}", e),
+            Err(e) => tracing::error!("Phase 3 task error: {:?}", e),
+        }
+    }
+
+    // ===== PHASE 4: All pages in parallel =====
+    debug!("Batch {}: Starting Phase 4 for {} pages", batch.batch_id, phase3_data.len());
+    let phase4_tasks: Vec<_> = phase3_data.into_iter().enumerate().map(|(i, (image_data, phase1_output, phase2_output, phase3_output))| {
+        let phase4 = Arc::clone(&phase4);
+        let config = Arc::clone(&config);
+        let app_config = Arc::clone(&app_config);
+        let page_start = page_starts[i];
+
+        tokio::spawn(async move {
+            let font_family = config.font_family.clone().unwrap_or_else(|| "arial".to_string());
+            let text_stroke = config.text_stroke.unwrap_or(app_config.text_stroke_enabled());
+
+            let phase4_output = phase4
+                .execute(&image_data, &phase1_output, &phase2_output, &phase3_output, &font_family, text_stroke)
+                .await?;
+
+            let processing_time_ms = page_start.elapsed().as_secs_f64() * 1000.0;
+
+            // Build metrics
+            let mut metrics = PerformanceMetrics::default();
+            metrics.total_regions = phase1_output.regions.len();
+            metrics.simple_bg_count = phase1_output.regions.iter()
+                .filter(|r| r.background_type == crate::core::types::BackgroundType::Simple)
+                .count();
+            metrics.complex_bg_count = phase1_output.regions.len() - metrics.simple_bg_count;
+            metrics.validation_warnings = phase1_output.validation_warnings.len();
+
+            // Convert to base64 data URL
+            let base64_image = general_purpose::STANDARD.encode(&phase4_output.final_image_bytes);
+            let data_url = format!("data:image/png;base64,{}", base64_image);
+
+            Ok::<_, anyhow::Error>((
+                PageResult {
+                    index: image_data.index,
+                    filename: image_data.filename,
+                    success: true,
+                    processing_time_ms,
+                    error: None,
+                    data_url: Some(data_url),
+                },
+                metrics,
+            ))
+        })
+    }).collect();
+
+    let phase4_results = join_all(phase4_tasks).await;
+    debug!("Batch {}: Phase 4 complete for all pages", batch.batch_id);
+
+    // Collect final results
     let mut results = Vec::new();
     let mut metrics = PerformanceMetrics::default();
 
-    for task_result in task_results {
-        match task_result {
+    for result in phase4_results {
+        match result {
             Ok(Ok((page_result, page_metrics))) => {
                 results.push(page_result);
                 metrics.merge(page_metrics);
             }
-            Ok(Err(e)) => {
-                tracing::error!("Page processing error: {:?}", e);
-            }
-            Err(e) => {
-                tracing::error!("Task join error: {:?}", e);
-            }
+            Ok(Err(e)) => tracing::error!("Phase 4 error: {:?}", e),
+            Err(e) => tracing::error!("Phase 4 task error: {:?}", e),
         }
+    }
+
+    // Add failed pages
+    for (index, filename, error) in failed_pages {
+        results.push(PageResult {
+            index,
+            filename,
+            success: false,
+            processing_time_ms: 0.0,
+            error: Some(error),
+            data_url: None,
+        });
     }
 
     // Sort results by index to maintain order
