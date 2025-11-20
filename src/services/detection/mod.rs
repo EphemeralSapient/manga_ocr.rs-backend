@@ -189,10 +189,11 @@ impl DetectionService {
             #[cfg(all(target_os = "windows", feature = "directml"))]
             "DIRECTML" => {
                 info!("Forcing DirectML backend...");
-                // DirectML has issues with Level3 optimizations (FusedMatMulActivation errors)
-                // Use Level1 for better compatibility
+                // DirectML REQUIRES specific session configuration (GitHub #16564)
                 let session = Session::builder()?
                     .with_execution_providers([DirectMLExecutionProvider::default().build()])?
+                    .with_parallel_execution(false)?   // REQUIRED: Sequential execution
+                    .with_memory_pattern(false)?       // REQUIRED: Disable memory pattern
                     .with_optimization_level(GraphOptimizationLevel::Level1)?
                     .with_intra_threads(num_cpus::get())?
                     .commit_from_memory(model_bytes)?;
@@ -324,10 +325,12 @@ impl DetectionService {
         // Try DirectML (Windows, if feature enabled)
         #[cfg(all(target_os = "windows", feature = "directml"))]
         {
-            // DirectML has issues with Level3 optimizations (FusedMatMulActivation errors)
-            // Use Level1 for better compatibility
+            // DirectML REQUIRES specific session configuration (GitHub #16564)
+            // Python ONNX Runtime sets these automatically, but C++/Rust requires manual configuration
             if let Ok(session) = Session::builder()
                 .and_then(|b| b.with_execution_providers([DirectMLExecutionProvider::default().build()]))
+                .and_then(|b| b.with_parallel_execution(false))  // REQUIRED: Sequential execution
+                .and_then(|b| b.with_memory_pattern(false))      // REQUIRED: Disable memory pattern
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level1))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
                 .and_then(|b| b.commit_from_memory(&model_bytes))
