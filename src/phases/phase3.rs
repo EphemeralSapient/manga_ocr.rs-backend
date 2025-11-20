@@ -6,7 +6,7 @@ use opencv::core::{Mat, Size, BORDER_DEFAULT};
 use opencv::imgproc::{self, MORPH_RECT};
 use opencv::prelude::*;
 use std::sync::Arc;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
 use crate::core::config::Config;
 use crate::core::types::{CategorizedRegion, ImageData, Phase1Output, Phase3Output};

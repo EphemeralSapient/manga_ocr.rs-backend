@@ -45,8 +45,7 @@ impl BatchOrchestrator {
         let cache = Arc::new(TranslationCache::new(config.cache_dir(), None, None, None).await?);
 
         // Log cache stats
-        let (cache_entries, cache_size_mb) = cache.stats().await;
-        debug!("Cache: {} entries ({:.2} MB)", cache_entries, cache_size_mb);
+        let (_cache_entries, _cache_size_mb) = cache.stats().await;
 
         // Initialize phase pipelines
         let phase1 = Arc::new(Phase1Pipeline::new(
@@ -168,7 +167,7 @@ impl BatchOrchestrator {
                                 }
                             }
 
-                            all_phase1_data.push((batch.images[i].clone(), outputs[i].clone()));
+                            all_phase1_data.push((batch.images[i].clone(), output.clone()));
                         }
                         all_decoded_images.extend(decoded_images);
                     }
@@ -223,7 +222,7 @@ impl BatchOrchestrator {
                                 }
                             }
 
-                            all_phase1_data.push((images[i].clone(), outputs[i].clone()));
+                            all_phase1_data.push((images[i].clone(), output.clone()));
                         }
                         all_decoded_images.extend(decoded_images);
                     }
@@ -514,8 +513,6 @@ async fn process_single_batch(
     config: &ProcessingConfig,
     app_config: &Config,
 ) -> Result<(Vec<PageResult>, PerformanceMetrics)> {
-    debug!("Processing batch {} with {} images (phase-synchronized)", batch.batch_id, batch.images.len());
-
     let config = Arc::new(config.clone());
     let app_config = Arc::new(app_config.clone());
     let page_starts: Vec<_> = batch.images.iter().map(|_| Instant::now()).collect();
@@ -534,8 +531,6 @@ async fn process_single_batch(
     // Collect Phase 1 results - either batched or parallel individual
     let phase1_results: Vec<Result<Result<(ImageData, crate::core::types::Phase1Output), anyhow::Error>, tokio::task::JoinError>> = if merge_img {
         // BATCH MODE: Run detection for all images in single ONNX inference
-        debug!("Batch {}: Starting Phase 1 BATCH MODE for {} pages", batch.batch_id, batch.images.len());
-
         // Execute batch Phase 1
         let batch_outputs = phase1.execute_batch(&batch.images, use_mask, merge_img).await;
 
@@ -560,7 +555,6 @@ async fn process_single_batch(
         }
     } else {
         // PARALLEL MODE: Run detection for each image independently
-        debug!("Batch {}: Starting Phase 1 for all {} pages", batch.batch_id, batch.images.len());
         let phase1_tasks: Vec<_> = batch.images.iter().map(|image_data| {
             let phase1 = Arc::clone(&phase1);
             let config = Arc::clone(&config);
@@ -594,7 +588,6 @@ async fn process_single_batch(
         join_all(phase1_tasks).await
     };
     batch_metrics.phase1_time = phase1_start.elapsed();
-    debug!("Batch {}: Phase 1 complete for all pages in {:.2}ms", batch.batch_id, batch_metrics.phase1_time.as_secs_f64() * 1000.0);
 
     // Collect Phase 1 outputs and metrics
     let mut phase1_data: Vec<(ImageData, crate::core::types::Phase1Output)> = Vec::new();
@@ -638,7 +631,6 @@ async fn process_single_batch(
 
     // ===== PHASE 2: BATCHED API calls for all pages =====
     let phase2_start = Instant::now();
-    debug!("Batch {}: Starting Phase 2 BATCHED for {} pages", batch.batch_id, phase1_data.len());
 
     // Use batched Phase 2 to combine all regions into fewer API calls
     let ocr_model_override = config.ocr_translation_model.as_deref();
@@ -651,7 +643,6 @@ async fn process_single_batch(
         .await;
 
     batch_metrics.phase2_time = phase2_start.elapsed();
-    debug!("Batch {}: Phase 2 complete for all pages in {:.2}ms", batch.batch_id, batch_metrics.phase2_time.as_secs_f64() * 1000.0);
 
     // Collect Phase 2 outputs and metrics
     let mut phase2_data: Vec<(ImageData, crate::core::types::Phase1Output, crate::core::types::Phase2Output)> = Vec::new();
@@ -715,7 +706,6 @@ async fn process_single_batch(
 
     // ===== PHASE 3: All pages in parallel =====
     let phase3_start = Instant::now();
-    debug!("Batch {}: Starting Phase 3 for {} pages", batch.batch_id, phase2_data.len());
     let phase3_tasks: Vec<_> = phase2_data.iter().map(|(image_data, phase1_output, phase2_output)| {
         let phase3 = Arc::clone(&phase3);
         let config = Arc::clone(&config);
@@ -744,7 +734,6 @@ async fn process_single_batch(
 
     let phase3_results = join_all(phase3_tasks).await;
     batch_metrics.phase3_time = phase3_start.elapsed();
-    debug!("Batch {}: Phase 3 complete for all pages in {:.2}ms", batch.batch_id, batch_metrics.phase3_time.as_secs_f64() * 1000.0);
 
     // Collect Phase 3 outputs
     let mut phase3_data: Vec<(ImageData, crate::core::types::Phase1Output, crate::core::types::Phase2Output, crate::core::types::Phase3Output)> = Vec::new();
@@ -759,7 +748,6 @@ async fn process_single_batch(
 
     // ===== PHASE 4: All pages in parallel =====
     let phase4_start = Instant::now();
-    debug!("Batch {}: Starting Phase 4 for {} pages", batch.batch_id, phase3_data.len());
     let phase4_tasks: Vec<_> = phase3_data.into_iter().enumerate().map(|(i, (image_data, phase1_output, phase2_output, phase3_output))| {
         let phase4 = Arc::clone(&phase4);
         let config = Arc::clone(&config);
@@ -793,7 +781,6 @@ async fn process_single_batch(
 
     let phase4_results = join_all(phase4_tasks).await;
     batch_metrics.phase4_time = phase4_start.elapsed();
-    debug!("Batch {}: Phase 4 complete for all pages in {:.2}ms", batch.batch_id, batch_metrics.phase4_time.as_secs_f64() * 1000.0);
 
     // Collect final results
     let mut results = Vec::new();

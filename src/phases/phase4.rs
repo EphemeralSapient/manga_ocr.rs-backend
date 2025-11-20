@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
 use rayon::prelude::*;
 use std::sync::Arc;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
 use crate::core::config::Config;
 use crate::services::rendering::CosmicTextRenderer;
