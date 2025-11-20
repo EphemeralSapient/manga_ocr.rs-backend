@@ -144,6 +144,153 @@ impl Phase1Pipeline {
         })
     }
 
+    /// Execute Phase 1 detection only (without segmentation)
+    /// Returns detection results + decoded images for later segmentation
+    ///
+    /// This allows Phase 2 to start immediately while segmentation runs in background
+    pub async fn execute_detection_only(
+        &self,
+        images: &[ImageData],
+        merge_img: bool,
+    ) -> Result<(Vec<Phase1Output>, Vec<DynamicImage>)> {
+        if images.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        if merge_img {
+            debug!("Phase 1 DETECTION: Processing {} images with SINGLE batched ONNX inference", images.len());
+        } else {
+            debug!("Phase 1 DETECTION: Processing {} images with INDIVIDUAL inferences", images.len());
+        }
+        let detection_start = std::time::Instant::now();
+
+        // Prepare images
+        let mut decoded_images: Vec<DynamicImage> = Vec::with_capacity(images.len());
+        for image_data in images {
+            let img = if let Some(ref decoded) = image_data.decoded_image {
+                (**decoded).clone()
+            } else {
+                image::load_from_memory(&image_data.image_bytes)
+                    .context("Failed to load image")?
+            };
+            decoded_images.push(img);
+        }
+
+        // Run detection: batched or parallel based on merge_img setting
+        let batch_detections: Vec<(Vec<_>, Vec<_>, Vec<_>)> = if merge_img {
+            debug!("Running BATCHED detection (single ONNX call for {} images)...", images.len());
+            let batch_refs: Vec<(&DynamicImage, usize)> = decoded_images
+                .iter()
+                .zip(images.iter())
+                .map(|(img, data)| (img, data.index))
+                .collect();
+
+            self.detector.detect_all_labels_batch(&batch_refs).await
+                .context("Batch detection failed")?
+        } else {
+            debug!("Running PARALLEL detection ({} individual ONNX calls)...", images.len());
+            let detection_tasks: Vec<_> = decoded_images
+                .iter()
+                .zip(images.iter())
+                .map(|(img, data)| {
+                    let detector = Arc::clone(&self.detector);
+                    let img_ref = img;
+                    let index = data.index;
+                    async move {
+                        detector.detect_all_labels(img_ref, index).await
+                    }
+                })
+                .collect();
+
+            futures::future::join_all(detection_tasks)
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        debug!("✓ Detection completed in {:.2}ms (mode: {})",
+               detection_start.elapsed().as_secs_f64() * 1000.0,
+               if merge_img { "BATCH" } else { "PARALLEL" });
+
+        // Create Phase1Output with empty segmentation masks (will be filled later)
+        let mut outputs = Vec::with_capacity(images.len());
+
+        for (i, (label_0_raw, label_1_raw, label_2_raw)) in batch_detections.into_iter().enumerate() {
+            let image_data = &images[i];
+            let img = &decoded_images[i];
+
+            // Convert BubbleDetection to RegionDetection
+            let label_0_detections: Vec<RegionDetection> = label_0_raw
+                .into_iter()
+                .map(|d| RegionDetection { bbox: d.bbox, label: 0, confidence: d.confidence })
+                .collect();
+            let label_1_detections: Vec<RegionDetection> = label_1_raw
+                .into_iter()
+                .map(|d| RegionDetection { bbox: d.bbox, label: 1, confidence: d.confidence })
+                .collect();
+            let label_2_detections: Vec<RegionDetection> = label_2_raw
+                .into_iter()
+                .map(|d| RegionDetection { bbox: d.bbox, label: 2, confidence: d.confidence })
+                .collect();
+
+            // Categorize regions
+            let (regions, validation_warnings) = self.categorize_regions(
+                img,
+                &label_0_detections,
+                &label_1_detections,
+                &label_2_detections,
+                image_data.index,
+            )?;
+
+            // Empty segmentation mask placeholder
+            let empty_mask = vec![0u8; (image_data.width * image_data.height) as usize];
+
+            outputs.push(Phase1Output {
+                page_index: image_data.index,
+                filename: image_data.filename.clone(),
+                width: image_data.width,
+                height: image_data.height,
+                regions,
+                segmentation_mask: empty_mask,
+                validation_warnings,
+            });
+        }
+
+        Ok((outputs, decoded_images))
+    }
+
+    /// Run segmentation and update Phase1Output with masks
+    /// This is called after Phase 2 starts, to fill in the segmentation masks before Phase 3
+    pub async fn complete_segmentation(
+        &self,
+        outputs: &mut [Phase1Output],
+        decoded_images: &[DynamicImage],
+        use_mask: bool,
+    ) -> Result<()> {
+        if !use_mask {
+            debug!("Segmentation skipped (mask disabled)");
+            return Ok(());
+        }
+
+        debug!("Running segmentation for {} images in parallel...", decoded_images.len());
+        let seg_start = std::time::Instant::now();
+
+        let segmentation_tasks: Vec<_> = decoded_images.iter().map(|img| {
+            self.segmenter.generate_mask(img)
+        }).collect();
+
+        let segmentation_results = futures::future::join_all(segmentation_tasks).await;
+        debug!("✓ Segmentation completed in {:.2}ms", seg_start.elapsed().as_secs_f64() * 1000.0);
+
+        // Update outputs with segmentation masks
+        for (i, seg_result) in segmentation_results.into_iter().enumerate() {
+            let mask = seg_result.context("Failed to generate segmentation mask")?;
+            outputs[i].segmentation_mask = mask;
+        }
+
+        Ok(())
+    }
+
     /// Execute Phase 1 on multiple images using batch inference
     ///
     /// This is more efficient than calling execute() multiple times when merge_img is enabled.

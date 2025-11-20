@@ -128,11 +128,12 @@ impl BatchOrchestrator {
 
         info!("Processing {} batches phase-by-phase: Phase 1 → Phase 2 (global) → Phase 3 → Phase 4", batches.len());
 
-        // ===== PHASE 1: ALL BATCHES =====
-        info!("Starting Phase 1 for all {} batches", batches.len());
+        // ===== PHASE 1: DETECTION ONLY (Segmentation runs in background) =====
+        info!("Starting Phase 1 detection for all {} batches", batches.len());
 
         let phase1_start = Instant::now();
         let mut all_phase1_data: Vec<(ImageData, crate::core::types::Phase1Output)> = Vec::new();
+        let mut all_decoded_images: Vec<image::DynamicImage> = Vec::new();
         let mut phase1_metrics = PerformanceMetrics::default();
 
         // Check if using DirectML - if so, use sequential processing
@@ -140,12 +141,12 @@ impl BatchOrchestrator {
 
         if is_directml {
             // DirectML: Sequential processing through single session (no parallelism)
-            info!("🔄 DirectML detected: Processing {} batches sequentially (single session)", batches.len());
+            info!("🔄 DirectML detected: Processing {} batches sequentially (detection only)", batches.len());
 
-            for (batch_idx, batch) in batches.into_iter().enumerate() {
-                match self.phase1.execute_batch(&batch.images, use_mask, merge_img).await {
-                    Ok(outputs) => {
-                        for (i, mut output) in outputs.into_iter().enumerate() {
+            for batch in batches.into_iter() {
+                match self.phase1.execute_detection_only(&batch.images, merge_img).await {
+                    Ok((mut outputs, decoded_images)) => {
+                        for (i, output) in outputs.iter_mut().enumerate() {
                             // Filter out label 2 if not included
                             if !include_free_text {
                                 output.regions.retain(|r| r.label != 2);
@@ -167,19 +168,20 @@ impl BatchOrchestrator {
                                 }
                             }
 
-                            all_phase1_data.push((batch.images[i].clone(), output));
+                            all_phase1_data.push((batch.images[i].clone(), outputs[i].clone()));
                         }
+                        all_decoded_images.extend(decoded_images);
                     }
                     Err(e) => {
-                        tracing::error!("Phase 1 batch {} failed: {:?}", batch_idx, e);
+                        tracing::error!("Phase 1 detection failed: {:?}", e);
                     }
                 }
             }
         } else {
-            // Non-DirectML: Parallel processing (original behavior)
+            // Non-DirectML: Parallel processing
             let num_batches = batches.len();
             if num_batches > 1 {
-                info!("⚡ Non-DirectML backend: Processing {} batches in parallel", num_batches);
+                info!("⚡ Non-DirectML backend: Processing {} batches in parallel (detection only)", num_batches);
             }
 
             let mut phase1_tasks = Vec::new();
@@ -188,18 +190,18 @@ impl BatchOrchestrator {
                 let images = batch.images.clone();
 
                 let task = tokio::spawn(async move {
-                    let batch_outputs = phase1.execute_batch(&images, use_mask, merge_img).await?;
-                    Ok::<_, anyhow::Error>((images, batch_outputs))
+                    let (outputs, decoded_images) = phase1.execute_detection_only(&images, merge_img).await?;
+                    Ok::<_, anyhow::Error>((images, outputs, decoded_images))
                 });
 
                 phase1_tasks.push(task);
             }
 
-            // Wait for all Phase 1 to complete
+            // Wait for all Phase 1 detection to complete
             for task in phase1_tasks {
                 match task.await {
-                    Ok(Ok((images, outputs))) => {
-                        for (i, mut output) in outputs.into_iter().enumerate() {
+                    Ok(Ok((images, mut outputs, decoded_images))) => {
+                        for (i, output) in outputs.iter_mut().enumerate() {
                             // Filter out label 2 if not included
                             if !include_free_text {
                                 output.regions.retain(|r| r.label != 2);
@@ -221,14 +223,15 @@ impl BatchOrchestrator {
                                 }
                             }
 
-                            all_phase1_data.push((images[i].clone(), output));
+                            all_phase1_data.push((images[i].clone(), outputs[i].clone()));
                         }
+                        all_decoded_images.extend(decoded_images);
                     }
                     Ok(Err(e)) => {
-                        tracing::error!("Phase 1 batch failed: {:?}", e);
+                        tracing::error!("Phase 1 detection failed: {:?}", e);
                     }
                     Err(e) => {
-                        tracing::error!("Phase 1 task panicked: {:?}", e);
+                        tracing::error!("Phase 1 detection task panicked: {:?}", e);
                     }
                 }
             }
@@ -236,17 +239,24 @@ impl BatchOrchestrator {
 
         phase1_metrics.phase1_time = phase1_start.elapsed();
         info!(
-            "Phase 1 complete for all {} pages in {:.2}ms",
+            "Phase 1 detection complete for all {} pages in {:.2}ms",
             all_phase1_data.len(),
             phase1_metrics.phase1_time.as_secs_f64() * 1000.0
         );
 
-        // CLEANUP: Free ONNX sessions after Phase 1 to minimize memory footprint
-        // Detection and segmentation are only needed in Phase 1
-        // Phases 2-4 use API calls and image processing (no ONNX)
-        info!("🧹 [MEMORY OPTIMIZATION] Cleaning up ONNX sessions after Phase 1");
+        // Spawn segmentation in background (will await before Phase 3)
+        info!("🔄 Starting segmentation in background while Phase 2 runs...");
+        let phase1_clone = Arc::clone(&self.phase1);
+        let mut phase1_outputs_for_seg: Vec<_> = all_phase1_data.iter().map(|(_, output)| output.clone()).collect();
+        let segmentation_task = tokio::spawn(async move {
+            phase1_clone.complete_segmentation(&mut phase1_outputs_for_seg, &all_decoded_images, use_mask).await?;
+            Ok::<_, anyhow::Error>(phase1_outputs_for_seg)
+        });
+
+        // CLEANUP: Free detection ONNX sessions (segmentation will clean up when done)
+        info!("🧹 [MEMORY OPTIMIZATION] Cleaning up detection sessions after Phase 1");
         self.phase1.cleanup_sessions();
-        info!("✓ ONNX memory freed, proceeding with translation & rendering");
+        info!("✓ Detection complete, proceeding with Phase 2 while segmentation runs in background");
 
         // ===== PHASE 2: GLOBAL (ALL PAGES, SPLIT ACROSS KEYS) =====
         info!("Starting Phase 2 GLOBAL for all {} pages", all_phase1_data.len());
@@ -297,12 +307,42 @@ impl BatchOrchestrator {
             }
         }
 
+        // ===== AWAIT SEGMENTATION BEFORE PHASE 3 =====
+        info!("Awaiting segmentation completion before Phase 3...");
+        let segmentation_await_start = Instant::now();
+        let updated_phase1_outputs = match segmentation_task.await {
+            Ok(Ok(outputs)) => {
+                info!("✓ Segmentation complete in {:.2}ms", segmentation_await_start.elapsed().as_secs_f64() * 1000.0);
+                outputs
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Segmentation failed: {:?}", e);
+                // Use existing outputs with empty masks
+                all_phase2_data.iter().map(|(_, p1, _)| p1.clone()).collect()
+            }
+            Err(e) => {
+                tracing::error!("Segmentation task panicked: {:?}", e);
+                // Use existing outputs with empty masks
+                all_phase2_data.iter().map(|(_, p1, _)| p1.clone()).collect()
+            }
+        };
+
+        // Update all_phase2_data with completed segmentation masks
+        let mut all_phase2_data_updated = Vec::new();
+        for (i, (image_data, _old_phase1, phase2_output)) in all_phase2_data.into_iter().enumerate() {
+            let updated_phase1 = updated_phase1_outputs.get(i).cloned().unwrap_or_else(|| {
+                tracing::warn!("Missing segmentation output for page {}, using empty mask", i);
+                _old_phase1
+            });
+            all_phase2_data_updated.push((image_data, updated_phase1, phase2_output));
+        }
+
         // ===== PHASE 3: ALL PAGES =====
-        info!("Starting Phase 3 for all {} pages", all_phase2_data.len());
+        info!("Starting Phase 3 for all {} pages", all_phase2_data_updated.len());
         let phase3_start = Instant::now();
 
         let mut phase3_tasks = Vec::new();
-        for (image_data, phase1_output, phase2_output) in all_phase2_data.iter() {
+        for (image_data, phase1_output, phase2_output) in all_phase2_data_updated.iter() {
             let phase3 = Arc::clone(&self.phase3);
             let config = Arc::clone(&config);
             let app_config = Arc::clone(&app_config);
