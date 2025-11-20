@@ -79,20 +79,11 @@ jobs:
       - name: Build release binary (${{ matrix.variant.name }})
         run: cargo build --release --locked --target x86_64-pc-windows-msvc ${{ matrix.variant.features }}
 
-      - name: Prepare artifacts (${{ matrix.variant.name }})
-        run: |
-          mkdir -p artifacts
-          cp target/x86_64-pc-windows-msvc/release/manga_workflow.exe artifacts/
-          # Include DirectML.dll with directml build (fixes System32 version conflict)
-          if ("${{ matrix.variant.name }}" -eq "directml") {
-            cp target/x86_64-pc-windows-msvc/release/DirectML.dll artifacts/ 2>$null
-          }
-
       - name: Upload artifact (${{ matrix.variant.name }})
         uses: actions/upload-artifact@v4
         with:
           name: manga_workflow-windows-x86_64-${{ matrix.variant.suffix }}
-          path: artifacts/*
+          path: target/x86_64-pc-windows-msvc/release/manga_workflow.exe
 
   release:
     name: Create Release
@@ -112,10 +103,6 @@ jobs:
           mv binaries/manga_workflow-windows-x86_64-standard/manga_workflow.exe release/manga_workflow_standard.exe
           mv binaries/manga_workflow-windows-x86_64-directml/manga_workflow.exe release/manga_workflow_directml.exe
           mv binaries/manga_workflow-windows-x86_64-openvino/manga_workflow.exe release/manga_workflow_openvino.exe
-          # Include DirectML.dll v1.15.4 with directml build
-          if [ -f binaries/manga_workflow-windows-x86_64-directml/DirectML.dll ]; then
-            mv binaries/manga_workflow-windows-x86_64-directml/DirectML.dll release/DirectML.dll
-          fi
           ls -lh release/
 
       - name: Create Release
@@ -125,7 +112,6 @@ jobs:
             release/manga_workflow_standard.exe
             release/manga_workflow_directml.exe
             release/manga_workflow_openvino.exe
-            release/DirectML.dll
           draft: false
           prerelease: false
           body: |
@@ -133,10 +119,14 @@ jobs:
             - `manga_workflow_standard.exe` - CPU only
             - `manga_workflow_directml.exe` - DirectML GPU acceleration (AMD/Intel/NVIDIA)
             - `manga_workflow_openvino.exe` - OpenVINO optimization (Intel CPUs)
-            - `DirectML.dll` v1.15.4 - **REQUIRED for directml.exe** (place in same directory)
 
-            ### DirectML Important Note
-            Windows includes DirectML v1.8 in System32, but ONNX Runtime needs v1.15.4+.
-            **Always place `DirectML.dll` next to `manga_workflow_directml.exe`** to avoid version conflicts.
+            ## Installation
+            1. Clone the repository: `git clone <repo-url>`
+            2. Install Git LFS: `git lfs install && git lfs pull`
+            3. Build with: `cargo build --release --features directml`
+            4. DirectML.dll v1.15.4 is auto-copied to output (fixes System32 v1.8 conflict)
+
+            ## Pre-built Binaries
+            Download executables above and clone repo to get required libraries (DirectML.dll via Git LFS).
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
