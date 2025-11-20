@@ -5,8 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::core::types::OCRTranslation;
@@ -59,6 +61,10 @@ struct CacheInner {
     // Debounced persistence
     dirty: Arc<RwLock<bool>>,
     save_notify: Arc<Notify>,
+
+    // Background task management (prevents memory leak)
+    persistence_task: RwLock<Option<JoinHandle<()>>>,
+    shutdown: Arc<AtomicBool>,
 
     // Metrics integration
     metrics: Option<Metrics>,
@@ -126,6 +132,8 @@ impl TranslationCache {
             cache_file: cache_file.clone(),
             dirty: Arc::new(RwLock::new(false)),
             save_notify: Arc::new(Notify::new()),
+            persistence_task: RwLock::new(None),
+            shutdown: Arc::new(AtomicBool::new(false)),
             metrics,
         });
 
@@ -263,14 +271,32 @@ impl TranslationCache {
     }
 
     /// Start background task for periodic persistence
+    /// FIX: Task now respects shutdown signal to prevent memory leak
     fn start_persistence_task(&self, interval: Duration) {
         let inner = Arc::clone(&self.inner);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut last_save = Instant::now();
 
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+
+                // Check for shutdown signal (prevents memory leak)
+                if inner.shutdown.load(Ordering::Relaxed) {
+                    // Final save before shutdown
+                    let cache_data = {
+                        let cache = inner.cache.read();
+                        let mut map = std::collections::HashMap::new();
+                        for (k, v) in cache.iter() {
+                            map.insert(format!("{:016x}", k), v.clone());
+                        }
+                        map
+                    };
+                    if let Ok(json) = serde_json::to_string_pretty(&cache_data) {
+                        let _ = tokio::fs::write(&inner.cache_file, json).await;
+                    }
+                    break; // Exit loop on shutdown
+                }
 
                 let is_dirty = *inner.dirty.read();
                 let should_save = is_dirty && last_save.elapsed() >= interval;
@@ -295,6 +321,9 @@ impl TranslationCache {
                 }
             }
         });
+
+        // Store handle so it can be aborted on drop
+        *self.inner.persistence_task.write() = Some(handle);
     }
 
     /// Get cache statistics
@@ -325,6 +354,19 @@ impl TranslationCache {
 
         if let Some(ref m) = self.inner.metrics {
             m.update_cache_size(0);
+        }
+    }
+}
+
+// FIX: Implement Drop to clean up background task (prevents memory leak)
+impl Drop for CacheInner {
+    fn drop(&mut self) {
+        // Signal shutdown to background task
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        // Abort persistence task if running
+        if let Some(handle) = self.persistence_task.write().take() {
+            handle.abort();
         }
     }
 }
