@@ -6,7 +6,7 @@ use futures::future::join_all;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
-use tracing::{debug, info, instrument};
+use tracing::{info, instrument};
 
 use crate::services::translation::api_client::ApiClient;
 use crate::core::config::Config;
@@ -131,67 +131,105 @@ impl BatchOrchestrator {
         // ===== PHASE 1: ALL BATCHES =====
         info!("Starting Phase 1 for all {} batches", batches.len());
 
-        // Pre-allocate ONNX sessions for concurrent batches
-        // Each batch needs at least 1 session to avoid serialization
-        let num_batches = batches.len();
-        if num_batches > 1 {
-            info!("⚡ Pre-allocating sessions: {} batches running in parallel", num_batches);
-            // Trigger session expansion by informing phase1 of concurrent load
-            // This happens automatically in expand_if_needed, but we can pre-warm
-        }
-
         let phase1_start = Instant::now();
-
-        let mut phase1_tasks = Vec::new();
-        for batch in batches {
-            let phase1 = Arc::clone(&self.phase1);
-            let images = batch.images.clone();
-
-            let task = tokio::spawn(async move {
-                let batch_outputs = phase1.execute_batch(&images, use_mask, merge_img).await?;
-                Ok::<_, anyhow::Error>((images, batch_outputs))
-            });
-
-            phase1_tasks.push(task);
-        }
-
-        // Wait for all Phase 1 to complete
         let mut all_phase1_data: Vec<(ImageData, crate::core::types::Phase1Output)> = Vec::new();
         let mut phase1_metrics = PerformanceMetrics::default();
 
-        for task in phase1_tasks {
-            match task.await {
-                Ok(Ok((images, outputs))) => {
-                    for (i, mut output) in outputs.into_iter().enumerate() {
-                        // Filter out label 2 if not included
-                        if !include_free_text {
-                            output.regions.retain(|r| r.label != 2);
-                        }
+        // Check if using DirectML - if so, use sequential processing
+        let is_directml = self.phase1.is_directml();
 
-                        // Count metrics
-                        phase1_metrics.total_regions += output.regions.len();
-                        for region in &output.regions {
-                            match region.label {
-                                0 => phase1_metrics.label_0_count += 1,
-                                1 => phase1_metrics.label_1_count += 1,
-                                2 => phase1_metrics.label_2_count += 1,
-                                _ => {}
-                            }
-                            if region.background_type == crate::core::types::BackgroundType::Simple {
-                                phase1_metrics.simple_bg_count += 1;
-                            } else {
-                                phase1_metrics.complex_bg_count += 1;
-                            }
-                        }
+        if is_directml {
+            // DirectML: Sequential processing through single session (no parallelism)
+            info!("🔄 DirectML detected: Processing {} batches sequentially (single session)", batches.len());
 
-                        all_phase1_data.push((images[i].clone(), output));
+            for (batch_idx, batch) in batches.into_iter().enumerate() {
+                match self.phase1.execute_batch(&batch.images, use_mask, merge_img).await {
+                    Ok(outputs) => {
+                        for (i, mut output) in outputs.into_iter().enumerate() {
+                            // Filter out label 2 if not included
+                            if !include_free_text {
+                                output.regions.retain(|r| r.label != 2);
+                            }
+
+                            // Count metrics
+                            phase1_metrics.total_regions += output.regions.len();
+                            for region in &output.regions {
+                                match region.label {
+                                    0 => phase1_metrics.label_0_count += 1,
+                                    1 => phase1_metrics.label_1_count += 1,
+                                    2 => phase1_metrics.label_2_count += 1,
+                                    _ => {}
+                                }
+                                if region.background_type == crate::core::types::BackgroundType::Simple {
+                                    phase1_metrics.simple_bg_count += 1;
+                                } else {
+                                    phase1_metrics.complex_bg_count += 1;
+                                }
+                            }
+
+                            all_phase1_data.push((batch.images[i].clone(), output));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Phase 1 batch {} failed: {:?}", batch_idx, e);
                     }
                 }
-                Ok(Err(e)) => {
-                    tracing::error!("Phase 1 batch failed: {:?}", e);
-                }
-                Err(e) => {
-                    tracing::error!("Phase 1 task panicked: {:?}", e);
+            }
+        } else {
+            // Non-DirectML: Parallel processing (original behavior)
+            let num_batches = batches.len();
+            if num_batches > 1 {
+                info!("⚡ Non-DirectML backend: Processing {} batches in parallel", num_batches);
+            }
+
+            let mut phase1_tasks = Vec::new();
+            for batch in batches {
+                let phase1 = Arc::clone(&self.phase1);
+                let images = batch.images.clone();
+
+                let task = tokio::spawn(async move {
+                    let batch_outputs = phase1.execute_batch(&images, use_mask, merge_img).await?;
+                    Ok::<_, anyhow::Error>((images, batch_outputs))
+                });
+
+                phase1_tasks.push(task);
+            }
+
+            // Wait for all Phase 1 to complete
+            for task in phase1_tasks {
+                match task.await {
+                    Ok(Ok((images, outputs))) => {
+                        for (i, mut output) in outputs.into_iter().enumerate() {
+                            // Filter out label 2 if not included
+                            if !include_free_text {
+                                output.regions.retain(|r| r.label != 2);
+                            }
+
+                            // Count metrics
+                            phase1_metrics.total_regions += output.regions.len();
+                            for region in &output.regions {
+                                match region.label {
+                                    0 => phase1_metrics.label_0_count += 1,
+                                    1 => phase1_metrics.label_1_count += 1,
+                                    2 => phase1_metrics.label_2_count += 1,
+                                    _ => {}
+                                }
+                                if region.background_type == crate::core::types::BackgroundType::Simple {
+                                    phase1_metrics.simple_bg_count += 1;
+                                } else {
+                                    phase1_metrics.complex_bg_count += 1;
+                                }
+                            }
+
+                            all_phase1_data.push((images[i].clone(), output));
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Phase 1 batch failed: {:?}", e);
+                    }
+                    Err(e) => {
+                        tracing::error!("Phase 1 task panicked: {:?}", e);
+                    }
                 }
             }
         }

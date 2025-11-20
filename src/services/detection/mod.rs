@@ -182,7 +182,7 @@ impl DetectionService {
                         CPUExecutionProvider::default().build(),
                         DirectMLExecutionProvider::default().build()
                     ])?
-                    .with_parallel_execution(true)?    // Enable parallel execution
+                    .with_parallel_execution(false)?   // REQUIRED: Sequential execution
                     .with_memory_pattern(false)?       // Disable memory pattern for stability
                     .with_optimization_level(GraphOptimizationLevel::Level1)?
                     .with_intra_threads(num_cpus::get())?
@@ -337,7 +337,7 @@ impl DetectionService {
                     CPUExecutionProvider::default().build(),
                     DirectMLExecutionProvider::default().build()
                 ]))
-                .and_then(|b| b.with_parallel_execution(true))   // Enable parallel execution
+                .and_then(|b| b.with_parallel_execution(false))  // REQUIRED: Sequential execution
                 .and_then(|b| b.with_memory_pattern(false))      // Disable memory pattern for stability
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level1))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
@@ -400,6 +400,11 @@ impl DetectionService {
     #[allow(dead_code)]
     pub fn device_type(&self) -> &str {
         &self.device_type
+    }
+
+    /// Check if using DirectML backend
+    pub fn is_directml(&self) -> bool {
+        self.device_type.contains("DirectML")
     }
 
     /// Expand session pool if under capacity (lazy allocation)

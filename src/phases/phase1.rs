@@ -41,6 +41,11 @@ impl Phase1Pipeline {
         self.segmenter.cleanup_sessions();
     }
 
+    /// Check if using DirectML backend
+    pub fn is_directml(&self) -> bool {
+        self.detector.is_directml()
+    }
+
     /// Execute Phase 1 on a single image
     ///
     /// # Steps:
