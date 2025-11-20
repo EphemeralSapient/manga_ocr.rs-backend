@@ -39,7 +39,7 @@ impl Phase1Pipeline {
     ///
     /// # Steps:
     /// 1. Run detector for labels 0, 1, 2
-    /// 2. Run mask model for segmentation
+    /// 2. Run mask model for segmentation (if use_mask is true)
     /// 3. Validate label 1 regions are within label 0
     /// 4. Categorize simple vs complex backgrounds
     ///
@@ -49,7 +49,7 @@ impl Phase1Pipeline {
         page_index = image_data.index,
         filename = %image_data.filename
     ))]
-    pub async fn execute(&self, image_data: &ImageData) -> Result<Phase1Output> {
+    pub async fn execute(&self, image_data: &ImageData, use_mask: bool) -> Result<Phase1Output> {
         debug!(
             "Phase 1: Processing page {} ({})",
             image_data.index, image_data.filename
@@ -67,20 +67,29 @@ impl Phase1Pipeline {
             &img_owned
         };
 
-        // Step 1 & 2: Run detection and segmentation IN PARALLEL
-        // This is a MASSIVE optimization - both models run simultaneously!
-        debug!("Running detection and segmentation in parallel...");
+        // Step 1 & 2: Run detection and segmentation (segmentation only if use_mask is true)
+        debug!("Running detection{}...", if use_mask { " and segmentation in parallel" } else { " (segmentation skipped)" });
         let parallel_start = std::time::Instant::now();
 
-        let (detection_result, segmentation_result) =
-            tokio::join!(
-                self.detector.detect_all_labels(&img, image_data.index),
-                self.segmenter.generate_mask(&img)
-            );
+        let (label_0_raw, label_1_raw, label_2_raw, segmentation_mask) = if use_mask {
+            // Run both in parallel
+            let (detection_result, segmentation_result) =
+                tokio::join!(
+                    self.detector.detect_all_labels(&img, image_data.index),
+                    self.segmenter.generate_mask(&img)
+                );
 
-        let (label_0_raw, label_1_raw, label_2_raw) =
-            detection_result.context("Failed to detect regions")?;
-        let segmentation_mask = segmentation_result.context("Failed to generate segmentation mask")?;
+            let (l0, l1, l2) = detection_result.context("Failed to detect regions")?;
+            let mask = segmentation_result.context("Failed to generate segmentation mask")?;
+            (l0, l1, l2, mask)
+        } else {
+            // Only run detection, return empty mask
+            let (l0, l1, l2) = self.detector.detect_all_labels(&img, image_data.index).await
+                .context("Failed to detect regions")?;
+            // Empty mask as Vec<u8> (same format as generate_mask returns)
+            let empty_mask: Vec<u8> = vec![0u8; (img.width() * img.height()) as usize];
+            (l0, l1, l2, empty_mask)
+        };
 
         // Convert BubbleDetection to RegionDetection
         let label_0_detections: Vec<RegionDetection> = label_0_raw
@@ -122,6 +131,118 @@ impl Phase1Pipeline {
             segmentation_mask,
             validation_warnings,
         })
+    }
+
+    /// Execute Phase 1 on multiple images using batch inference
+    ///
+    /// This is more efficient than calling execute() multiple times when merge_img is enabled.
+    /// Detection runs in a single batched ONNX inference pass.
+    /// Segmentation is skipped if use_mask is false.
+    pub async fn execute_batch(&self, images: &[ImageData], use_mask: bool) -> Result<Vec<Phase1Output>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        debug!("Phase 1 BATCH: Processing {} images with batched detection", images.len());
+        let batch_start = std::time::Instant::now();
+
+        // Prepare images for batch detection
+        let mut decoded_images: Vec<DynamicImage> = Vec::with_capacity(images.len());
+        for image_data in images {
+            let img = if let Some(ref decoded) = image_data.decoded_image {
+                (**decoded).clone()
+            } else {
+                image::load_from_memory(&image_data.image_bytes)
+                    .context("Failed to load image")?
+            };
+            decoded_images.push(img);
+        }
+
+        // Create references for batch detection
+        let batch_refs: Vec<(&DynamicImage, usize)> = decoded_images
+            .iter()
+            .zip(images.iter())
+            .map(|(img, data)| (img, data.index))
+            .collect();
+
+        // Run batch detection (single ONNX inference for all images)
+        debug!("Running batched detection for {} images...", images.len());
+        let detection_start = std::time::Instant::now();
+        let batch_detections = self.detector.detect_all_labels_batch(&batch_refs).await
+            .context("Batch detection failed")?;
+        debug!("✓ Batch detection completed in {:.2}ms", detection_start.elapsed().as_secs_f64() * 1000.0);
+
+        // Run segmentation in parallel for each image (only if use_mask is true)
+        let segmentation_results: Vec<Result<Vec<u8>, anyhow::Error>> = if use_mask {
+            debug!("Running segmentation for {} images in parallel...", images.len());
+            let seg_start = std::time::Instant::now();
+            let segmentation_tasks: Vec<_> = decoded_images.iter().map(|img| {
+                self.segmenter.generate_mask(img)
+            }).collect();
+
+            let results = futures::future::join_all(segmentation_tasks).await;
+            debug!("✓ Segmentation completed in {:.2}ms", seg_start.elapsed().as_secs_f64() * 1000.0);
+            results
+        } else {
+            debug!("Segmentation skipped (mask disabled)");
+            // Return empty masks for each image
+            decoded_images.iter().map(|img| {
+                Ok(vec![0u8; (img.width() * img.height()) as usize])
+            }).collect()
+        };
+
+        // Process results for each image
+        let mut outputs = Vec::with_capacity(images.len());
+
+        for (i, ((label_0_raw, label_1_raw, label_2_raw), seg_result)) in
+            batch_detections.into_iter().zip(segmentation_results.into_iter()).enumerate()
+        {
+            let image_data = &images[i];
+            let img = &decoded_images[i];
+            let segmentation_mask = seg_result.context("Failed to generate segmentation mask")?;
+
+            // Convert BubbleDetection to RegionDetection
+            let label_0_detections: Vec<RegionDetection> = label_0_raw
+                .into_iter()
+                .map(|d| RegionDetection { bbox: d.bbox, label: 0, confidence: d.confidence })
+                .collect();
+            let label_1_detections: Vec<RegionDetection> = label_1_raw
+                .into_iter()
+                .map(|d| RegionDetection { bbox: d.bbox, label: 1, confidence: d.confidence })
+                .collect();
+            let label_2_detections: Vec<RegionDetection> = label_2_raw
+                .into_iter()
+                .map(|d| RegionDetection { bbox: d.bbox, label: 2, confidence: d.confidence })
+                .collect();
+
+            // Categorize regions
+            let (regions, validation_warnings) = self.categorize_regions(
+                img,
+                &label_0_detections,
+                &label_1_detections,
+                &label_2_detections,
+                image_data.index,
+            )?;
+
+            outputs.push(Phase1Output {
+                page_index: image_data.index,
+                filename: image_data.filename.clone(),
+                width: image_data.width,
+                height: image_data.height,
+                regions,
+                segmentation_mask,
+                validation_warnings,
+            });
+        }
+
+        debug!(
+            "✓ Phase 1 BATCH completed in {:.2}ms for {} images ({:.2}ms/image)",
+            batch_start.elapsed().as_secs_f64() * 1000.0,
+            images.len(),
+            batch_start.elapsed().as_secs_f64() * 1000.0 / images.len() as f64
+        );
+
+        Ok(outputs)
     }
 
     /// Categorize regions and validate label 1 within label 0

@@ -41,6 +41,7 @@ impl Phase3Pipeline {
     /// * `phase1_output` - Phase 1 detection/categorization results
     /// * `banana_processed_region_ids` - IDs of regions processed with banana (skip these)
     /// * `blur_free_text` - Whether to blur free text regions (label 2) instead of white fill
+    /// * `use_mask` - Whether to use segmentation mask (false = fill entire label 1 with white)
     ///
     /// # Returns:
     /// Phase3Output with cleaned region images
@@ -54,6 +55,7 @@ impl Phase3Pipeline {
         phase1_output: &Phase1Output,
         banana_processed_region_ids: &[usize],
         blur_free_text: bool,
+        use_mask: bool,
     ) -> Result<Phase3Output> {
         debug!(
             "Phase 3: Text removal for page {}",
@@ -102,7 +104,7 @@ impl Phase3Pipeline {
             );
 
             let cleaned_bytes = self
-                .clean_region(&img, region, &seg_mask, blur_free_text)
+                .clean_region(&img, region, &seg_mask, blur_free_text, use_mask)
                 .context("Failed to clean region")?;
 
             cleaned_regions.push((region.region_id, cleaned_bytes));
@@ -121,12 +123,17 @@ impl Phase3Pipeline {
     /// 2. Erode mask for tighter fit (7x7 kernel, 4 iterations)
     /// 3. Intersect with segmentation mask
     /// 4. Replace masked pixels with white
+    ///
+    /// When use_mask is false:
+    /// - Label 0/1: Fill entire label 1 region with white (no mask)
+    /// - Label 2: Always fill entire region (blur or white)
     fn clean_region(
         &self,
         img: &DynamicImage,
         region: &CategorizedRegion,
         seg_mask: &ImageBuffer<Luma<u8>, Vec<u8>>,
         blur_free_text: bool,
+        use_mask: bool,
     ) -> Result<Vec<u8>> {
         let [x1, y1, x2, y2] = region.bbox;
         let width = (x2 - x1).max(1) as u32;
@@ -135,12 +142,42 @@ impl Phase3Pipeline {
         // Crop region from original image
         let mut cropped = img.crop_imm(x1 as u32, y1 as u32, width, height).to_rgba8();
 
-        // Special handling for label 2 (free text): fill or blur entire bbox
+        // Special handling for label 2 (free text): ALWAYS fill or blur entire bbox (never use mask)
         if region.label == 2 {
             return self.clean_free_text_region(cropped, blur_free_text);
         }
 
-        // Create label 1 mask for this region
+        // When mask is disabled: fill entire label 1 regions with white
+        if !use_mask {
+            debug!("Mask disabled: filling entire label 1 regions with white for region {}", region.region_id);
+            for l1_bbox in &region.label_1_regions {
+                let [l1_x1, l1_y1, l1_x2, l1_y2] = *l1_bbox;
+                // Convert to region-local coordinates
+                let local_x1 = ((l1_x1 - x1).max(0)) as u32;
+                let local_y1 = ((l1_y1 - y1).max(0)) as u32;
+                let local_x2 = ((l1_x2 - x1).min(width as i32)) as u32;
+                let local_y2 = ((l1_y2 - y1).min(height as i32)) as u32;
+
+                // Fill entire label 1 region with white
+                for y in local_y1..local_y2 {
+                    for x in local_x1..local_x2 {
+                        if x < width && y < height {
+                            cropped.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+                        }
+                    }
+                }
+            }
+
+            // Convert to PNG bytes
+            let mut png_bytes = Vec::new();
+            DynamicImage::ImageRgba8(cropped)
+                .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+                .context("Failed to encode cleaned region (no mask)")?;
+
+            return Ok(png_bytes);
+        }
+
+        // Create label 1 mask for this region (mask mode enabled)
         let mut label_1_mask = ImageBuffer::<Luma<u8>, Vec<u8>>::new(width, height);
 
         for l1_bbox in &region.label_1_regions {

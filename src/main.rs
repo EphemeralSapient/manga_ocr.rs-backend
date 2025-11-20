@@ -15,6 +15,7 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 
@@ -24,6 +25,12 @@ struct AppState {
     config: Arc<Config>,
     orchestrator: Arc<BatchOrchestrator>,
     metrics: Metrics,
+    /// Global mask mode setting (true = use segmentation mask, false = fill with white)
+    mask_enabled: Arc<AtomicBool>,
+    /// Current session limit per model (detection and segmentation each get this many)
+    session_limit: Arc<AtomicUsize>,
+    /// Global batch inference mode (true = merge images into single tensor)
+    merge_img_enabled: Arc<AtomicBool>,
 }
 
 #[tokio::main]
@@ -61,10 +68,14 @@ async fn main() -> Result<()> {
     // Initialize batch orchestrator
     info!("Initializing batch orchestrator...");
     let orchestrator = Arc::new(BatchOrchestrator::new(config.clone()).await?);
+    let initial_session_limit = config.onnx_pool_size();
     let state = AppState {
         config: config.clone(),
         orchestrator,
         metrics,
+        mask_enabled: Arc::new(AtomicBool::new(true)), // Default: mask enabled
+        session_limit: Arc::new(AtomicUsize::new(initial_session_limit)),
+        merge_img_enabled: Arc::new(AtomicBool::new(false)), // Default: batch mode disabled
     };
 
     // Setup CORS
@@ -81,6 +92,12 @@ async fn main() -> Result<()> {
         .route("/metrics", get(metrics_endpoint))
         .route("/stats", get(stats_endpoint))
         .route("/process", post(process_images))
+        .route("/mask-toggle", post(mask_toggle))
+        .route("/mask-status", get(mask_status))
+        .route("/sessions-limit", post(sessions_limit))
+        .route("/sessions-status", get(sessions_status))
+        .route("/mergeimg-toggle", post(mergeimg_toggle))
+        .route("/mergeimg-status", get(mergeimg_status))
         .with_state(state)
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024)) // 200MB for large batches
         .layer(cors);
@@ -96,6 +113,12 @@ async fn main() -> Result<()> {
     info!("  GET  /metrics         - Prometheus metrics");
     info!("  GET  /stats           - Detailed statistics");
     info!("  POST /process         - Process images (multipart/form-data)");
+    info!("  POST /mask-toggle     - Toggle mask segmentation mode");
+    info!("  GET  /mask-status     - Get current mask mode status");
+    info!("  POST /sessions-limit  - Set session limit (requires restart)");
+    info!("  GET  /sessions-status - Get current session configuration");
+    info!("  POST /mergeimg-toggle - Toggle batch inference mode");
+    info!("  GET  /mergeimg-status - Get batch inference mode status");
     info!("{}", "=".repeat(70));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -108,10 +131,22 @@ async fn root() -> &'static str {
     "Manga Text Processing Workflow - Optimized Rust Version"
 }
 
-async fn health() -> Json<serde_json::Value> {
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mask_enabled = state.mask_enabled.load(Ordering::SeqCst);
+    let merge_img_enabled = state.merge_img_enabled.load(Ordering::SeqCst);
+    let session_limit = state.session_limit.load(Ordering::SeqCst);
+
     Json(serde_json::json!({
         "status": "healthy",
         "version": env!("CARGO_PKG_VERSION"),
+        "config": {
+            "mask_enabled": mask_enabled,
+            "merge_img_enabled": merge_img_enabled,
+            "session_limit": session_limit,
+            "onnx_pool_size": state.config.onnx_pool_size(),
+            "batch_size_n": state.config.batch_size_n(),
+            "max_concurrent_batches": state.config.max_concurrent_batches(),
+        }
     }))
 }
 
@@ -149,6 +184,158 @@ async fn stats_endpoint(
                 format!("Failed to serialize metrics: {}", e),
             )
         })
+}
+
+/// Toggle mask segmentation mode
+///
+/// When mask is enabled (default): Uses segmentation mask for precise text removal
+/// When mask is disabled: Fills entire label 1 region with white background
+///
+/// Label 2 (free text) always fills entire region (never uses mask)
+async fn mask_toggle(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let current = state.mask_enabled.load(Ordering::SeqCst);
+    let new_value = !current;
+    state.mask_enabled.store(new_value, Ordering::SeqCst);
+
+    info!("Mask mode toggled: {} -> {}",
+        if current { "enabled" } else { "disabled" },
+        if new_value { "enabled" } else { "disabled" }
+    );
+
+    Json(serde_json::json!({
+        "mask_enabled": new_value,
+        "message": if new_value {
+            "Mask mode enabled - using segmentation mask for text removal"
+        } else {
+            "Mask mode disabled - filling entire label 1 region with white"
+        }
+    }))
+}
+
+/// Get current mask mode status
+async fn mask_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let enabled = state.mask_enabled.load(Ordering::SeqCst);
+    Json(serde_json::json!({
+        "mask_enabled": enabled,
+        "description": if enabled {
+            "Using segmentation mask for precise text removal"
+        } else {
+            "Filling entire label 1 region with white background"
+        }
+    }))
+}
+
+/// Session limit request body
+#[derive(serde::Deserialize)]
+struct SessionLimitRequest {
+    /// Number of sessions per model (detection and segmentation each)
+    limit: usize,
+}
+
+/// Set session limit (requires server restart to take effect)
+///
+/// # Arguments
+/// - limit: Number of sessions per model (1-16 recommended)
+///
+/// Note: Full dynamic resizing is not yet implemented.
+/// This sets the desired limit which requires restart to apply.
+async fn sessions_limit(
+    State(state): State<AppState>,
+    Json(payload): Json<SessionLimitRequest>,
+) -> Json<serde_json::Value> {
+    let old_limit = state.session_limit.load(Ordering::SeqCst);
+    let new_limit = payload.limit.clamp(1, 32); // Reasonable bounds
+
+    state.session_limit.store(new_limit, Ordering::SeqCst);
+
+    info!("Session limit set: {} -> {} (restart required to apply)", old_limit, new_limit);
+
+    // Calculate memory estimates
+    let detection_mem_mb = new_limit * 42; // ~42MB per detection session
+    let segmentation_mem_mb = new_limit * 40; // ~40MB per segmentation session
+    let total_mem_mb = detection_mem_mb + segmentation_mem_mb;
+
+    Json(serde_json::json!({
+        "previous_limit": old_limit,
+        "new_limit": new_limit,
+        "detection_sessions": new_limit,
+        "segmentation_sessions": new_limit,
+        "estimated_memory_mb": total_mem_mb,
+        "status": "pending_restart",
+        "message": format!(
+            "Session limit set to {}. Restart server with ONNX_POOL_SIZE={} to apply. \
+            Estimated memory: {} MB ({} detection + {} segmentation)",
+            new_limit, new_limit, total_mem_mb, detection_mem_mb, segmentation_mem_mb
+        )
+    }))
+}
+
+/// Get current session configuration and status
+async fn sessions_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let current_limit = state.config.onnx_pool_size();
+    let desired_limit = state.session_limit.load(Ordering::SeqCst);
+    let mask_enabled = state.mask_enabled.load(Ordering::SeqCst);
+
+    // Calculate memory usage
+    let detection_mem_mb = current_limit * 42;
+    let segmentation_mem_mb = if mask_enabled { current_limit * 40 } else { 0 };
+    let total_mem_mb = detection_mem_mb + segmentation_mem_mb;
+
+    Json(serde_json::json!({
+        "current": {
+            "detection_sessions": current_limit,
+            "segmentation_sessions": if mask_enabled { current_limit } else { 0 },
+            "total_sessions": if mask_enabled { current_limit * 2 } else { current_limit },
+            "estimated_memory_mb": total_mem_mb
+        },
+        "desired": {
+            "limit": desired_limit,
+            "needs_restart": desired_limit != current_limit
+        },
+        "mask_enabled": mask_enabled,
+        "note": if !mask_enabled {
+            "Segmentation sessions not used when mask is disabled"
+        } else {
+            "Both detection and segmentation sessions active"
+        }
+    }))
+}
+
+/// Toggle batch inference mode (mergeImg)
+///
+/// When enabled: Multiple images are batched into single ONNX inference
+/// When disabled: Each image processed with separate inference (default)
+async fn mergeimg_toggle(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let current = state.merge_img_enabled.load(Ordering::SeqCst);
+    let new_value = !current;
+    state.merge_img_enabled.store(new_value, Ordering::SeqCst);
+
+    info!("Batch inference mode toggled: {} -> {}",
+        if current { "enabled" } else { "disabled" },
+        if new_value { "enabled" } else { "disabled" }
+    );
+
+    Json(serde_json::json!({
+        "merge_img_enabled": new_value,
+        "message": if new_value {
+            "Batch inference enabled - images will be merged into single ONNX tensor for faster GPU processing"
+        } else {
+            "Batch inference disabled - each image processed with separate inference"
+        }
+    }))
+}
+
+/// Get current batch inference mode status
+async fn mergeimg_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let enabled = state.merge_img_enabled.load(Ordering::SeqCst);
+    Json(serde_json::json!({
+        "merge_img_enabled": enabled,
+        "description": if enabled {
+            "Images are batched into single ONNX inference for better GPU utilization"
+        } else {
+            "Each image is processed with separate ONNX inference"
+        }
+    }))
 }
 
 /// Process images endpoint
@@ -227,6 +414,14 @@ async fn process_images(
     }
 
     info!("Processing {} images", images.len());
+
+    // Apply global settings if not overridden in request config
+    if config.use_mask.is_none() {
+        config.use_mask = Some(state.mask_enabled.load(Ordering::SeqCst));
+    }
+    if config.merge_img.is_none() {
+        config.merge_img = Some(state.merge_img_enabled.load(Ordering::SeqCst));
+    }
 
     // Process batch
     let result = state

@@ -66,6 +66,18 @@ pub struct ProcessingConfig {
     /// If not provided, defaults to true
     #[serde(rename = "metricsDetail")]
     pub metrics_detail: Option<bool>,
+
+    /// Use segmentation mask for text removal
+    /// If false, fills entire label 1 region with white instead of using mask
+    /// If not provided, uses global mask mode setting
+    #[serde(rename = "useMask")]
+    pub use_mask: Option<bool>,
+
+    /// Enable batch inference mode (merge multiple images into single tensor)
+    /// Processes N images in one ONNX inference pass for better GPU utilization
+    /// If not provided, defaults to false
+    #[serde(rename = "mergeImg")]
+    pub merge_img: Option<bool>,
 }
 
 /// Detection label for region classification
@@ -319,6 +331,13 @@ pub struct PerformanceMetrics {
     pub api_calls_banana: usize,
     pub cache_hits: usize,
     pub cache_misses: usize,
+    // Label counts
+    pub label_0_count: usize,
+    pub label_1_count: usize,
+    pub label_2_count: usize,
+    // Token usage
+    pub input_tokens: usize,
+    pub output_tokens: usize,
 }
 
 impl PerformanceMetrics {
@@ -340,5 +359,12 @@ impl PerformanceMetrics {
         self.api_calls_banana += other.api_calls_banana;
         self.cache_hits += other.cache_hits;
         self.cache_misses += other.cache_misses;
+        // Label counts
+        self.label_0_count += other.label_0_count;
+        self.label_1_count += other.label_1_count;
+        self.label_2_count += other.label_2_count;
+        // Token usage
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
     }
 }

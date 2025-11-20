@@ -87,13 +87,49 @@ impl DetectionService {
         // Wrap in Arc for sharing across threads
         let session_pool = Arc::new(session_pool);
 
-        info!("✓ Detection: {} ({} sessions, ~{} MB)", device_type, pool_size, pool_size * 42);
-
-        Ok(Self {
+        let service = Self {
             session_pool,
             config,
-            device_type,
-        })
+            device_type: device_type.clone(),
+        };
+
+        // Warmup inference to trigger JIT compilation and memory allocation
+        // This moves the slow first-run overhead from request time to startup time
+        info!("Running warmup inference for detection...");
+        let warmup_start = std::time::Instant::now();
+        service.warmup().await?;
+        info!("✓ Detection warmup completed in {:.2}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
+
+        info!("✓ Detection: {} ({} sessions, ~{} MB)", device_type, pool_size, pool_size * 42);
+
+        Ok(service)
+    }
+
+    /// Run warmup inference to trigger JIT compilation and memory allocation
+    async fn warmup(&self) -> Result<()> {
+        let target_size = self.config.target_size();
+
+        // Create a small dummy image (just needs to match expected dimensions)
+        let dummy_img = image::DynamicImage::new_rgb8(target_size, target_size);
+
+        // Run inference on one session to trigger optimization
+        let (preprocessed, original_size) = self.preprocess_image(&dummy_img);
+
+        let images_value = Value::from_array(preprocessed)?;
+        let sizes_value = Value::from_array(original_size)?;
+
+        // Acquire session and run dummy inference
+        let mut session = self.session_pool.acquire();
+        {
+            let _outputs = session.run(ort::inputs![
+                "images" => images_value,
+                "orig_target_sizes" => sizes_value
+            ])?;
+            // outputs dropped here before releasing session
+        }
+        self.session_pool.release(session);
+
+        Ok(())
     }
 
     fn try_forced_backend(backend: &str, model_bytes: &[u8]) -> Result<(String, Session)> {
@@ -546,6 +582,154 @@ impl DetectionService {
         );
 
         Ok((label_0_detections, label_1_detections, label_2_detections))
+    }
+
+    /// Detect ALL regions for multiple images in a single batched inference pass
+    /// This is more efficient than calling detect_all_labels multiple times
+    ///
+    /// # Arguments
+    /// * `images` - Vector of (image, page_index) tuples
+    ///
+    /// # Returns
+    /// Vector of (label_0, label_1, label_2) detection tuples, one per input image
+    pub async fn detect_all_labels_batch(
+        &self,
+        images: &[(&DynamicImage, usize)],
+    ) -> Result<Vec<(Vec<BubbleDetection>, Vec<BubbleDetection>, Vec<BubbleDetection>)>> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = images.len();
+        debug!("🔍 [BATCH DETECTION] Starting batched detection for {} images", batch_size);
+        let detection_start = std::time::Instant::now();
+
+        let target_size = self.config.target_size();
+        let target = target_size as usize;
+
+        // Preprocess all images and stack into batch tensor
+        let mut batch_array = Array4::<f32>::zeros((batch_size, 3, target, target));
+        let mut sizes_array = Array2::zeros((batch_size, 2));
+
+        for (i, (img, _page_index)) in images.iter().enumerate() {
+            // Store original size
+            sizes_array[[i, 0]] = img.width() as i64;
+            sizes_array[[i, 1]] = img.height() as i64;
+
+            // Resize and normalize
+            let resized = img.resize_exact(
+                target_size,
+                target_size,
+                image::imageops::FilterType::Triangle,
+            );
+            let rgb_img = resized.to_rgb8();
+
+            // Fill batch tensor
+            for y in 0..target {
+                for x in 0..target {
+                    let pixel = rgb_img.get_pixel(x as u32, y as u32);
+                    batch_array[[i, 0, y, x]] = pixel[0] as f32 / 255.0;
+                    batch_array[[i, 1, y, x]] = pixel[1] as f32 / 255.0;
+                    batch_array[[i, 2, y, x]] = pixel[2] as f32 / 255.0;
+                }
+            }
+        }
+
+        debug!("✓ Batch preprocessed: {} images into [{}, 3, {}, {}]", batch_size, batch_size, target, target);
+
+        let images_value = Value::from_array(batch_array)?;
+        let sizes_value = Value::from_array(sizes_array)?;
+
+        debug!("Running batched ONNX inference on {}...", self.device_type);
+        let inference_start = std::time::Instant::now();
+
+        // Run batched inference
+        let results = {
+            let mut session = self.session_pool.acquire();
+            let outputs = session.run(ort::inputs![
+                "images" => images_value,
+                "orig_target_sizes" => sizes_value
+            ])?;
+
+            let inference_time = inference_start.elapsed();
+            debug!("✓ Batch inference completed in {:.2}ms", inference_time.as_secs_f64() * 1000.0);
+
+            // Extract tensor data
+            let (labels_shape, labels_data) = outputs["labels"].try_extract_tensor::<i64>()?;
+            let (boxes_shape, boxes_data) = outputs["boxes"].try_extract_tensor::<f32>()?;
+            let (_scores_shape, scores_data) = outputs["scores"].try_extract_tensor::<f32>()?;
+
+            let num_detections = labels_shape[1] as usize;
+            let confidence_threshold = self.config.confidence_threshold();
+
+            // Process results for each image in batch
+            let mut all_results = Vec::with_capacity(batch_size);
+
+            for batch_idx in 0..batch_size {
+                let page_index = images[batch_idx].1;
+                let mut label_0 = Vec::new();
+                let mut label_1 = Vec::new();
+                let mut label_2 = Vec::new();
+
+                for det_idx in 0..num_detections {
+                    let flat_idx = batch_idx * num_detections + det_idx;
+                    let label = labels_data[flat_idx];
+                    let score = scores_data[flat_idx];
+
+                    if score < confidence_threshold {
+                        continue;
+                    }
+
+                    // Box index depends on output format
+                    let box_base = if boxes_shape.len() == 3 {
+                        // Shape [batch, detections, 4]
+                        (batch_idx * num_detections + det_idx) * 4
+                    } else {
+                        // Shape [batch * detections, 4] - flattened
+                        flat_idx * 4
+                    };
+
+                    let bbox = [
+                        boxes_data[box_base] as i32,
+                        boxes_data[box_base + 1] as i32,
+                        boxes_data[box_base + 2] as i32,
+                        boxes_data[box_base + 3] as i32,
+                    ];
+
+                    let detection = BubbleDetection {
+                        bbox,
+                        confidence: score,
+                        page_index,
+                        bubble_index: det_idx,
+                        text_regions: vec![],
+                    };
+
+                    match label {
+                        0 => label_0.push(detection),
+                        1 => label_1.push(detection),
+                        2 => label_2.push(detection),
+                        _ => {}
+                    }
+                }
+
+                all_results.push((label_0, label_1, label_2));
+            }
+
+            drop(outputs);
+            self.session_pool.release(session);
+
+            all_results
+        };
+
+        let total_time = detection_start.elapsed();
+        debug!(
+            "✓ Batch detection completed in {:.2}ms for {} images ({:.2}ms/image)",
+            total_time.as_secs_f64() * 1000.0,
+            batch_size,
+            total_time.as_secs_f64() * 1000.0 / batch_size as f64
+        );
+
+        Ok(results)
     }
 
     /// Detect regions with a specific label

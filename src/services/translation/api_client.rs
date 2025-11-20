@@ -71,6 +71,11 @@ impl ApiClient {
         })
     }
 
+    /// Get the total number of available API keys
+    pub async fn total_keys(&self) -> usize {
+        self.api_key_pool.total_keys().await
+    }
+
     /// Perform OCR and translation on a batch of images (simple backgrounds)
     ///
     /// # Arguments

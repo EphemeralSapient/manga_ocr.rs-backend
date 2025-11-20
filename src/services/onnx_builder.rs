@@ -6,6 +6,9 @@ use anyhow::{Context, Result};
 use crossbeam::channel::{bounded, Receiver, Sender};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::execution_providers::CPUExecutionProvider;
+use parking_lot::Mutex;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{info, warn, debug};
 
 /// Calculate optimal thread count for ONNX Runtime CPU inference.
@@ -77,6 +80,103 @@ impl OnnxSessionPool {
     /// crossbeam send() on bounded channel blocks if full (backpressure)
     pub fn release(&self, session: Session) {
         self.sender.send(session).expect("Failed to return session to pool");
+    }
+}
+
+/// Dynamic session pool that supports runtime resizing
+/// Uses Mutex<VecDeque> for flexibility at slight performance cost
+pub struct DynamicSessionPool {
+    sessions: Mutex<VecDeque<Session>>,
+    capacity: AtomicUsize,
+    in_use: AtomicUsize,
+}
+
+impl DynamicSessionPool {
+    /// Create a new dynamic session pool
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            sessions: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity: AtomicUsize::new(capacity),
+            in_use: AtomicUsize::new(0),
+        }
+    }
+
+    /// Add a session to the pool
+    pub fn add_session(&self, session: Session) {
+        let mut sessions = self.sessions.lock();
+        sessions.push_back(session);
+    }
+
+    /// Get current capacity
+    pub fn capacity(&self) -> usize {
+        self.capacity.load(Ordering::SeqCst)
+    }
+
+    /// Get number of available sessions
+    pub fn available(&self) -> usize {
+        self.sessions.lock().len()
+    }
+
+    /// Get number of sessions in use
+    pub fn in_use(&self) -> usize {
+        self.in_use.load(Ordering::SeqCst)
+    }
+
+    /// Acquire a session from the pool (blocks if pool is empty)
+    pub fn acquire(&self) -> Session {
+        loop {
+            {
+                let mut sessions = self.sessions.lock();
+                if let Some(session) = sessions.pop_front() {
+                    self.in_use.fetch_add(1, Ordering::SeqCst);
+                    return session;
+                }
+            }
+            // Yield to allow other threads to release sessions
+            std::thread::yield_now();
+        }
+    }
+
+    /// Try to acquire a session without blocking
+    pub fn try_acquire(&self) -> Option<Session> {
+        let mut sessions = self.sessions.lock();
+        if let Some(session) = sessions.pop_front() {
+            self.in_use.fetch_add(1, Ordering::SeqCst);
+            Some(session)
+        } else {
+            None
+        }
+    }
+
+    /// Release a session back to the pool
+    pub fn release(&self, session: Session) {
+        self.in_use.fetch_sub(1, Ordering::SeqCst);
+        let mut sessions = self.sessions.lock();
+        sessions.push_back(session);
+    }
+
+    /// Remove one session from the pool (for downsizing)
+    /// Returns None if no sessions available
+    pub fn remove_one(&self) -> Option<Session> {
+        let mut sessions = self.sessions.lock();
+        if let Some(session) = sessions.pop_back() {
+            self.capacity.fetch_sub(1, Ordering::SeqCst);
+            Some(session)
+        } else {
+            None
+        }
+    }
+
+    /// Increase capacity (call add_session separately to add actual sessions)
+    pub fn increase_capacity(&self, amount: usize) {
+        self.capacity.fetch_add(amount, Ordering::SeqCst);
+    }
+
+    /// Drain all sessions from the pool
+    pub fn drain_all(&self) -> Vec<Session> {
+        let mut sessions = self.sessions.lock();
+        self.capacity.store(0, Ordering::SeqCst);
+        sessions.drain(..).collect()
     }
 }
 

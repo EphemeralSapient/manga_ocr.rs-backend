@@ -294,4 +294,256 @@ impl Phase2Pipeline {
 
         Ok(results)
     }
+
+    /// Execute Phase 2 on multiple pages as a batch (fewer API calls)
+    ///
+    /// This combines all simple regions from all pages into fewer API calls,
+    /// dramatically reducing API rate limit issues.
+    ///
+    /// # Arguments
+    /// * `pages` - Vector of (ImageData, Phase1Output) pairs
+    /// * `ocr_model_override` - Optional OCR/translation model name override
+    /// * `banana_model_override` - Optional banana mode image model name override
+    /// * `banana_mode` - Whether to use banana mode for complex backgrounds
+    /// * `cache_enabled` - Whether to use translation cache
+    ///
+    /// # Returns
+    /// Vector of Phase2Output for each page
+    pub async fn execute_batch(
+        &self,
+        pages: &[(ImageData, Phase1Output)],
+        ocr_model_override: Option<&str>,
+        banana_model_override: Option<&str>,
+        banana_mode: bool,
+        cache_enabled: bool,
+    ) -> Result<Vec<Phase2Output>> {
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        debug!("Phase 2 BATCH: Processing {} pages together", pages.len());
+
+        // Collect all regions from all pages with their metadata
+        // (page_index, region_id, source_image_hash, bbox, background_type, cropped_bytes)
+        let mut all_simple_regions: Vec<(usize, usize, u64, [i32; 4], Vec<u8>)> = Vec::new();
+        let mut all_complex_regions: Vec<(usize, usize, [i32; 4], Vec<u8>)> = Vec::new();
+        let mut cached_results: Vec<(usize, usize, OCRTranslation)> = Vec::new();
+
+        // Pre-process all pages
+        for (image_data, phase1_output) in pages {
+            // Load image
+            let img_owned;
+            let img: &DynamicImage = if let Some(ref decoded) = image_data.decoded_image {
+                decoded.as_ref()
+            } else {
+                img_owned = image::load_from_memory(&image_data.image_bytes)
+                    .context("Failed to load image")?;
+                &img_owned
+            };
+
+            let source_image_hash = xxh3_64(&image_data.image_bytes);
+            let page_index = phase1_output.page_index;
+
+            for region in &phase1_output.regions {
+                let is_simple = region.background_type == BackgroundType::Simple;
+
+                // Check cache first (for simple regions or complex without banana)
+                if is_simple || !banana_mode {
+                    if cache_enabled {
+                        let cache_key = TranslationCache::generate_key_from_source(
+                            source_image_hash,
+                            &region.bbox,
+                        );
+                        if let Some(cached_translation) = self.cache.get(cache_key) {
+                            cached_results.push((page_index, region.region_id, cached_translation));
+                            continue;
+                        }
+                    }
+                }
+
+                // Crop the region
+                let [x1, y1, x2, y2] = region.bbox;
+                let width = (x2 - x1).max(1) as u32;
+                let height = (y2 - y1).max(1) as u32;
+                let cropped = img.crop_imm(x1 as u32, y1 as u32, width, height);
+
+                let mut png_bytes = Vec::new();
+                cropped
+                    .write_to(
+                        &mut std::io::Cursor::new(&mut png_bytes),
+                        image::ImageFormat::Png,
+                    )
+                    .context("Failed to encode cropped image")?;
+
+                if is_simple || !banana_mode {
+                    all_simple_regions.push((
+                        page_index,
+                        region.region_id,
+                        source_image_hash,
+                        region.bbox,
+                        png_bytes,
+                    ));
+                } else {
+                    all_complex_regions.push((
+                        page_index,
+                        region.region_id,
+                        region.bbox,
+                        png_bytes,
+                    ));
+                }
+            }
+        }
+
+        debug!(
+            "Batch collected: {} simple regions, {} complex regions, {} cache hits",
+            all_simple_regions.len(),
+            all_complex_regions.len(),
+            cached_results.len()
+        );
+
+        // Process all simple regions SPLIT ACROSS API KEYS for parallelism
+        let simple_translations = if !all_simple_regions.is_empty() {
+            // Get number of available API keys
+            let num_keys = self.api_client.total_keys().await.max(1);
+
+            debug!(
+                "Splitting {} simple regions across {} API keys for parallel processing",
+                all_simple_regions.len(),
+                num_keys
+            );
+
+            // Split regions into chunks for each API key
+            let chunk_size = (all_simple_regions.len() + num_keys - 1) / num_keys; // Round up
+            let chunks: Vec<Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>> = all_simple_regions
+                .chunks(chunk_size)
+                .map(|chunk| chunk.to_vec())
+                .collect();
+
+            debug!(
+                "Created {} chunks (chunk_size={}) for parallel API calls",
+                chunks.len(),
+                chunk_size
+            );
+
+            // Process each chunk in parallel
+            let tasks: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    let api_client = Arc::clone(&self.api_client);
+                    let model_override = ocr_model_override.map(|s| s.to_string());
+
+                    tokio::spawn(async move {
+                        let image_bytes: Vec<Vec<u8>> = chunk
+                            .iter()
+                            .map(|(_, _, _, _, bytes)| bytes.clone())
+                            .collect();
+
+                        let translations = api_client
+                            .ocr_translate_batch(image_bytes, model_override.as_deref())
+                            .await?;
+
+                        Ok::<_, anyhow::Error>((chunk, translations))
+                    })
+                })
+                .collect();
+
+            // Wait for all parallel API calls
+            let results = try_join_all(tasks)
+                .await
+                .context("One or more API tasks panicked")?
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .context("One or more API calls failed")?;
+
+            // Flatten results and cache
+            let mut all_translations = Vec::new();
+            for (chunk, translations) in results {
+                for ((page_index, region_id, source_hash, bbox, _), translation) in
+                    chunk.iter().zip(translations.iter())
+                {
+                    if cache_enabled {
+                        let cache_key = TranslationCache::generate_key_from_source(*source_hash, bbox);
+                        self.cache.put(cache_key, translation);
+                    }
+                    all_translations.push((*page_index, *region_id, translation.clone()));
+                }
+            }
+
+            all_translations
+        } else {
+            Vec::new()
+        };
+
+        // Process complex regions with banana mode (concurrent per-region calls)
+        let banana_results = if !all_complex_regions.is_empty() && banana_mode {
+            let tasks: Vec<_> = all_complex_regions
+                .into_iter()
+                .map(|(page_index, region_id, _bbox, png_bytes)| {
+                    let api_client = Arc::clone(&self.api_client);
+                    let model_override = banana_model_override.map(|s| s.to_string());
+
+                    tokio::spawn(async move {
+                        let result = api_client
+                            .banana_translate(region_id, png_bytes, model_override.as_deref())
+                            .await?;
+                        Ok::<_, anyhow::Error>((page_index, result))
+                    })
+                })
+                .collect();
+
+            let results = try_join_all(tasks)
+                .await
+                .context("One or more banana tasks panicked")?
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .context("One or more banana API calls failed")?;
+
+            results
+        } else {
+            Vec::new()
+        };
+
+        // Assemble Phase2Output for each page
+        let mut outputs: Vec<Phase2Output> = pages
+            .iter()
+            .map(|(_, phase1_output)| Phase2Output {
+                page_index: phase1_output.page_index,
+                simple_bg_translations: Vec::new(),
+                complex_bg_bananas: Vec::new(),
+                complex_bg_translations: Vec::new(),
+            })
+            .collect();
+
+        // Create a map from page_index to output index
+        let page_to_idx: std::collections::HashMap<usize, usize> = pages
+            .iter()
+            .enumerate()
+            .map(|(i, (_, p))| (p.page_index, i))
+            .collect();
+
+        // Distribute cached results
+        for (page_index, region_id, translation) in cached_results {
+            if let Some(&idx) = page_to_idx.get(&page_index) {
+                outputs[idx].simple_bg_translations.push((region_id, translation));
+            }
+        }
+
+        // Distribute simple translations
+        for (page_index, region_id, translation) in simple_translations {
+            if let Some(&idx) = page_to_idx.get(&page_index) {
+                outputs[idx].simple_bg_translations.push((region_id, translation));
+            }
+        }
+
+        // Distribute banana results
+        for (page_index, banana_result) in banana_results {
+            if let Some(&idx) = page_to_idx.get(&page_index) {
+                outputs[idx].complex_bg_bananas.push(banana_result);
+            }
+        }
+
+        debug!("Phase 2 BATCH: Completed processing {} pages", pages.len());
+
+        Ok(outputs)
+    }
 }

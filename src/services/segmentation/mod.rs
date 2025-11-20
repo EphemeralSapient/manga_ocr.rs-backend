@@ -87,13 +87,61 @@ impl SegmentationService {
         // Wrap in Arc for sharing across threads
         let session_pool = Arc::new(session_pool);
 
-        info!("✓ Segmentation: {} ({} sessions, ~{} MB)", device_type, pool_size, pool_size * 40);
-
-        Ok(Self {
+        let service = Self {
             session_pool,
             target_size: config.target_size(),
-            device_type,
-        })
+            device_type: device_type.clone(),
+        };
+
+        // Warmup inference to trigger JIT compilation and memory allocation
+        // This moves the slow first-run overhead from request time to startup time
+        info!("Running warmup inference for segmentation...");
+        let warmup_start = std::time::Instant::now();
+        service.warmup().await?;
+        info!("✓ Segmentation warmup completed in {:.2}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
+
+        info!("✓ Segmentation: {} ({} sessions, ~{} MB)", device_type, pool_size, pool_size * 40);
+
+        Ok(service)
+    }
+
+    /// Run warmup inference to trigger JIT compilation and memory allocation
+    async fn warmup(&self) -> Result<()> {
+        // Create a small dummy image (just needs to match expected dimensions)
+        let dummy_img = image::DynamicImage::new_rgb8(self.target_size, self.target_size);
+
+        // Run inference on one session to trigger optimization
+        // Preprocess: resize and normalize
+        let resized = dummy_img.resize_exact(
+            self.target_size,
+            self.target_size,
+            image::imageops::FilterType::Triangle,
+        );
+        let rgb_img = resized.to_rgb8();
+
+        let target = self.target_size as usize;
+        let mut array = Array4::<f32>::zeros((1, 3, target, target));
+
+        for y in 0..target {
+            for x in 0..target {
+                let pixel = rgb_img.get_pixel(x as u32, y as u32);
+                array[[0, 0, y, x]] = pixel[0] as f32 / 255.0;
+                array[[0, 1, y, x]] = pixel[1] as f32 / 255.0;
+                array[[0, 2, y, x]] = pixel[2] as f32 / 255.0;
+            }
+        }
+
+        let input_value = ort::value::Value::from_array(array)?;
+
+        // Acquire session and run dummy inference
+        let mut session = self.session_pool.acquire();
+        {
+            let _outputs = session.run(ort::inputs!["images" => input_value])?;
+            // outputs dropped here before releasing session
+        }
+        self.session_pool.release(session);
+
+        Ok(())
     }
 
     fn initialize_with_acceleration(config: &Config) -> Result<(String, Session)> {
