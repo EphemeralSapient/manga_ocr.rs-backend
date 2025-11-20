@@ -57,11 +57,6 @@ impl Phase3Pipeline {
         blur_free_text: bool,
         use_mask: bool,
     ) -> Result<Phase3Output> {
-        debug!(
-            "Phase 3: Text removal for page {}",
-            phase1_output.page_index
-        );
-
         // Use pre-decoded image if available, otherwise load from bytes
         // OPTIMIZATION: Pre-decoded image eliminates redundant decoding across phases
         // Use Arc reference instead of cloning the entire image (saves ~8MB per phase!)
@@ -90,18 +85,8 @@ impl Phase3Pipeline {
         for region in &phase1_output.regions {
             // Skip banana-processed regions
             if banana_processed_region_ids.contains(&region.region_id) {
-                debug!(
-                    "Skipping region {} (processed with banana)",
-                    region.region_id
-                );
                 continue;
             }
-
-            // Only process simple backgrounds and complex backgrounds without banana
-            debug!(
-                "Cleaning region {} (label {}, {:?})",
-                region.region_id, region.label, region.background_type
-            );
 
             let cleaned_bytes = self
                 .clean_region(&img, region, &seg_mask, blur_free_text, use_mask)
@@ -149,7 +134,6 @@ impl Phase3Pipeline {
 
         // When mask is disabled: fill entire label 1 regions with white
         if !use_mask {
-            debug!("Mask disabled: filling entire label 1 regions with white for region {}", region.region_id);
             for l1_bbox in &region.label_1_regions {
                 let [l1_x1, l1_y1, l1_x2, l1_y2] = *l1_bbox;
                 // Convert to region-local coordinates

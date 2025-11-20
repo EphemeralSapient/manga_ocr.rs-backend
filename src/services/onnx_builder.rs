@@ -266,18 +266,23 @@ pub fn build_session_with_acceleration(
     #[cfg(all(target_os = "windows", feature = "directml"))]
     {
         // DirectML with CPU fallback for unsupported operations
-        // Using DirectML 1.15.4+ which supports full optimizations
+        // IMPORTANT: DirectML requires specific settings for stability
+        // - parallel_execution(false): Sequential execution required
+        // - memory_pattern(false): Memory pattern must be disabled
+        // - Level1 optimization: Higher levels can cause crashes
         if let Ok(session) = Session::builder()
             .and_then(|b| b.with_execution_providers([
                 CPUExecutionProvider::default().build(),      // Fallback for unsupported ops
                 DirectMLExecutionProvider::default().build()  // Primary GPU acceleration
             ]))
-            .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))  // Full optimization
+            .and_then(|b| b.with_parallel_execution(false))  // REQUIRED: Sequential execution
+            .and_then(|b| b.with_memory_pattern(false))      // REQUIRED: Disable memory pattern
+            .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level1))
             .and_then(|b| b.with_intra_threads(optimal_intra_op_threads()))
             .and_then(|b| b.with_inter_threads(1))
             .and_then(|b| b.commit_from_memory(model_bytes))
         {
-            info!("✓ Using DirectML acceleration for {} (with CPU fallback, Level3 optimizations)", model_name);
+            info!("✓ Using DirectML acceleration for {} (with CPU fallback)", model_name);
             return Ok(("DirectML+CPU".to_string(), session));
         }
     }

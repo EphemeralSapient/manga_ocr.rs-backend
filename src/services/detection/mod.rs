@@ -176,16 +176,19 @@ impl DetectionService {
             #[cfg(all(target_os = "windows", feature = "directml"))]
             "DIRECTML" => {
                 info!("Forcing DirectML backend...");
-                // DirectML with CPU fallback, full optimizations (DirectML 1.15.4+)
+                // DirectML with CPU fallback for unsupported operations
+                // REQUIRED settings for stability
                 let session = Session::builder()?
                     .with_execution_providers([
                         CPUExecutionProvider::default().build(),
                         DirectMLExecutionProvider::default().build()
                     ])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?  // Full optimization
+                    .with_parallel_execution(false)?   // REQUIRED: Sequential execution
+                    .with_memory_pattern(false)?       // REQUIRED: Disable memory pattern
+                    .with_optimization_level(GraphOptimizationLevel::Level1)?
                     .with_intra_threads(num_cpus::get())?
                     .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized DirectML backend (with CPU fallback, Level3 optimizations)");
+                info!("✓ Successfully initialized DirectML backend (with CPU fallback)");
                 Ok(("DirectML+CPU (forced)".to_string(), session))
             }
             #[cfg(not(all(target_os = "windows", feature = "directml")))]

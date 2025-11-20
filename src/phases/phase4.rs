@@ -62,8 +62,6 @@ impl Phase4Pipeline {
         font_family: &str,
         text_stroke: bool,
     ) -> Result<Phase4Output> {
-        debug!("Phase 4: Text insertion for page {}", phase1_output.page_index);
-
         // Use pre-decoded image if available, otherwise load from bytes
         // OPTIMIZATION: Pre-decoded image eliminates redundant decoding across phases
         // Use Arc reference instead of cloning the entire image (saves ~8MB per phase!)
@@ -104,7 +102,6 @@ impl Phase4Pipeline {
 
             // Check if this region was processed with banana
             if let Some(banana) = banana_map.get(&region_id) {
-                debug!("Compositing banana result for region {}", region_id);
                 self.composite_banana_result(&mut final_image, region, banana)?;
                 continue;
             }
@@ -118,11 +115,6 @@ impl Phase4Pipeline {
             let cleaned_bytes = cleaned_map
                 .get(&region_id)
                 .context(format!("No cleaned image found for region {}", region_id))?;
-
-            debug!(
-                "Rendering text '{}' for region {}",
-                translation.translated_text, region_id
-            );
 
             // Convert label_1_regions from absolute to local coordinates
             let [x1, y1, _, _] = region.bbox;
@@ -342,10 +334,6 @@ impl Phase4Pipeline {
             MAX_FONT_SIZE,
         ).await?;
 
-        debug!(
-            "Dynamic font sizing: area={:.0}x{:.0}px, text_len={}, optimal={:.1}px",
-            text_width, text_height, text.len(), font_size
-        );
         let text_color = Rgba([0u8, 0u8, 0u8, 255u8]); // Black text
 
         // Create upscaled canvas for better quality
