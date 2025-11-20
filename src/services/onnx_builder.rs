@@ -261,16 +261,17 @@ pub fn build_session_with_acceleration(
     // Try DirectML (Windows, if feature enabled)
     #[cfg(all(target_os = "windows", feature = "directml"))]
     {
-        // DirectML has issues with Level3 optimizations (FusedMatMulActivation errors)
-        // Use Level1 for better compatibility
+        // DirectML has known issues with transformer models (Softmax in self-attention)
+        // GitHub issues: #8118, #15255, #16564
+        // Try with optimizations completely disabled as last resort
         if let Ok(session) = Session::builder()
             .and_then(|b| b.with_execution_providers([DirectMLExecutionProvider::default().build()]))
-            .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level1))
+            .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Disable))
             .and_then(|b| b.with_intra_threads(optimal_intra_op_threads()))
             .and_then(|b| b.with_inter_threads(1))
             .and_then(|b| b.commit_from_memory(model_bytes))
         {
-            info!("✓ Using DirectML acceleration for {}", model_name);
+            info!("✓ Using DirectML acceleration for {} (optimizations disabled)", model_name);
             return Ok(("DirectML".to_string(), session));
         }
     }
