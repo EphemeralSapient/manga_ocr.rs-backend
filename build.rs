@@ -43,6 +43,33 @@ fn main() {
     }
     if env::var("CARGO_FEATURE_DIRECTML").is_ok() {
         enabled_features.push("DirectML");
+
+        // Copy DirectML.dll to output directory (fixes version mismatch with System32)
+        // Windows ships old DirectML 1.8, ONNX Runtime needs 1.15.4+
+        if target.contains("windows") {
+            let out_dir = env::var("OUT_DIR").unwrap();
+            let profile = env::var("PROFILE").unwrap();
+            let dll_source = "libs/windows/x64/DirectML.dll";
+
+            if std::path::Path::new(dll_source).exists() {
+                // Calculate target directory (e.g., target/release or target/debug)
+                let target_dir = std::path::Path::new(&out_dir)
+                    .ancestors()
+                    .nth(3)
+                    .unwrap()
+                    .join(&profile);
+
+                let dll_target = target_dir.join("DirectML.dll");
+
+                match std::fs::copy(dll_source, &dll_target) {
+                    Ok(_) => println!("cargo:warning=Copied DirectML.dll v1.15.4 to output (fixes System32 v1.8 conflict)"),
+                    Err(e) => println!("cargo:warning=Failed to copy DirectML.dll: {}", e),
+                }
+            } else {
+                println!("cargo:warning=DirectML.dll not found in libs/windows/x64/");
+                println!("cargo:warning=Download from: https://www.nuget.org/packages/Microsoft.AI.DirectML/1.15.4");
+            }
+        }
     }
     if env::var("CARGO_FEATURE_COREML").is_ok() {
         enabled_features.push("CoreML");

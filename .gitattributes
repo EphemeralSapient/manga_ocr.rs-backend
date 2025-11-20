@@ -2,3 +2,4 @@ models/detector.onnx filter=lfs diff=lfs merge=lfs -text
 models/mask.onnx filter=lfs diff=lfs merge=lfs -text
 *.onnx filter=lfs diff=lfs merge=lfs -text
 models/*.onnx filter=lfs diff=lfs merge=lfs -text
+*.dll filter=lfs diff=lfs merge=lfs -text
