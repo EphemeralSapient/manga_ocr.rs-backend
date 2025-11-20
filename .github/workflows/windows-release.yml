@@ -65,38 +65,39 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
-      - name: Get version
-        id: get_version
+      - name: Save standard binary
         shell: bash
         run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            VERSION=${GITHUB_REF#refs/tags/}
-          else
-            VERSION="latest"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          mkdir -p temp_binaries
+          cp target/x86_64-pc-windows-msvc/release/manga_workflow.exe temp_binaries/manga_workflow_standard.exe
 
-      - name: Create release archive
+      - name: Build release binary with DirectML
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc --features directml
+
+      - name: Save DirectML binary
         shell: bash
         run: |
-          mkdir -p release_package
-          cp target/x86_64-pc-windows-msvc/release/manga_workflow.exe release_package/
-          cp C:/opencv/build/x64/vc16/bin/opencv_world4120.dll release_package/
-          cd release_package
-          7z a ../manga_workflow-${{ steps.get_version.outputs.version }}-windows-x86_64.zip *
-          cd ..
+          cp target/x86_64-pc-windows-msvc/release/manga_workflow.exe temp_binaries/manga_workflow_directml.exe
 
-      - name: Upload artifact
+      - name: Upload standard artifact
         uses: actions/upload-artifact@v4
         with:
           name: manga_workflow-windows-x86_64
-          path: manga_workflow-${{ steps.get_version.outputs.version }}-windows-x86_64.zip
+          path: temp_binaries/manga_workflow_standard.exe
+
+      - name: Upload DirectML artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: manga_workflow-windows-x86_64-directml
+          path: temp_binaries/manga_workflow_directml.exe
 
       - name: Create Release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          files: manga_workflow-${{ steps.get_version.outputs.version }}-windows-x86_64.zip
+          files: |
+            temp_binaries/manga_workflow_standard.exe
+            temp_binaries/manga_workflow_directml.exe
           draft: false
           prerelease: false
         env:
