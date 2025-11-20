@@ -32,6 +32,9 @@ fn main() {
         println!("cargo:warning=Binary will be small (~25MB). Models must be provided at runtime.");
     }
 
+    // Get target platform early (needed for DirectML DLL copying)
+    let target = env::var("TARGET").unwrap_or_default();
+
     // Detect enabled acceleration features
     let mut enabled_features = Vec::new();
 
@@ -85,8 +88,7 @@ fn main() {
         println!("cargo:warning=GPU acceleration enabled: {}", enabled_features.join(", "));
     }
 
-    // Platform-specific warnings
-    let target = env::var("TARGET").unwrap_or_default();
+    // Platform-specific warnings (target already defined above)
 
     if target.contains("windows-gnu") && enabled_features.contains(&"CUDA") {
         println!("cargo:warning=WARNING: CUDA binaries may not be available for Windows GNU target");
