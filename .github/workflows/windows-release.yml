@@ -12,8 +12,22 @@ env:
 
 jobs:
   build-windows:
-    name: Build Windows Binary
+    name: Build Windows Binary (${{ matrix.variant }})
     runs-on: windows-2025  # Faster I/O with Dev Drive support
+
+    strategy:
+      fail-fast: false  # Continue other builds even if one fails
+      matrix:
+        variant:
+          - name: standard
+            features: ""
+            suffix: "standard"
+          - name: directml
+            features: "--features directml"
+            suffix: "directml"
+          - name: openvino
+            features: "--features openvino"
+            suffix: "openvino"
 
     steps:
       - uses: actions/checkout@v5
@@ -52,7 +66,7 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "release"
+          shared-key: "release-${{ matrix.variant.name }}"
           cache-on-failure: true
 
       - name: Configure build environment
@@ -62,42 +76,42 @@ jobs:
           echo "CARGO_INCREMENTAL=0" >> $env:GITHUB_ENV
           echo "CARGO_TERM_COLOR=always" >> $env:GITHUB_ENV
 
-      - name: Build release binary
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Build release binary (${{ matrix.variant.name }})
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc ${{ matrix.variant.features }}
 
-      - name: Save standard binary
-        shell: bash
-        run: |
-          mkdir -p temp_binaries
-          cp target/x86_64-pc-windows-msvc/release/manga_workflow.exe temp_binaries/manga_workflow_standard.exe
-
-      - name: Build release binary with DirectML
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc --features directml
-
-      - name: Save DirectML binary
-        shell: bash
-        run: |
-          cp target/x86_64-pc-windows-msvc/release/manga_workflow.exe temp_binaries/manga_workflow_directml.exe
-
-      - name: Upload standard artifact
+      - name: Upload artifact (${{ matrix.variant.name }})
         uses: actions/upload-artifact@v4
         with:
-          name: manga_workflow-windows-x86_64
-          path: temp_binaries/manga_workflow_standard.exe
+          name: manga_workflow-windows-x86_64-${{ matrix.variant.suffix }}
+          path: target/x86_64-pc-windows-msvc/release/manga_workflow.exe
 
-      - name: Upload DirectML artifact
-        uses: actions/upload-artifact@v4
+  release:
+    name: Create Release
+    needs: build-windows
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          name: manga_workflow-windows-x86_64-directml
-          path: temp_binaries/manga_workflow_directml.exe
+          path: binaries
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          mv binaries/manga_workflow-windows-x86_64-standard/manga_workflow.exe release/manga_workflow_standard.exe
+          mv binaries/manga_workflow-windows-x86_64-directml/manga_workflow.exe release/manga_workflow_directml.exe
+          mv binaries/manga_workflow-windows-x86_64-openvino/manga_workflow.exe release/manga_workflow_openvino.exe
+          ls -lh release/
 
       - name: Create Release
-        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            temp_binaries/manga_workflow_standard.exe
-            temp_binaries/manga_workflow_directml.exe
+            release/manga_workflow_standard.exe
+            release/manga_workflow_directml.exe
+            release/manga_workflow_openvino.exe
           draft: false
           prerelease: false
         env:
