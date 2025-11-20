@@ -177,14 +177,13 @@ impl DetectionService {
             "DIRECTML" => {
                 info!("Forcing DirectML backend...");
                 // DirectML with CPU fallback for unsupported operations
-                // REQUIRED settings for stability
                 let session = Session::builder()?
                     .with_execution_providers([
                         CPUExecutionProvider::default().build(),
                         DirectMLExecutionProvider::default().build()
                     ])?
-                    .with_parallel_execution(false)?   // REQUIRED: Sequential execution
-                    .with_memory_pattern(false)?       // REQUIRED: Disable memory pattern
+                    .with_parallel_execution(true)?    // Enable parallel execution
+                    .with_memory_pattern(false)?       // Disable memory pattern for stability
                     .with_optimization_level(GraphOptimizationLevel::Level1)?
                     .with_intra_threads(num_cpus::get())?
                     .commit_from_memory(model_bytes)?;
@@ -338,8 +337,8 @@ impl DetectionService {
                     CPUExecutionProvider::default().build(),
                     DirectMLExecutionProvider::default().build()
                 ]))
-                .and_then(|b| b.with_parallel_execution(false))  // REQUIRED: Sequential execution
-                .and_then(|b| b.with_memory_pattern(false))      // REQUIRED: Disable memory pattern
+                .and_then(|b| b.with_parallel_execution(true))   // Enable parallel execution
+                .and_then(|b| b.with_memory_pattern(false))      // Disable memory pattern for stability
                 .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level1))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
                 .and_then(|b| b.commit_from_memory(&model_bytes))
