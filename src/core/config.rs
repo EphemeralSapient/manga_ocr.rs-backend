@@ -186,7 +186,12 @@ impl Config {
                 onnx_pool_size: env::var("ONNX_POOL_SIZE")
                     .ok()
                     .and_then(|s| s.parse().ok())
-                    .unwrap_or(8), // Default 8 for maximum parallelism with ~656MB memory
+                    .unwrap_or_else(|| {
+                        // Intelligent default: max(half the cores, 8)
+                        // This balances performance with memory usage
+                        let cores = num_cpus::get();
+                        std::cmp::max(cores / 2, 8)
+                    }),
             },
             background: BackgroundConfig {
                 simple_bg_white_threshold: env::var("SIMPLE_BG_WHITE_THRESHOLD")

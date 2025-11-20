@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::{debug, info, instrument};
 
 use crate::core::config::Config;
-use crate::services::onnx_builder::{self, OnnxSessionPool};
+use crate::services::onnx_builder::{self};
 
 // Embed the mask model at compile time
 // If LFS not checked out, this will be a small stub - load from runtime path instead
@@ -29,12 +29,16 @@ fn load_model_bytes(config: &Config) -> Result<Vec<u8>> {
     }
 }
 
+use crate::services::onnx_builder::DynamicSessionPool;
+
 /// Segmentation service for generating text region masks
 pub struct SegmentationService {
-    session_pool: Arc<OnnxSessionPool>,
+    session_pool: Arc<DynamicSessionPool>,
     target_size: u32,
     #[allow(dead_code)]
     device_type: String,
+    max_sessions: usize,
+    config: Arc<Config>,
 }
 
 impl SegmentationService {
@@ -47,60 +51,44 @@ impl SegmentationService {
     /// Result containing the segmentation service or an error
     #[instrument(skip(config), fields(target_size = config.target_size()))]
     pub async fn new(config: Arc<Config>) -> Result<Self> {
-        // Configurable pool size for inference parallelism
-        // Default 4 sessions = ~160 MB, provides 4x throughput vs single session
-        let pool_size = config.onnx_pool_size();
-        debug!("Creating segmentation session pool with {} session(s)", pool_size);
+        Self::new_with_limit(config, None).await
+    }
+
+    /// Create segmentation service with optional session limit override
+    pub async fn new_with_limit(config: Arc<Config>, session_limit: Option<usize>) -> Result<Self> {
+        // Use provided limit or fall back to config default
+        let max_sessions = session_limit.unwrap_or_else(|| config.onnx_pool_size());
+
+        info!("🚀 [DYNAMIC ALLOCATION] Creating segmentation service with max {} sessions", max_sessions);
+        info!("   Starting with 1 session for warmup, will expand on demand");
 
         // Create first session to determine device type
         let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
 
-        // Create generic ONNX session pool (lock-free, high performance)
-        let session_pool = OnnxSessionPool::new(pool_size);
+        // Create dynamic session pool with capacity for max_sessions
+        let session_pool = DynamicSessionPool::new(max_sessions);
 
-        // Send first session to pool
-        session_pool.sender().send(first_session)
-            .map_err(|_| anyhow::anyhow!("Failed to initialize session pool"))?;
+        // Add ONLY the first session
+        session_pool.add_session(first_session);
 
-        // Create remaining sessions IN PARALLEL for faster startup
-        if pool_size > 1 {
-            let mut tasks = Vec::new();
-
-            for i in 1..pool_size {
-                let config_clone = Arc::clone(&config);
-                let task = tokio::task::spawn_blocking(move || {
-                    debug!("Creating session {} of {}", i + 1, pool_size);
-                    Self::initialize_with_acceleration(&config_clone)
-                });
-                tasks.push(task);
-            }
-
-            // Wait for all sessions to be created
-            for task in tasks {
-                let (_, session) = task.await
-                    .map_err(|e| anyhow::anyhow!("Failed to spawn session creation: {}", e))??;
-                session_pool.sender().send(session)
-                    .map_err(|_| anyhow::anyhow!("Failed to add session to pool"))?;
-            }
-        }
-
-        // Wrap in Arc for sharing across threads
         let session_pool = Arc::new(session_pool);
 
         let service = Self {
             session_pool,
             target_size: config.target_size(),
             device_type: device_type.clone(),
+            max_sessions,
+            config: Arc::clone(&config),
         };
 
-        // Warmup inference to trigger JIT compilation and memory allocation
-        // This moves the slow first-run overhead from request time to startup time
+        // Warmup inference to trigger JIT compilation
         info!("Running warmup inference for segmentation...");
         let warmup_start = std::time::Instant::now();
         service.warmup().await?;
         info!("✓ Segmentation warmup completed in {:.2}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
 
-        info!("✓ Segmentation: {} ({} sessions, ~{} MB)", device_type, pool_size, pool_size * 40);
+        info!("✓ Segmentation: {} (1/{} sessions allocated, ~40 MB used, {} MB max)",
+              device_type, max_sessions, max_sessions * 40);
 
         Ok(service)
     }
@@ -176,6 +164,37 @@ impl SegmentationService {
         Ok((backend, session))
     }
 
+    /// Expand session pool if under capacity (lazy allocation)
+    fn expand_if_needed(&self) {
+        let available = self.session_pool.available();
+        let in_use = self.session_pool.in_use();
+        let total = available + in_use;
+
+        // If all sessions busy and under capacity, create a new one
+        if available == 0 && total < self.max_sessions {
+            debug!("🔄 [LAZY EXPANSION] Segmentation pool under pressure: {}/{} sessions, creating new session",
+                   total, self.max_sessions);
+
+            // Create new session
+            if let Ok((_, new_session)) = Self::initialize_with_acceleration(&self.config) {
+                self.session_pool.add_session(new_session);
+                info!("✓ Expanded segmentation pool: {}/{} sessions ({} MB used)",
+                      total + 1, self.max_sessions, (total + 1) * 40);
+            } else {
+                debug!("⚠️  Failed to create additional segmentation session");
+            }
+        }
+    }
+
+    /// Drain all sessions and free memory (call after phase 1 complete)
+    pub fn cleanup_sessions(&self) {
+        let sessions = self.session_pool.drain_all();
+        let count = sessions.len();
+        drop(sessions); // Explicit drop to ensure memory is freed
+        info!("🧹 [CLEANUP] Dropped {} segmentation sessions (~{} MB freed)",
+              count, count * 40);
+    }
+
     /// Generate segmentation mask for an image
     ///
     /// # Arguments
@@ -211,9 +230,12 @@ impl SegmentationService {
         // Run inference
         let images_value = ort::value::Value::from_array(input_tensor)?;
 
+        // Lazy expand pool if needed
+        self.expand_if_needed();
+
         // Acquire session from pool, run inference, and extract data
         let (det_output, proto_masks) = {
-            let mut session = self.session_pool.acquire();  // No await - crossbeam is sync!
+            let mut session = self.session_pool.acquire();
             let outputs = session
                 .run(ort::inputs!["images" => images_value])?;
 

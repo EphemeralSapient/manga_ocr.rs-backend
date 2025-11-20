@@ -35,6 +35,12 @@ impl Phase1Pipeline {
         }
     }
 
+    /// Cleanup ONNX sessions after Phase 1 completes to free memory
+    pub fn cleanup_sessions(&self) {
+        self.detector.cleanup_sessions();
+        self.segmenter.cleanup_sessions();
+    }
+
     /// Execute Phase 1 on a single image
     ///
     /// # Steps:

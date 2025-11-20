@@ -41,18 +41,27 @@ async fn main() -> Result<()> {
     // Initialize logging
     use tracing_subscriber::EnvFilter;
 
+    let level_str = match config.log_level() {
+        tracing::Level::TRACE => "trace",
+        tracing::Level::DEBUG => "debug",
+        tracing::Level::INFO => "info",
+        tracing::Level::WARN => "warn",
+        tracing::Level::ERROR => "error",
+    };
+
+    // Set global default to configured level, then override noisy dependencies
     let filter = EnvFilter::new(format!(
-        "manga_workflow={},ort=off",
-        match config.log_level() {
-            tracing::Level::TRACE => "trace",
-            tracing::Level::DEBUG => "debug",
-            tracing::Level::INFO => "info",
-            tracing::Level::WARN => "warn",
-            tracing::Level::ERROR => "error",
-        }
+        "{},ort=warn,h2=warn,tower_http=warn,hyper=warn,tokio=info,runtime=warn,xnnpack=warn",
+        level_str
     ));
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)  // Show module paths
+        .with_thread_ids(false)  // Cleaner output
+        .init();
+
+    info!("Logging initialized at level: {}", level_str.to_uppercase());
 
     info!("=== MANGA TEXT PROCESSOR - OPTIMIZED ===");
     info!("Config: N={} M={} Batches={} Banana={}",

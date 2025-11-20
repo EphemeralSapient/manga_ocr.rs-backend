@@ -50,6 +50,9 @@ use ort::execution_providers::DirectMLExecutionProvider;
 #[cfg(feature = "openvino")]
 use ort::execution_providers::OpenVINOExecutionProvider;
 
+#[cfg(feature = "xnnpack")]
+use ort::execution_providers::XNNPACKExecutionProvider;
+
 /// Generic session pool for ONNX Runtime sessions
 /// OPTIMIZATION: Eliminates duplication between SessionPool and SegmentationSessionPool
 /// Uses crossbeam bounded channel instead of tokio Mutex (15-25% faster under load)
@@ -188,7 +191,8 @@ impl DynamicSessionPool {
 /// 3. CoreML (Apple Silicon M1/M2/M3)
 /// 4. DirectML (Windows GPU acceleration)
 /// 5. OpenVINO (Intel CPU optimizations)
-/// 6. CPU (fallback)
+/// 6. XNNPACK (ARM CPU optimizations - mobile, Raspberry Pi)
+/// 7. CPU (fallback)
 ///
 /// # Arguments
 /// * `model_bytes` - ONNX model file bytes
@@ -300,6 +304,23 @@ pub fn build_session_with_acceleration(
         }
     }
 
+    // Try XNNPACK (ARM CPU optimization, if feature enabled)
+    #[cfg(feature = "xnnpack")]
+    {
+        if let Ok(session) = Session::builder()
+            .and_then(|b| b.with_execution_providers([
+                XNNPACKExecutionProvider::default().build()
+            ]))
+            .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
+            .and_then(|b| b.with_intra_threads(optimal_intra_op_threads()))
+            .and_then(|b| b.with_inter_threads(1))
+            .and_then(|b| b.commit_from_memory(model_bytes))
+        {
+            info!("✓ Using XNNPACK acceleration for {} (ARM CPU optimizations)", model_name);
+            return Ok(("XNNPACK".to_string(), session));
+        }
+    }
+
     // Final fallback: Pure CPU (no acceleration)
     let session = Session::builder()
         .context(format!("Failed to create ONNX session builder for {}", model_name))?
@@ -369,6 +390,46 @@ fn try_forced_backend(
                 .context("Failed to load model with TensorRT")?;
             info!("✓ Forced TensorRT backend for {}", model_name);
             Ok(("TensorRT".to_string(), session))
+        }
+
+        #[cfg(feature = "openvino")]
+        "openvino" => {
+            let session = Session::builder()
+                .context("Failed to create session builder")?
+                .with_execution_providers([
+                    OpenVINOExecutionProvider::default()
+                        .with_device_type("CPU")
+                        .build()
+                ])
+                .context("Failed to configure OpenVINO provider")?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .context("Failed to set optimization level")?
+                .with_intra_threads(optimal_intra_op_threads())
+                .context("Failed to configure intra-op threads")?
+                .with_inter_threads(1)
+                .context("Failed to configure inter-op threads")?
+                .commit_from_memory(model_bytes)
+                .context("Failed to load model with OpenVINO")?;
+            info!("✓ Forced OpenVINO backend for {}", model_name);
+            Ok(("OpenVINO-CPU".to_string(), session))
+        }
+
+        #[cfg(feature = "xnnpack")]
+        "xnnpack" => {
+            let session = Session::builder()
+                .context("Failed to create session builder")?
+                .with_execution_providers([XNNPACKExecutionProvider::default().build()])
+                .context("Failed to configure XNNPACK provider")?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .context("Failed to set optimization level")?
+                .with_intra_threads(optimal_intra_op_threads())
+                .context("Failed to configure intra-op threads")?
+                .with_inter_threads(1)
+                .context("Failed to configure inter-op threads")?
+                .commit_from_memory(model_bytes)
+                .context("Failed to load model with XNNPACK")?;
+            info!("✓ Forced XNNPACK backend for {}", model_name);
+            Ok(("XNNPACK".to_string(), session))
         }
 
         "cpu" => {

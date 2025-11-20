@@ -193,6 +193,13 @@ impl BatchOrchestrator {
             phase1_metrics.phase1_time.as_secs_f64() * 1000.0
         );
 
+        // CLEANUP: Free ONNX sessions after Phase 1 to minimize memory footprint
+        // Detection and segmentation are only needed in Phase 1
+        // Phases 2-4 use API calls and image processing (no ONNX)
+        info!("🧹 [MEMORY OPTIMIZATION] Cleaning up ONNX sessions after Phase 1");
+        self.phase1.cleanup_sessions();
+        info!("✓ ONNX memory freed, proceeding with translation & rendering");
+
         // ===== PHASE 2: GLOBAL (ALL PAGES, SPLIT ACROSS KEYS) =====
         info!("Starting Phase 2 GLOBAL for all {} pages", all_phase1_data.len());
         let phase2_start = Instant::now();

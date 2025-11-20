@@ -78,6 +78,13 @@ pub struct ProcessingConfig {
     /// If not provided, defaults to false
     #[serde(rename = "mergeImg")]
     pub merge_img: Option<bool>,
+
+    /// Maximum number of ONNX sessions per model (controls inference parallelism)
+    /// Sessions are allocated dynamically on demand up to this limit
+    /// If not provided, uses config default (max(cores/2, 8))
+    /// Range: 1-32, each session uses ~82MB (42MB detection + 40MB segmentation)
+    #[serde(rename = "sessionLimit")]
+    pub session_limit: Option<usize>,
 }
 
 /// Detection label for region classification

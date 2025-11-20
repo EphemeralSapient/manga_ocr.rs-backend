@@ -1,6 +1,5 @@
 use crate::core::config::Config;
 use crate::core::types::BubbleDetection;
-use crate::services::onnx_builder::OnnxSessionPool;
 use anyhow::{Result, Context};
 use image::DynamicImage;
 use ndarray::{Array2, Array4};
@@ -15,6 +14,8 @@ use ort::execution_providers::DirectMLExecutionProvider;
 use ort::execution_providers::CoreMLExecutionProvider;
 #[cfg(feature = "openvino")]
 use ort::execution_providers::OpenVINOExecutionProvider;
+#[cfg(feature = "xnnpack")]
+use ort::execution_providers::XNNPACKExecutionProvider;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Value;
 use std::sync::Arc;
@@ -39,68 +40,54 @@ fn load_model_bytes(config: &Config) -> Result<Vec<u8>> {
     }
 }
 
+use crate::services::onnx_builder::DynamicSessionPool;
+
 pub struct DetectionService {
-    session_pool: Arc<OnnxSessionPool>,
+    session_pool: Arc<DynamicSessionPool>,
     config: Arc<Config>,
     device_type: String,
+    max_sessions: usize,
 }
 
 impl DetectionService {
     pub async fn new(config: Arc<Config>) -> Result<Self> {
-        // Configurable pool size for inference parallelism
-        // Default 4 sessions = ~168 MB, provides 4x throughput vs single session
-        let pool_size = config.onnx_pool_size();
-        debug!("Creating detection session pool with {} session(s)", pool_size);
+        Self::new_with_limit(config, None).await
+    }
+
+    /// Create detection service with optional session limit override
+    pub async fn new_with_limit(config: Arc<Config>, session_limit: Option<usize>) -> Result<Self> {
+        // Use provided limit or fall back to config default
+        let max_sessions = session_limit.unwrap_or_else(|| config.onnx_pool_size());
+
+        info!("🚀 [DYNAMIC ALLOCATION] Creating detection service with max {} sessions", max_sessions);
+        info!("   Starting with 1 session for warmup, will expand on demand");
 
         // Create first session to determine device type
         let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
 
-        // Create generic ONNX session pool (lock-free, high performance)
-        let session_pool = OnnxSessionPool::new(pool_size);
+        // Create dynamic session pool with capacity for max_sessions
+        let session_pool = DynamicSessionPool::new(max_sessions);
 
-        // Send first session to pool (synchronous - no await needed)
-        session_pool.sender().send(first_session)
-            .map_err(|_| anyhow::anyhow!("Failed to initialize session pool"))?;
+        // Add ONLY the first session
+        session_pool.add_session(first_session);
 
-        // Create remaining sessions IN PARALLEL for faster startup
-        if pool_size > 1 {
-            let mut tasks = Vec::new();
-
-            for i in 1..pool_size {
-                let config_clone = Arc::clone(&config);
-                let task = tokio::task::spawn_blocking(move || {
-                    debug!("Creating session {} of {}", i + 1, pool_size);
-                    Self::initialize_with_acceleration(&config_clone)
-                });
-                tasks.push(task);
-            }
-
-            // Wait for all sessions to be created
-            for task in tasks {
-                let (_, session) = task.await
-                    .map_err(|e| anyhow::anyhow!("Failed to spawn session creation: {}", e))??;
-                session_pool.sender().send(session)
-                    .map_err(|_| anyhow::anyhow!("Failed to add session to pool"))?;
-            }
-        }
-
-        // Wrap in Arc for sharing across threads
         let session_pool = Arc::new(session_pool);
 
         let service = Self {
             session_pool,
             config,
             device_type: device_type.clone(),
+            max_sessions,
         };
 
-        // Warmup inference to trigger JIT compilation and memory allocation
-        // This moves the slow first-run overhead from request time to startup time
+        // Warmup inference to trigger JIT compilation
         info!("Running warmup inference for detection...");
         let warmup_start = std::time::Instant::now();
         service.warmup().await?;
         info!("✓ Detection warmup completed in {:.2}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
 
-        info!("✓ Detection: {} ({} sessions, ~{} MB)", device_type, pool_size, pool_size * 42);
+        info!("✓ Detection: {} (1/{} sessions allocated, ~42 MB used, {} MB max)",
+              device_type, max_sessions, max_sessions * 42);
 
         Ok(service)
     }
@@ -224,6 +211,22 @@ impl DetectionService {
                 anyhow::bail!("CoreML backend not available. Rebuild with: cargo build --features coreml (macOS only)")
             }
 
+            #[cfg(feature = "xnnpack")]
+            "XNNPACK" => {
+                info!("Forcing XNNPACK backend...");
+                let session = Session::builder()?
+                    .with_execution_providers([XNNPACKExecutionProvider::default().build()])?
+                    .with_optimization_level(GraphOptimizationLevel::Level3)?
+                    .with_intra_threads(num_cpus::get())?
+                    .commit_from_memory(model_bytes)?;
+                info!("✓ Successfully initialized XNNPACK backend");
+                Ok(("XNNPACK (forced)".to_string(), session))
+            }
+            #[cfg(not(feature = "xnnpack"))]
+            "XNNPACK" => {
+                anyhow::bail!("XNNPACK backend not available. Rebuild with: cargo build --features xnnpack")
+            }
+
             "CPU" => {
                 info!("Forcing CPU backend...");
                 let session = Session::builder()?
@@ -237,7 +240,7 @@ impl DetectionService {
             _ => {
                 anyhow::bail!(
                     "Unknown inference backend '{}'. \
-                    Valid options: TENSORRT, CUDA, OPENVINO, DIRECTML, COREML, CPU, AUTO",
+                    Valid options: TENSORRT, CUDA, OPENVINO, DIRECTML, COREML, XNNPACK, CPU, AUTO",
                     backend
                 )
             }
@@ -399,6 +402,37 @@ impl DetectionService {
         &self.device_type
     }
 
+    /// Expand session pool if under capacity (lazy allocation)
+    fn expand_if_needed(&self) {
+        let available = self.session_pool.available();
+        let in_use = self.session_pool.in_use();
+        let total = available + in_use;
+
+        // If all sessions busy and under capacity, create a new one
+        if available == 0 && total < self.max_sessions {
+            debug!("🔄 [LAZY EXPANSION] Detection pool under pressure: {}/{} sessions, creating new session",
+                   total, self.max_sessions);
+
+            // Create new session in blocking task (we're already in async context)
+            if let Ok((_, new_session)) = Self::initialize_with_acceleration(&self.config) {
+                self.session_pool.add_session(new_session);
+                info!("✓ Expanded detection pool: {}/{} sessions ({}  MB used)",
+                      total + 1, self.max_sessions, (total + 1) * 42);
+            } else {
+                debug!("⚠️  Failed to create additional detection session");
+            }
+        }
+    }
+
+    /// Drain all sessions and free memory (call after phase 1 complete)
+    pub fn cleanup_sessions(&self) {
+        let sessions = self.session_pool.drain_all();
+        let count = sessions.len();
+        drop(sessions); // Explicit drop to ensure memory is freed
+        info!("🧹 [CLEANUP] Dropped {} detection sessions (~{} MB freed)",
+              count, count * 42);
+    }
+
     fn preprocess_image(&self, img: &DynamicImage) -> (Array4<f32>, Array2<i64>) {
         let target_size = self.config.target_size();
         trace!("Preprocessing image: {}x{} → {}x{}",
@@ -517,10 +551,13 @@ impl DetectionService {
         debug!("Running ONNX inference on {}...", self.device_type);
         let inference_start = std::time::Instant::now();
 
+        // Lazy expand pool if needed before acquiring
+        self.expand_if_needed();
+
         // Acquire session from pool and run inference
         // OPTIMIZED: Process tensors in-place and only clone filtered results
         let (label_0_detections, label_1_detections, label_2_detections, inference_time) = {
-            let mut session = self.session_pool.acquire();  // No await - crossbeam is sync!
+            let mut session = self.session_pool.acquire();
             let outputs = session.run(ort::inputs![
                 "images" => images_value,
                 "orig_target_sizes" => sizes_value
@@ -655,6 +692,9 @@ impl DetectionService {
         debug!("Running batched ONNX inference on {}...", self.device_type);
         let inference_start = std::time::Instant::now();
 
+        // Lazy expand pool if needed
+        self.expand_if_needed();
+
         // Run batched inference
         let results = {
             let mut session = self.session_pool.acquire();
@@ -770,10 +810,13 @@ impl DetectionService {
         debug!("Running ONNX inference on {}...", self.device_type);
         let inference_start = std::time::Instant::now();
 
+        // Lazy expand pool if needed
+        self.expand_if_needed();
+
         // Acquire session from pool and run inference
         // OPTIMIZED: Process tensors in-place and only clone filtered results
         let (text_detections, inference_time) = {
-            let mut session = self.session_pool.acquire();  // No await - crossbeam is sync!
+            let mut session = self.session_pool.acquire();
             let outputs = session.run(ort::inputs![
                 "images" => images_value,
                 "orig_target_sizes" => sizes_value

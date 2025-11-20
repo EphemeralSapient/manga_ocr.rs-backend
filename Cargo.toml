@@ -68,14 +68,16 @@ default-features = true
 [features]
 default = []
 
-# GPU acceleration features
+# GPU/Hardware acceleration features
 cuda = ["ort/cuda"]
 tensorrt = ["ort/tensorrt"]
 directml = ["ort/directml"]
 coreml = ["ort/coreml"]
 openvino = ["ort/openvino"]
+xnnpack = ["ort/xnnpack"]  # Optimized for ARM CPUs (mobile, Raspberry Pi, M1/M2/M3)
 
-# Note: CUDA/TensorRT may not be available on all platforms
-# - Windows GNU: CUDA binaries not available, use DirectML instead
-# - macOS: Use CoreML for Apple Silicon
-# - Linux: CUDA/TensorRT/OpenVINO available
+# Note: Feature availability by platform:
+# - Windows: DirectML (GPU), XNNPACK (ARM)
+# - macOS: CoreML (Apple Neural Engine), XNNPACK (ARM)
+# - Linux: CUDA/TensorRT/OpenVINO (NVIDIA/Intel), XNNPACK (ARM)
+# - Android/iOS: XNNPACK (primary choice for mobile)
