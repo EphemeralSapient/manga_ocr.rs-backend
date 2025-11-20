@@ -30,6 +30,7 @@ pub struct BatchOrchestrator {
     phase3: Arc<Phase3Pipeline>,
     phase4: Arc<Phase4Pipeline>,
     batch_semaphore: Arc<Semaphore>,
+    backend_type: String,
 }
 
 impl BatchOrchestrator {
@@ -46,6 +47,9 @@ impl BatchOrchestrator {
 
         // Log cache stats
         let (_cache_entries, _cache_size_mb) = cache.stats().await;
+
+        // Store backend type for health endpoint
+        let backend_type = detector.device_type().to_string();
 
         // Initialize phase pipelines
         let phase1 = Arc::new(Phase1Pipeline::new(
@@ -71,7 +75,13 @@ impl BatchOrchestrator {
             phase3,
             phase4,
             batch_semaphore,
+            backend_type,
         })
+    }
+
+    /// Get the backend type (e.g., "DirectML+CPU", "CUDA", "TensorRT", "CPU")
+    pub fn backend_type(&self) -> &str {
+        &self.backend_type
     }
 
     /// Process multiple batches of images
@@ -352,6 +362,7 @@ impl BatchOrchestrator {
             let task = tokio::spawn(async move {
                 let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
                 let use_mask = config.use_mask.unwrap_or(true);
+                let tighter_bounds = config.tighter_bounds.unwrap_or(true);
 
                 let banana_region_ids: Vec<usize> = phase2_output
                     .complex_bg_bananas
@@ -360,7 +371,7 @@ impl BatchOrchestrator {
                     .collect();
 
                 let phase3_output = phase3
-                    .execute(&image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask)
+                    .execute(&image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask, tighter_bounds)
                     .await?;
 
                 Ok::<_, anyhow::Error>((image_data, phase1_output, phase2_output, phase3_output))
@@ -717,6 +728,7 @@ async fn process_single_batch(
         tokio::spawn(async move {
             let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
             let use_mask = config.use_mask.unwrap_or(true);
+            let tighter_bounds = config.tighter_bounds.unwrap_or(true);
 
             let banana_region_ids: Vec<usize> = phase2_output
                 .complex_bg_bananas
@@ -725,7 +737,7 @@ async fn process_single_batch(
                 .collect();
 
             let phase3_output = phase3
-                .execute(&image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask)
+                .execute(&image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask, tighter_bounds)
                 .await?;
 
             Ok::<_, anyhow::Error>((image_data, phase1_output, phase2_output, phase3_output))
@@ -835,6 +847,7 @@ async fn process_single_page(
     let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
     let cache_enabled = config.cache_enabled.unwrap_or(true);
     let use_mask = config.use_mask.unwrap_or(true);
+    let tighter_bounds = config.tighter_bounds.unwrap_or(true);
 
     // OPTIMIZATION: Load image once for all phases to avoid redundant decoding
     // Image decoding is expensive (5-50ms), and we were doing it 4 times per image.
@@ -902,7 +915,7 @@ async fn process_single_page(
     // Phase 3: Text Removal
     let p3_start = Instant::now();
     let phase3_output = phase3
-        .execute(&optimized_image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask)
+        .execute(&optimized_image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask, tighter_bounds)
         .await
         .context("Phase 3 failed")?;
     metrics.phase3_time = p3_start.elapsed();

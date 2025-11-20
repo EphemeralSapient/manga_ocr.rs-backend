@@ -32,7 +32,7 @@ impl Phase3Pipeline {
     /// # Steps (based on minimal_code.py lines 74-85):
     /// 1. For each region (skip banana-processed complex bg):
     ///    a. Extract label 1,2 areas
-    ///    b. Create label 1,2 mask (eroded)
+    ///    b. Create label 1,2 mask (eroded if tighter_bounds enabled)
     ///    c. Intersect with segmentation mask
     ///    d. Replace masked pixels with white (255)
     ///
@@ -42,6 +42,7 @@ impl Phase3Pipeline {
     /// * `banana_processed_region_ids` - IDs of regions processed with banana (skip these)
     /// * `blur_free_text` - Whether to blur free text regions (label 2) instead of white fill
     /// * `use_mask` - Whether to use segmentation mask (false = fill entire label 1 with white)
+    /// * `tighter_bounds` - Whether to erode label 1 mask for tighter fit (default true)
     ///
     /// # Returns:
     /// Phase3Output with cleaned region images
@@ -56,6 +57,7 @@ impl Phase3Pipeline {
         banana_processed_region_ids: &[usize],
         blur_free_text: bool,
         use_mask: bool,
+        tighter_bounds: bool,
     ) -> Result<Phase3Output> {
         // Use pre-decoded image if available, otherwise load from bytes
         // OPTIMIZATION: Pre-decoded image eliminates redundant decoding across phases
@@ -89,7 +91,7 @@ impl Phase3Pipeline {
             }
 
             let cleaned_bytes = self
-                .clean_region(&img, region, &seg_mask, blur_free_text, use_mask)
+                .clean_region(&img, region, &seg_mask, blur_free_text, use_mask, tighter_bounds)
                 .context("Failed to clean region")?;
 
             cleaned_regions.push((region.region_id, cleaned_bytes));
@@ -105,7 +107,7 @@ impl Phase3Pipeline {
     ///
     /// # Implementation (minimal_code.py lines 46-85):
     /// 1. Create label 1 mask for the region
-    /// 2. Erode mask for tighter fit (7x7 kernel, 4 iterations)
+    /// 2. Optionally erode mask for tighter fit (7x7 kernel, 4 iterations) if tighter_bounds enabled
     /// 3. Intersect with segmentation mask
     /// 4. Replace masked pixels with white
     ///
@@ -119,6 +121,7 @@ impl Phase3Pipeline {
         seg_mask: &ImageBuffer<Luma<u8>, Vec<u8>>,
         blur_free_text: bool,
         use_mask: bool,
+        tighter_bounds: bool,
     ) -> Result<Vec<u8>> {
         let [x1, y1, x2, y2] = region.bbox;
         let width = (x2 - x1).max(1) as u32;
@@ -182,8 +185,13 @@ impl Phase3Pipeline {
             }
         }
 
-        // Erode label 1 mask (minimal_code.py lines 47-48)
-        let eroded_label_1_mask = self.opencv_erode(&label_1_mask, EROSION_KERNEL_SIZE, EROSION_ITERATIONS)?;
+        // Optionally erode label 1 mask for tighter fit (minimal_code.py lines 47-48)
+        // When tighter_bounds is disabled, use the original mask without erosion
+        let eroded_label_1_mask = if tighter_bounds {
+            self.opencv_erode(&label_1_mask, EROSION_KERNEL_SIZE, EROSION_ITERATIONS)?
+        } else {
+            label_1_mask.clone()
+        };
 
         // Crop segmentation mask to region (optimized with pre-calculated bounds)
         let src_x1 = x1 as u32;

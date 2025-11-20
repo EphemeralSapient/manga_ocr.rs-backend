@@ -140,7 +140,7 @@ impl ApiClient {
         );
         contents.push(serde_json::json!({"text": prompt}));
 
-        let request_body = serde_json::json!({
+        let mut request_body = serde_json::json!({
             "contents": [{
                 "parts": contents
             }],
@@ -165,6 +165,20 @@ impl ApiClient {
                 }
             }
         });
+
+        // Disable thinking by default for faster responses and lower token usage
+        // Can be enabled via GEMINI_ENABLE_THINKING=true environment variable
+        let enable_thinking = std::env::var("GEMINI_ENABLE_THINKING")
+            .ok()
+            .and_then(|s| s.parse::<bool>().ok())
+            .unwrap_or(false);
+
+        if !enable_thinking {
+            // For Gemini 2.5+, disable thinking by setting thinking_budget to 0
+            request_body["generationConfig"]["thinkingConfig"] = serde_json::json!({
+                "thinking_budget": 0
+            });
+        }
 
         // Send request with retries
         let result = self

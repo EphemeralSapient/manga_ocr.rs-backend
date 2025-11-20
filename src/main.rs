@@ -31,6 +31,8 @@ struct AppState {
     session_limit: Arc<AtomicUsize>,
     /// Global batch inference mode (true = merge images into single tensor)
     merge_img_enabled: Arc<AtomicBool>,
+    /// Global Gemini thinking mode (true = enable thinking, false = disable)
+    gemini_thinking_enabled: Arc<AtomicBool>,
 }
 
 #[tokio::main]
@@ -85,6 +87,7 @@ async fn main() -> Result<()> {
         mask_enabled: Arc::new(AtomicBool::new(true)), // Default: mask enabled
         session_limit: Arc::new(AtomicUsize::new(initial_session_limit)),
         merge_img_enabled: Arc::new(AtomicBool::new(false)), // Default: batch mode disabled
+        gemini_thinking_enabled: Arc::new(AtomicBool::new(false)), // Default: thinking disabled
     };
 
     // Setup CORS
@@ -107,6 +110,8 @@ async fn main() -> Result<()> {
         .route("/sessions-status", get(sessions_status))
         .route("/mergeimg-toggle", post(mergeimg_toggle))
         .route("/mergeimg-status", get(mergeimg_status))
+        .route("/thinking-toggle", post(thinking_toggle))
+        .route("/thinking-status", get(thinking_status))
         .with_state(state)
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024)) // 200MB for large batches
         .layer(cors);
@@ -144,13 +149,17 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mask_enabled = state.mask_enabled.load(Ordering::SeqCst);
     let merge_img_enabled = state.merge_img_enabled.load(Ordering::SeqCst);
     let session_limit = state.session_limit.load(Ordering::SeqCst);
+    let gemini_thinking_enabled = state.gemini_thinking_enabled.load(Ordering::SeqCst);
+    let backend_type = state.orchestrator.backend_type();
 
     Json(serde_json::json!({
         "status": "healthy",
         "version": env!("CARGO_PKG_VERSION"),
+        "backend": backend_type,
         "config": {
             "mask_enabled": mask_enabled,
             "merge_img_enabled": merge_img_enabled,
+            "gemini_thinking_enabled": gemini_thinking_enabled,
             "session_limit": session_limit,
             "onnx_pool_size": state.config.onnx_pool_size(),
             "batch_size_n": state.config.batch_size_n(),
@@ -343,6 +352,40 @@ async fn mergeimg_status(State(state): State<AppState>) -> Json<serde_json::Valu
             "Images are batched into single ONNX inference for better GPU utilization"
         } else {
             "Each image is processed with separate ONNX inference"
+        }
+    }))
+}
+
+/// Toggle Gemini thinking mode
+async fn thinking_toggle(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let current = state.gemini_thinking_enabled.load(Ordering::SeqCst);
+    let new_value = !current;
+    state.gemini_thinking_enabled.store(new_value, Ordering::SeqCst);
+
+    info!("Gemini thinking mode toggled: {} -> {}",
+        if current { "enabled" } else { "disabled" },
+        if new_value { "enabled" } else { "disabled" }
+    );
+
+    Json(serde_json::json!({
+        "gemini_thinking_enabled": new_value,
+        "message": if new_value {
+            "Gemini thinking enabled - better quality but slower and uses more tokens"
+        } else {
+            "Gemini thinking disabled - faster responses with lower token usage"
+        }
+    }))
+}
+
+/// Get current Gemini thinking mode status
+async fn thinking_status(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let enabled = state.gemini_thinking_enabled.load(Ordering::SeqCst);
+    Json(serde_json::json!({
+        "gemini_thinking_enabled": enabled,
+        "description": if enabled {
+            "Gemini uses deep thinking for better translation quality (slower, more tokens)"
+        } else {
+            "Gemini uses fast mode for quicker translations (default)"
         }
     }))
 }

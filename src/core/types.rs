@@ -85,6 +85,12 @@ pub struct ProcessingConfig {
     /// Range: 1-32, each session uses ~82MB (42MB detection + 40MB segmentation)
     #[serde(rename = "sessionLimit")]
     pub session_limit: Option<usize>,
+
+    /// Apply tighter bounds (erosion) to label 1 mask for more precise text removal
+    /// When enabled, erodes the mask by 7x7 kernel for 4 iterations
+    /// If not provided, defaults to true (enabled)
+    #[serde(rename = "tighterBounds")]
+    pub tighter_bounds: Option<bool>,
 }
 
 /// Detection label for region classification

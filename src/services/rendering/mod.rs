@@ -389,7 +389,6 @@ impl CosmicTextRenderer {
             }
         }
 
-        debug!("Optimal font size: {:.1}px (fits in {:.0}x{:.0}px)", best_size, max_width, max_height);
         Ok(best_size)
     }
 }
