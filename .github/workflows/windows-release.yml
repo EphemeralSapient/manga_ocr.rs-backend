@@ -82,11 +82,67 @@ jobs:
       - name: Build release binary (${{ matrix.variant.name }})
         run: cargo build --release --locked --target x86_64-pc-windows-msvc ${{ matrix.variant.features }}
 
+      - name: Package binary with dependencies (${{ matrix.variant.name }})
+        shell: powershell
+        run: |
+          $packageDir = "manga_workflow-${{ matrix.variant.suffix }}"
+          $releaseDir = "target\x86_64-pc-windows-msvc\release"
+
+          # Create package directory
+          New-Item -ItemType Directory -Force -Path $packageDir
+
+          # Copy main executable
+          Copy-Item "$releaseDir\manga_workflow.exe" -Destination "$packageDir\"
+
+          # Copy OpenCV DLL (required for all builds)
+          Copy-Item "C:\opencv\build\x64\vc16\bin\opencv_world4120.dll" -Destination "$packageDir\" -ErrorAction SilentlyContinue
+
+          # Copy ONNX Runtime DLLs (should be in release directory after build)
+          Copy-Item "$releaseDir\onnxruntime.dll" -Destination "$packageDir\" -ErrorAction SilentlyContinue
+          Copy-Item "$releaseDir\onnxruntime_providers_shared.dll" -Destination "$packageDir\" -ErrorAction SilentlyContinue
+
+          # Copy variant-specific DLLs
+          if ("${{ matrix.variant.suffix }}" -eq "directml") {
+            Copy-Item "libs\windows\x64\DirectML.dll" -Destination "$packageDir\" -ErrorAction SilentlyContinue
+          }
+          if ("${{ matrix.variant.suffix }}" -eq "cuda") {
+            Copy-Item "$releaseDir\onnxruntime_providers_cuda.dll" -Destination "$packageDir\" -ErrorAction SilentlyContinue
+          }
+
+          # Create README with instructions
+          @"
+          # Manga Workflow - Windows ${{ matrix.variant.suffix }} Build
+
+          ## Contents
+          - manga_workflow.exe: Main executable
+          - *.dll: Required runtime libraries
+
+          ## Usage
+          1. Extract all files to a directory
+          2. Create .env.local with your GEMINI_API_KEYS
+          3. Run: manga_workflow.exe
+
+          ## Acceleration
+          ${{ matrix.variant.suffix }} build includes optimizations for:
+          $(if ("${{ matrix.variant.suffix }}" -eq "cuda") { "- NVIDIA GPU (CUDA)" })
+          $(if ("${{ matrix.variant.suffix }}" -eq "directml") { "- DirectML (AMD/Intel/NVIDIA GPU)" })
+          $(if ("${{ matrix.variant.suffix }}" -eq "openvino") { "- Intel CPU optimization" })
+          $(if ("${{ matrix.variant.suffix }}" -eq "standard") { "- CPU-only inference" })
+          "@ | Out-File -FilePath "$packageDir\README.txt" -Encoding utf8
+
+          # List contents for verification
+          Write-Host "Package contents:"
+          Get-ChildItem -Path $packageDir -Recurse | Select-Object Name, Length
+
+          # Create zip archive
+          Compress-Archive -Path "$packageDir\*" -DestinationPath "manga_workflow-windows-x64-${{ matrix.variant.suffix }}.zip" -Force
+          Write-Host "Created: manga_workflow-windows-x64-${{ matrix.variant.suffix }}.zip"
+
       - name: Upload artifact (${{ matrix.variant.name }})
         uses: actions/upload-artifact@v4
         with:
           name: manga_workflow-windows-x86_64-${{ matrix.variant.suffix }}
-          path: target/x86_64-pc-windows-msvc/release/manga_workflow.exe
+          path: manga_workflow-windows-x64-${{ matrix.variant.suffix }}.zip
 
   release:
     name: Create Release

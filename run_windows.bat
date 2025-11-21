@@ -46,9 +46,9 @@ if not exist "%SCRIPT_DIR%\fonts" (
 )
 echo   [OK] fonts\
 
-REM Find the executable
+REM Find the DirectML executable
 set "EXE_PATH="
-for %%F in ("%SCRIPT_DIR%\binary\*.exe") do (
+for %%F in ("%SCRIPT_DIR%\binary\*directml.exe") do (
     set "EXE_PATH=%%F"
     set "EXE_NAME=%%~nxF"
     goto :found_exe
