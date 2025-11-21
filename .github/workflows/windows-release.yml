@@ -2,6 +2,9 @@ name: Windows Binary Release
 
 on:
   push:
+    branches:
+      - main
+      - master
     tags:
       - 'v*.*.*'
   workflow_dispatch:
@@ -82,48 +85,12 @@ jobs:
       - name: Build release binary (${{ matrix.variant.name }})
         run: cargo build --release --locked --target x86_64-pc-windows-msvc ${{ matrix.variant.features }}
 
-      - name: Bundle ONNX Runtime DLLs for CUDA build
-        if: matrix.variant.name == 'cuda'
-        run: |
-          $targetDir = "target\x86_64-pc-windows-msvc\release"
-          $bundleDir = "bundle-cuda"
-          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
-
-          # Copy executable
-          Copy-Item "$targetDir\manga_workflow.exe" "$bundleDir\"
-
-          # Copy ONNX Runtime DLLs (required for CUDA execution provider)
-          $requiredDlls = @(
-            "onnxruntime.dll",
-            "onnxruntime_providers_shared.dll",
-            "onnxruntime_providers_cuda.dll"
-          )
-
-          foreach ($dll in $requiredDlls) {
-            if (Test-Path "$targetDir\$dll") {
-              Copy-Item "$targetDir\$dll" "$bundleDir\"
-              Write-Host "✓ Bundled: $dll"
-            } else {
-              Write-Host "✗ Missing: $dll - checking deps directory..."
-              $depsPath = "$targetDir\deps\$dll"
-              if (Test-Path $depsPath) {
-                Copy-Item $depsPath "$bundleDir\"
-                Write-Host "✓ Bundled from deps: $dll"
-              } else {
-                Write-Warning "Missing required DLL: $dll"
-              }
-            }
-          }
-
-          Write-Host "`nBundle contents:"
-          Get-ChildItem $bundleDir | Format-Table Name, Length
 
       - name: Upload artifact (${{ matrix.variant.name }})
         uses: actions/upload-artifact@v4
         with:
           name: manga_workflow-windows-x86_64-${{ matrix.variant.suffix }}
-          path: |
-            ${{ matrix.variant.name == 'cuda' && 'bundle-cuda/*' || 'target/x86_64-pc-windows-msvc/release/manga_workflow.exe' }}
+          path: target/x86_64-pc-windows-msvc/release/manga_workflow.exe
 
   release:
     name: Create Release
@@ -188,10 +155,8 @@ jobs:
 
             ### CUDA Build
             1. Download `manga_workflow_cuda.zip`
-            2. **Extract the entire zip** - includes required ONNX Runtime DLLs:
+            2. **Extract the entire zip** - includes required ONNX Runtime DLL:
                - `onnxruntime.dll`
-               - `onnxruntime_providers_shared.dll`
-               - `onnxruntime_providers_cuda.dll`
             3. Clone the repository: `git clone <repo-url>`
             4. Install Git LFS: `git lfs install && git lfs pull`
             5. Run `manga_workflow.exe` from the extracted folder
