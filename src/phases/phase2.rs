@@ -315,6 +315,7 @@ impl Phase2Pipeline {
     /// * `cache_enabled` - Whether to use translation cache
     /// * `custom_api_keys` - Optional custom API keys to use instead of config keys
     /// * `target_language` - Optional target language for translation (defaults to "English")
+    /// * `reuse_factor` - Number of parallel requests per API key (default: 4, range: 1-8)
     ///
     /// # Returns
     /// Vector of Phase2Output for each page
@@ -327,6 +328,7 @@ impl Phase2Pipeline {
         cache_enabled: bool,
         custom_api_keys: Option<&[String]>,
         target_language: Option<&str>,
+        reuse_factor: usize,
     ) -> Result<Vec<Phase2Output>> {
         if pages.is_empty() {
             return Ok(Vec::new());
@@ -430,50 +432,82 @@ impl Phase2Pipeline {
             cached_results.len()
         );
 
-        // Process all simple regions SPLIT ACROSS API KEYS for parallelism
+        // Process all simple regions SPLIT ACROSS API KEYS with REUSE_FACTOR for parallelism
         let simple_translations = if !all_simple_regions.is_empty() {
             // Get number of available API keys
             let num_keys = api_client.total_keys().await.max(1);
 
             debug!(
-                "Splitting {} simple regions across {} API keys for parallel processing",
+                "🔑 Phase 2: {} regions, {} keys, reuse_factor={}",
                 all_simple_regions.len(),
-                num_keys
+                num_keys,
+                reuse_factor
             );
 
-            // Split regions into chunks for each API key
+            // Step 1: Split regions into chunks for each API key
             let chunk_size = (all_simple_regions.len() + num_keys - 1) / num_keys; // Round up
-            let chunks: Vec<Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>> = all_simple_regions
+            let key_chunks: Vec<Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>> = all_simple_regions
                 .chunks(chunk_size)
                 .map(|chunk| chunk.to_vec())
                 .collect();
 
+            // Step 2: Further split each key's chunk by reuse_factor
+            let mut all_sub_chunks: Vec<(usize, Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>)> = Vec::new();
+
+            for (key_idx, key_chunk) in key_chunks.into_iter().enumerate() {
+                if key_chunk.is_empty() {
+                    continue;
+                }
+
+                // Calculate sub-chunk size for this key
+                let sub_chunk_size = (key_chunk.len() + reuse_factor - 1) / reuse_factor; // Round up
+                let sub_chunks: Vec<Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>> = key_chunk
+                    .chunks(sub_chunk_size)
+                    .map(|sub| sub.to_vec())
+                    .collect();
+
+                debug!(
+                    "  Key {}: {} regions → {} sub-chunks of ~{} regions each",
+                    key_idx,
+                    key_chunk.len(),
+                    sub_chunks.len(),
+                    sub_chunk_size
+                );
+
+                // Store with key index for pinning
+                for sub_chunk in sub_chunks {
+                    all_sub_chunks.push((key_idx, sub_chunk));
+                }
+            }
+
             debug!(
-                "Created {} chunks (chunk_size={}) for parallel API calls",
-                chunks.len(),
-                chunk_size
+                "✓ Created {} total API calls ({} keys × {} reuse_factor)",
+                all_sub_chunks.len(),
+                num_keys,
+                reuse_factor
             );
 
-            // Process each chunk in parallel
+            // Step 3: Process all sub-chunks in parallel with pinned keys
             let target_language_str = target_language.map(|s| s.to_string());
-            let tasks: Vec<_> = chunks
+            let tasks: Vec<_> = all_sub_chunks
                 .into_iter()
-                .map(|chunk| {
+                .map(|(key_idx, sub_chunk)| {
                     let api_client = Arc::clone(&api_client);
                     let model_override = ocr_model_override.map(|s| s.to_string());
                     let target_language = target_language_str.clone();
 
                     tokio::spawn(async move {
-                        let image_bytes: Vec<Vec<u8>> = chunk
+                        let image_bytes: Vec<Vec<u8>> = sub_chunk
                             .iter()
                             .map(|(_, _, _, _, bytes)| bytes.clone())
                             .collect();
 
+                        // Use pinned key for this sub-chunk
                         let translations = api_client
-                            .ocr_translate_batch(image_bytes, model_override.as_deref(), target_language.as_deref())
+                            .ocr_translate_batch_with_key(image_bytes, model_override.as_deref(), target_language.as_deref(), key_idx)
                             .await?;
 
-                        Ok::<_, anyhow::Error>((chunk, translations))
+                        Ok::<_, anyhow::Error>((sub_chunk, translations))
                     })
                 })
                 .collect();

@@ -242,6 +242,22 @@ impl ApiKeyPool {
         let keys = self.keys.read().await;
         keys.len()
     }
+
+    /// Get a specific API key by index (for reuse_factor parallelism)
+    /// Returns None if index is out of bounds or key is unhealthy
+    pub async fn get_key_by_index(&self, index: usize) -> Option<(usize, String)> {
+        let keys = self.keys.read().await;
+
+        if let Some(key) = keys.get(index) {
+            // Only return healthy or degraded keys
+            if key.health() != KeyHealth::Unhealthy {
+                debug!("Using API key {} (health: {:?})", key.index, key.health());
+                return Some((key.index, key.key.clone()));
+            }
+        }
+
+        None
+    }
 }
 
 #[cfg(test)]

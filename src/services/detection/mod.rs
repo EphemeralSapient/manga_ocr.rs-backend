@@ -176,10 +176,9 @@ impl DetectionService {
             #[cfg(all(target_os = "windows", feature = "directml"))]
             "DIRECTML" => {
                 info!("Forcing DirectML backend...");
-                // DirectML with CPU fallback for unsupported operations
+                // DirectML-only (NO CPU fallback)
                 let session = Session::builder()?
                     .with_execution_providers([
-                        CPUExecutionProvider::default().build(),
                         DirectMLExecutionProvider::default().build()
                     ])?
                     .with_parallel_execution(false)?   // REQUIRED: Sequential execution
@@ -187,8 +186,8 @@ impl DetectionService {
                     .with_optimization_level(GraphOptimizationLevel::Level1)?
                     .with_intra_threads(num_cpus::get())?
                     .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized DirectML backend (with CPU fallback)");
-                Ok(("DirectML+CPU (forced)".to_string(), session))
+                info!("✓ Successfully initialized DirectML backend (GPU-only, no CPU fallback)");
+                Ok(("DirectML (forced)".to_string(), session))
             }
             #[cfg(not(all(target_os = "windows", feature = "directml")))]
             "DIRECTML" => {
@@ -331,10 +330,9 @@ impl DetectionService {
         // Try DirectML (Windows, if feature enabled)
         #[cfg(all(target_os = "windows", feature = "directml"))]
         {
-            // DirectML with CPU fallback for unsupported operations
+            // DirectML-only (NO CPU fallback)
             if let Ok(session) = Session::builder()
                 .and_then(|b| b.with_execution_providers([
-                    CPUExecutionProvider::default().build(),
                     DirectMLExecutionProvider::default().build()
                 ]))
                 .and_then(|b| b.with_parallel_execution(false))  // REQUIRED: Sequential execution
@@ -343,8 +341,8 @@ impl DetectionService {
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
                 .and_then(|b| b.commit_from_memory(&model_bytes))
             {
-                info!("✓ Using DirectML acceleration (with CPU fallback)");
-                return Ok(("DirectML+CPU".to_string(), session));
+                info!("✓ Using DirectML acceleration (GPU-only, no CPU fallback)");
+                return Ok(("DirectML".to_string(), session));
             }
         }
 

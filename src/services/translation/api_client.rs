@@ -108,6 +108,38 @@ impl ApiClient {
         model_override: Option<&str>,
         target_language: Option<&str>,
     ) -> Result<Vec<OCRTranslation>> {
+        self.ocr_translate_batch_internal(image_bytes_batch, model_override, target_language, None).await
+    }
+
+    /// Perform OCR and translation with a specific API key (for reuse_factor parallelism)
+    ///
+    /// # Arguments
+    /// * `image_bytes_batch` - Vector of image bytes to process
+    /// * `model_override` - Optional model name to override the default from config
+    /// * `target_language` - Optional target language for translation (defaults to "English")
+    /// * `key_index` - Specific API key index to use
+    ///
+    /// # Returns
+    /// Vector of OCRTranslation results
+    #[instrument(skip(self, image_bytes_batch), fields(batch_size = image_bytes_batch.len(), key_index = key_index))]
+    pub async fn ocr_translate_batch_with_key(
+        &self,
+        image_bytes_batch: Vec<Vec<u8>>,
+        model_override: Option<&str>,
+        target_language: Option<&str>,
+        key_index: usize,
+    ) -> Result<Vec<OCRTranslation>> {
+        self.ocr_translate_batch_internal(image_bytes_batch, model_override, target_language, Some(key_index)).await
+    }
+
+    /// Internal implementation for OCR/translation batch
+    async fn ocr_translate_batch_internal(
+        &self,
+        image_bytes_batch: Vec<Vec<u8>>,
+        model_override: Option<&str>,
+        target_language: Option<&str>,
+        pinned_key_index: Option<usize>,
+    ) -> Result<Vec<OCRTranslation>> {
         debug!("OCR/Translation batch of {} images", image_bytes_batch.len());
 
         // Check circuit breaker
@@ -118,12 +150,18 @@ impl ApiClient {
 
         let start = Instant::now();
 
-        // Get healthy API key
-        let (key_idx, api_key) = self
-            .api_key_pool
-            .get_healthy_key()
-            .await
-            .context("No healthy API keys available")?;
+        // Get API key (either pinned or healthy round-robin)
+        let (key_idx, api_key) = if let Some(idx) = pinned_key_index {
+            self.api_key_pool
+                .get_key_by_index(idx)
+                .await
+                .context(format!("API key {} is not available", idx))?
+        } else {
+            self.api_key_pool
+                .get_healthy_key()
+                .await
+                .context("No healthy API keys available")?
+        };
 
         // Prepare request
         let model = model_override.unwrap_or_else(|| self.config.ocr_translation_model());

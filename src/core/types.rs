@@ -119,6 +119,15 @@ pub struct ProcessingConfig {
     /// If not provided, defaults to false (disabled)
     #[serde(rename = "filterOrphanRegions")]
     pub filter_orphan_regions: Option<bool>,
+
+    /// API key reuse factor for parallel requests per key
+    /// Splits each key's chunk into N sub-chunks for concurrent API calls
+    /// Example: With 8 keys and reuse_factor=4, makes 32 parallel API calls (4 per key)
+    /// Useful when rate limits allow multiple concurrent requests per key (e.g., 5+ RPM)
+    /// If not provided, defaults to 4
+    /// Valid range: 1-8
+    #[serde(rename = "reuseFactor")]
+    pub reuse_factor: Option<usize>,
 }
 
 /// Detection label for region classification

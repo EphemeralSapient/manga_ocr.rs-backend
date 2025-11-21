@@ -304,9 +304,10 @@ impl BatchOrchestrator {
         let cache_enabled = config.cache_enabled.unwrap_or(true);
         let custom_api_keys = config.api_keys.as_deref();
         let target_language = config.target_language.as_deref();
+        let reuse_factor = config.reuse_factor.unwrap_or(4).clamp(1, 8);
 
         let phase2_outputs = self.phase2
-            .execute_batch(&all_phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys, target_language)
+            .execute_batch(&all_phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys, target_language, reuse_factor)
             .await;
 
         phase1_metrics.phase2_time = phase2_start.elapsed();
@@ -680,9 +681,10 @@ async fn process_single_batch(
     let cache_enabled = config.cache_enabled.unwrap_or(true);
     let custom_api_keys = config.api_keys.as_deref();
     let target_language = config.target_language.as_deref();
+    let reuse_factor = config.reuse_factor.unwrap_or(4).clamp(1, 8);
 
     let phase2_outputs = phase2
-        .execute_batch(&phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys, target_language)
+        .execute_batch(&phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys, target_language, reuse_factor)
         .await;
 
     batch_metrics.phase2_time = phase2_start.elapsed();

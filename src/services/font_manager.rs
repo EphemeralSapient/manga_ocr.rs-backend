@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Font Manager - handles downloading and caching Google Fonts
 pub struct FontManager {

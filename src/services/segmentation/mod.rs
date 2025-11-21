@@ -87,8 +87,14 @@ impl SegmentationService {
         service.warmup().await?;
         info!("✓ Segmentation warmup completed in {:.2}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
 
-        info!("✓ Segmentation: {} (1/{} sessions allocated, ~40 MB used, {} MB max)",
-              device_type, max_sessions, max_sessions * 40);
+        // Log DirectML limitation
+        if service.is_directml() {
+            info!("✓ Segmentation: {} (1/1 sessions, ~40 MB used) [DirectML: pool expansion disabled]",
+                  device_type);
+        } else {
+            info!("✓ Segmentation: {} (1/{} sessions allocated, ~40 MB used, {} MB max)",
+                  device_type, max_sessions, max_sessions * 40);
+        }
 
         Ok(service)
     }
@@ -164,9 +170,21 @@ impl SegmentationService {
         Ok((backend, session))
     }
 
+    /// Check if using DirectML backend
+    pub fn is_directml(&self) -> bool {
+        self.device_type.contains("DirectML")
+    }
+
     /// Expand session pool if under capacity (lazy allocation)
     /// Expands aggressively when high contention detected
+    ///
+    /// IMPORTANT: DirectML processes sequentially, so pool expansion is disabled
     fn expand_if_needed(&self) {
+        // DirectML can only use 1 session at a time (sequential processing)
+        if self.is_directml() {
+            return;
+        }
+
         let available = self.session_pool.available();
         let in_use = self.session_pool.in_use();
         let total = available + in_use;

@@ -52,14 +52,38 @@ pub struct BackgroundConfig {
     pub simple_bg_white_threshold: f32,
 }
 
+/// Text alignment options
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+impl TextAlign {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "left" => TextAlign::Left,
+            "center" => TextAlign::Center,
+            "right" => TextAlign::Right,
+            _ => TextAlign::Center, // Default
+        }
+    }
+}
+
 /// Rendering configuration
 #[derive(Debug, Clone)]
 pub struct RenderingConfig {
     pub upscale_factor: u32,
+    pub adaptive_upscale: bool,
     pub text_stroke_enabled: bool,
     pub text_stroke_width: i32,
     pub blur_free_text: bool,
     pub blur_radius: f32,
+    pub text_alignment: TextAlign,
+    pub cjk_font_size_multiplier: f32,
+    pub font_size_min_ratio: f32,  // Ratio of target_size for min font
+    pub font_size_max_ratio: f32,  // Ratio of target_size for max font
 }
 
 /// Cache configuration
@@ -204,6 +228,10 @@ impl Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(3),
+                adaptive_upscale: env::var("ADAPTIVE_UPSCALE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(true),
                 text_stroke_enabled: env::var("TEXT_STROKE_ENABLED")
                     .ok()
                     .and_then(|s| s.parse().ok())
@@ -220,6 +248,21 @@ impl Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(10.0),
+                text_alignment: TextAlign::from_str(
+                    &env::var("TEXT_ALIGNMENT").unwrap_or_else(|_| "center".to_string())
+                ),
+                cjk_font_size_multiplier: env::var("CJK_FONT_SIZE_MULTIPLIER")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1.15),
+                font_size_min_ratio: env::var("FONT_SIZE_MIN_RATIO")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.028),  // 18px at 640
+                font_size_max_ratio: env::var("FONT_SIZE_MAX_RATIO")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.050),  // 32px at 640
             },
             cache: CacheConfig {
                 cache_dir: env::var("CACHE_DIR").unwrap_or_else(|_| ".cache".to_string()),
@@ -408,6 +451,26 @@ impl Config {
 
     pub fn blur_radius(&self) -> f32 {
         self.rendering.blur_radius
+    }
+
+    pub fn adaptive_upscale(&self) -> bool {
+        self.rendering.adaptive_upscale
+    }
+
+    pub fn text_alignment(&self) -> TextAlign {
+        self.rendering.text_alignment
+    }
+
+    pub fn cjk_font_size_multiplier(&self) -> f32 {
+        self.rendering.cjk_font_size_multiplier
+    }
+
+    pub fn font_size_min_ratio(&self) -> f32 {
+        self.rendering.font_size_min_ratio
+    }
+
+    pub fn font_size_max_ratio(&self) -> f32 {
+        self.rendering.font_size_max_ratio
     }
 }
 

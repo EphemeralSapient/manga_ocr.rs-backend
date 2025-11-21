@@ -19,9 +19,9 @@ pub struct Phase4Pipeline {
     renderer: Arc<CosmicTextRenderer>,
 }
 
-// Font sizing constants for optimal comic readability
-const MIN_FONT_SIZE: f32 = 18.0; // Minimum font size for readability
-const MAX_FONT_SIZE: f32 = 32.0; // Maximum font size to prevent oversized text
+// Font sizing is now RESOLUTION-ADAPTIVE and configured via Config
+// See config.font_size_min_ratio and config.font_size_max_ratio
+// Default: min = target_size * 0.028 (~18px @ 640), max = target_size * 0.050 (~32px @ 640)
 
 impl Phase4Pipeline {
     /// Create new Phase 4 pipeline
@@ -323,26 +323,64 @@ impl Phase4Pipeline {
         let text_width = (max_x - min_x).max(1) as f32;
         let text_height = (max_y - min_y).max(1) as f32;
 
-        // Add padding for comic-style text (10% on each side)
-        let padding = 0.1;
-        let available_width = text_width * (1.0 - padding * 2.0);
-        let available_height = text_height * (1.0 - padding * 2.0);
+        // IMPROVED: Dynamic padding based on stroke width and font characteristics
+        let base_padding = 0.08;  // 8% base padding
+        let stroke_width_f32 = if text_stroke {
+            self.config.text_stroke_width() as f32
+        } else {
+            0.0
+        };
 
-        // Use cosmic-text's built-in optimal font size finder
-        // Optimized for comic readability
+        // Calculate additional padding needed for stroke
+        // Stroke extends on both sides, so we need to account for it in padding
+        let stroke_padding_ratio = (stroke_width_f32 * 2.0) / text_width.min(text_height);
+
+        // Dynamic padding: base + stroke contribution
+        let padding = base_padding + stroke_padding_ratio;
+
+        let available_width = text_width * (1.0 - padding * 2.0).max(0.5);  // Ensure at least 50% available
+        let available_height = text_height * (1.0 - padding * 2.0).max(0.5);
+
+        // RESOLUTION-ADAPTIVE font size limits
+        let target_size = self.config.target_size() as f32;
+        let mut min_font_size = target_size * self.config.font_size_min_ratio();
+        let mut max_font_size = target_size * self.config.font_size_max_ratio();
+
+        // CJK MULTIPLIER: CJK characters need larger sizes for readability
+        if crate::services::rendering::is_cjk_text(text) {
+            let multiplier = self.config.cjk_font_size_multiplier();
+            min_font_size *= multiplier;
+            max_font_size *= multiplier;
+        }
+
+        // Use cosmic-text's built-in optimal font size finder WITH stroke width
         let font_size = self.renderer.find_optimal_font_size(
             text,
             font_family,
             available_width,
             available_height,
-            MIN_FONT_SIZE,
-            MAX_FONT_SIZE,
+            min_font_size,
+            max_font_size,
+            Some(stroke_width_f32),  // NEW: Account for stroke in font sizing
         ).await?;
 
         let text_color = Rgba([0u8, 0u8, 0u8, 255u8]); // Black text
 
-        // Create upscaled canvas for better quality
-        let upscale_factor = self.config.upscale_factor();
+        // ADAPTIVE UPSCALE: Adjust upscale factor based on font size for optimal quality/performance
+        let upscale_factor = if self.config.adaptive_upscale() {
+            // Smaller text needs more upscaling for quality
+            // Larger text doesn't benefit as much from high upscaling
+            if font_size < 16.0 {
+                self.config.upscale_factor().max(4)  // Small text: at least 4x
+            } else if font_size < 24.0 {
+                self.config.upscale_factor().max(3)  // Medium text: at least 3x
+            } else {
+                self.config.upscale_factor().max(2).min(3)  // Large text: 2-3x is enough
+            }
+        } else {
+            self.config.upscale_factor()  // Use fixed upscale factor
+        };
+
         let upscaled_width = canvas_width * upscale_factor;
         let upscaled_height = canvas_height * upscale_factor;
 
@@ -353,12 +391,22 @@ impl Phase4Pipeline {
         );
 
         // Measure actual text dimensions for centering
+        // Note: measure_text now returns visual bounds including glyph overhangs
         let (actual_text_width, actual_text_height) = self.renderer.measure_text(
             text,
             font_family,
             font_size,
             Some(text_width),
         ).await?;
+
+        // Calculate stroke padding if stroke is enabled
+        let stroke_padding = if text_stroke {
+            // Stroke width from config, scaled by upscale factor
+            let stroke_width = self.config.text_stroke_width() as f32;
+            stroke_width * 2.0 // Account for stroke on both sides
+        } else {
+            0.0
+        };
 
         // Detect and log overflow
         if actual_text_width > text_width || actual_text_height > text_height {
@@ -410,13 +458,35 @@ impl Phase4Pipeline {
         };
 
         // Calculate padded region boundaries for strict enforcement
-        // This ensures text stays within the padded area (10% padding on each side)
-        // Note: padding_pixels_x and padding_pixels_y already calculated above for centering
-        let padded_min_x = (min_x + padding_pixels_x) * upscale_factor as i32;
-        let padded_min_y = (min_y + padding_pixels_y) * upscale_factor as i32;
-        let padded_max_x = (max_x - padding_pixels_x) * upscale_factor as i32;
-        let padded_max_y = (max_y - padding_pixels_y) * upscale_factor as i32;
-        let region_bounds = Some((padded_min_x, padded_min_y, padded_max_x, padded_max_y));
+        // This ensures text stays within the padded area
+        // IMPORTANT: Add extra padding for stroke width and glyph overhangs to prevent clipping!
+        let stroke_padding_scaled = (stroke_padding * upscale_factor as f32) as i32;
+        let glyph_overhang_padding = (font_size * 0.15 * upscale_factor as f32) as i32; // 15% of font size for glyph overhangs
+
+        let extra_padding = stroke_padding_scaled + glyph_overhang_padding;
+
+        let padded_min_x = ((min_x + padding_pixels_x) * upscale_factor as i32) - extra_padding;
+        let padded_min_y = ((min_y + padding_pixels_y) * upscale_factor as i32) - extra_padding;
+        let padded_max_x = ((max_x - padding_pixels_x) * upscale_factor as i32) + extra_padding;
+        let padded_max_y = ((max_y - padding_pixels_y) * upscale_factor as i32) + extra_padding;
+
+        // Clamp bounds to canvas to prevent rendering outside the region
+        let padded_min_x = padded_min_x.max(0);
+        let padded_min_y = padded_min_y.max(0);
+        let padded_max_x = padded_max_x.min(upscaled_width as i32);
+        let padded_max_y = padded_max_y.min(upscaled_height as i32);
+
+        // CRITICAL: Validate region bounds after clamping
+        // If min >= max, the region is invalid (can happen with extreme padding or small regions)
+        let region_bounds = if padded_min_x >= padded_max_x || padded_min_y >= padded_max_y {
+            tracing::warn!(
+                "Invalid region bounds after clamping: min=({}, {}), max=({}, {}). Disabling bounds enforcement.",
+                padded_min_x, padded_min_y, padded_max_x, padded_max_y
+            );
+            None  // No bounds enforcement - render anywhere on canvas
+        } else {
+            Some((padded_min_x, padded_min_y, padded_max_x, padded_max_y))
+        };
 
         self.renderer.render_text(
             &mut upscaled_canvas,
