@@ -30,6 +30,11 @@ impl Phase4Pipeline {
         Self { config, renderer }
     }
 
+    /// Load a Google Font into the renderer
+    pub async fn load_google_font(&self, font_data: Vec<u8>, family_name: &str) -> Result<()> {
+        self.renderer.load_google_font(font_data, family_name).await
+    }
+
     /// Execute Phase 4: Insert translated text
     ///
     /// # Steps:

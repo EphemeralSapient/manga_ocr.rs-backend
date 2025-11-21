@@ -97,6 +97,7 @@ impl ApiClient {
     /// # Arguments
     /// * `image_bytes_batch` - Vector of image bytes to process
     /// * `model_override` - Optional model name to override the default from config
+    /// * `target_language` - Optional target language for translation (defaults to "English")
     ///
     /// # Returns
     /// Vector of OCRTranslation results
@@ -105,6 +106,7 @@ impl ApiClient {
         &self,
         image_bytes_batch: Vec<Vec<u8>>,
         model_override: Option<&str>,
+        target_language: Option<&str>,
     ) -> Result<Vec<OCRTranslation>> {
         debug!("OCR/Translation batch of {} images", image_bytes_batch.len());
 
@@ -147,11 +149,13 @@ impl ApiClient {
 
         let mut contents = contents;
 
-        // Add text prompt
+        // Add text prompt with target language
+        let target_lang = target_language.unwrap_or("English");
         let prompt = format!(
-            "For each image provided, extract the original text found in the image and translate it to English. \
+            "For each image provided, extract the original text found in the image and translate it to {}. \
              Return a JSON array with {} objects, each containing 'original_text' and 'translated_text' fields. \
              Maintain the order of images. If no text is found, use empty strings.",
+            target_lang,
             image_bytes_batch.len()
         );
         contents.push(serde_json::json!({"text": prompt}));
@@ -261,6 +265,7 @@ impl ApiClient {
     /// * `region_id` - Unique region identifier
     /// * `image_bytes` - Image bytes of the region
     /// * `model_override` - Optional model name to override the default from config
+    /// * `target_language` - Optional target language for translation (defaults to "English")
     ///
     /// # Returns
     /// BananaResult with translated image
@@ -270,6 +275,7 @@ impl ApiClient {
         region_id: usize,
         image_bytes: Vec<u8>,
         model_override: Option<&str>,
+        target_language: Option<&str>,
     ) -> Result<BananaResult> {
         debug!("Banana mode translation for region {}", region_id);
 
@@ -297,10 +303,16 @@ impl ApiClient {
 
         let base64_image = general_purpose::STANDARD.encode(&image_bytes);
 
+        let target_lang = target_language.unwrap_or("English");
+        let prompt = format!(
+            "Replace any text found in this image with {} translation, matching the original style, font, and background exactly.",
+            target_lang
+        );
+
         let request_body = serde_json::json!({
             "contents": [{
                 "parts": [
-                    {"text": "Replace any text found in this image with English translation, matching the original style, font, and background exactly."},
+                    {"text": prompt},
                     {
                         "inline_data": {
                             "mime_type": "image/png",

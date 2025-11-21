@@ -20,9 +20,22 @@ pub struct AppState {
 /// All fields are optional - if not provided, defaults from .env are used
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct ProcessingConfig {
-    /// Font family for rendering translated text (e.g., "arial", "comic-sans")
-    /// If not provided, defaults to "arial"
+    /// Font source: "builtin" or "google"
+    /// If not provided, defaults to "builtin"
+    pub font_source: Option<String>,
+
+    /// Font family for built-in fonts (e.g., "arial", "comic-sans", "anime-ace", "ms-yahei", "noto-sans-mono-cjk")
+    /// Used when font_source is "builtin"
     pub font_family: Option<String>,
+
+    /// Google Font family name (e.g., "Roboto", "Open Sans", "Noto Sans")
+    /// Used when font_source is "google"
+    pub google_font_family: Option<String>,
+
+    /// Target language for translation (e.g., "English", "Spanish", "French", "Japanese", "Chinese")
+    /// If not provided, defaults to "English"
+    #[serde(rename = "targetLanguage")]
+    pub target_language: Option<String>,
 
     /// OCR/Translation model override (e.g., "gemini-2.5-flash")
     /// If not provided, uses the model from environment config

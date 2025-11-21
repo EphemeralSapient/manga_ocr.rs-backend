@@ -43,6 +43,7 @@ impl Phase2Pipeline {
     /// * `banana_model_override` - Optional banana mode image model name override
     /// * `banana_mode` - Whether to use banana mode for complex backgrounds
     /// * `cache_enabled` - Whether to use translation cache
+    /// * `target_language` - Optional target language for translation (defaults to "English")
     ///
     /// # Returns
     /// Phase2Output with translations
@@ -58,6 +59,7 @@ impl Phase2Pipeline {
         banana_model_override: Option<&str>,
         banana_mode: bool,
         cache_enabled: bool,
+        target_language: Option<&str>,
     ) -> Result<Phase2Output> {
         debug!(
             "Phase 2: Processing {} regions for page {}",
@@ -98,7 +100,7 @@ impl Phase2Pipeline {
             // Process simple backgrounds (always use OCR/translation)
             async {
                 if !simple_regions.is_empty() {
-                    self.process_simple_backgrounds(&img, source_image_hash, &simple_regions, ocr_model_override, cache_enabled)
+                    self.process_simple_backgrounds(&img, source_image_hash, &simple_regions, ocr_model_override, cache_enabled, target_language)
                         .await
                         .context("Failed to process simple backgrounds")
                 } else {
@@ -110,13 +112,13 @@ impl Phase2Pipeline {
                 if !complex_regions.is_empty() {
                     if banana_mode {
                         // Use banana API (1 image per call)
-                        self.process_complex_banana(&img, &complex_regions, banana_model_override)
+                        self.process_complex_banana(&img, &complex_regions, banana_model_override, target_language)
                             .await
                             .map(|bananas| (bananas, Vec::new()))
                             .context("Failed to process complex backgrounds with banana")
                     } else {
                         // Use OCR/translation (all regions in single call)
-                        self.process_simple_backgrounds(&img, source_image_hash, &complex_regions, ocr_model_override, cache_enabled)
+                        self.process_simple_backgrounds(&img, source_image_hash, &complex_regions, ocr_model_override, cache_enabled, target_language)
                             .await
                             .map(|translations| (Vec::new(), translations))
                             .context("Failed to process complex backgrounds with OCR")
@@ -146,6 +148,7 @@ impl Phase2Pipeline {
     /// * `regions` - Regions to process
     /// * `model_override` - Optional model name to override the default from config
     /// * `cache_enabled` - Whether to use translation cache
+    /// * `target_language` - Optional target language for translation (defaults to "English")
     ///
     /// # Returns:
     /// Vector of (region_id, OCRTranslation)
@@ -156,6 +159,7 @@ impl Phase2Pipeline {
         regions: &[&CategorizedRegion],
         model_override: Option<&str>,
         cache_enabled: bool,
+        target_language: Option<&str>,
     ) -> Result<Vec<(usize, OCRTranslation)>> {
         let mut results = Vec::new();
 
@@ -214,7 +218,7 @@ impl Phase2Pipeline {
             // Call API for ALL uncached regions in SINGLE call
             let translations = self
                 .api_client
-                .ocr_translate_batch(image_bytes_batch, model_override)
+                .ocr_translate_batch(image_bytes_batch, model_override, target_language)
                 .await
                 .context("OCR/translation API call failed")?;
 
@@ -241,6 +245,7 @@ impl Phase2Pipeline {
     /// * `img` - Source image
     /// * `regions` - Complex background regions
     /// * `model_override` - Optional model name to override the default from config
+    /// * `target_language` - Optional target language for translation (defaults to "English")
     ///
     /// # Returns:
     /// Vector of BananaResult
@@ -249,6 +254,7 @@ impl Phase2Pipeline {
         img: &DynamicImage,
         regions: &[&CategorizedRegion],
         model_override: Option<&str>,
+        target_language: Option<&str>,
     ) -> Result<Vec<BananaResult>> {
         debug!("Processing {} complex backgrounds with banana mode", regions.len());
 
@@ -273,10 +279,11 @@ impl Phase2Pipeline {
             let region_id = region.region_id;
             let api_client = Arc::clone(&self.api_client);
             let model_override = model_override.map(|s| s.to_string());
+            let target_language = target_language.map(|s| s.to_string());
 
             // Spawn concurrent tasks for each banana call
             let task = tokio::spawn(async move {
-                api_client.banana_translate(region_id, png_bytes, model_override.as_deref()).await
+                api_client.banana_translate(region_id, png_bytes, model_override.as_deref(), target_language.as_deref()).await
             });
 
             tasks.push(task);
@@ -307,6 +314,7 @@ impl Phase2Pipeline {
     /// * `banana_mode` - Whether to use banana mode for complex backgrounds
     /// * `cache_enabled` - Whether to use translation cache
     /// * `custom_api_keys` - Optional custom API keys to use instead of config keys
+    /// * `target_language` - Optional target language for translation (defaults to "English")
     ///
     /// # Returns
     /// Vector of Phase2Output for each page
@@ -318,6 +326,7 @@ impl Phase2Pipeline {
         banana_mode: bool,
         cache_enabled: bool,
         custom_api_keys: Option<&[String]>,
+        target_language: Option<&str>,
     ) -> Result<Vec<Phase2Output>> {
         if pages.is_empty() {
             return Ok(Vec::new());
@@ -446,11 +455,13 @@ impl Phase2Pipeline {
             );
 
             // Process each chunk in parallel
+            let target_language_str = target_language.map(|s| s.to_string());
             let tasks: Vec<_> = chunks
                 .into_iter()
                 .map(|chunk| {
                     let api_client = Arc::clone(&api_client);
                     let model_override = ocr_model_override.map(|s| s.to_string());
+                    let target_language = target_language_str.clone();
 
                     tokio::spawn(async move {
                         let image_bytes: Vec<Vec<u8>> = chunk
@@ -459,7 +470,7 @@ impl Phase2Pipeline {
                             .collect();
 
                         let translations = api_client
-                            .ocr_translate_batch(image_bytes, model_override.as_deref())
+                            .ocr_translate_batch(image_bytes, model_override.as_deref(), target_language.as_deref())
                             .await?;
 
                         Ok::<_, anyhow::Error>((chunk, translations))
@@ -496,15 +507,17 @@ impl Phase2Pipeline {
 
         // Process complex regions with banana mode (concurrent per-region calls)
         let banana_results = if !all_complex_regions.is_empty() && banana_mode {
+            let target_language_str = target_language.map(|s| s.to_string());
             let tasks: Vec<_> = all_complex_regions
                 .into_iter()
                 .map(|(page_index, region_id, _bbox, png_bytes)| {
                     let api_client = Arc::clone(&api_client);
                     let model_override = banana_model_override.map(|s| s.to_string());
+                    let target_language = target_language_str.clone();
 
                     tokio::spawn(async move {
                         let result = api_client
-                            .banana_translate(region_id, png_bytes, model_override.as_deref())
+                            .banana_translate(region_id, png_bytes, model_override.as_deref(), target_language.as_deref())
                             .await?;
                         Ok::<_, anyhow::Error>((page_index, result))
                     })

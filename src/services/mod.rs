@@ -1,4 +1,5 @@
 pub mod detection;
+pub mod font_manager;
 pub mod onnx_builder; // Shared ONNX session builder (eliminates ~280 lines of duplication)
 pub mod rendering;
 pub mod segmentation;

@@ -11,6 +11,7 @@ use tracing::{info, instrument};
 use crate::services::translation::api_client::ApiClient;
 use crate::core::config::Config;
 use crate::services::detection::DetectionService;
+use crate::services::font_manager::FontManager;
 use crate::phases::phase1::Phase1Pipeline;
 use crate::phases::phase2::Phase2Pipeline;
 use crate::phases::phase3::Phase3Pipeline;
@@ -29,6 +30,7 @@ pub struct BatchOrchestrator {
     phase2: Arc<Phase2Pipeline>,
     phase3: Arc<Phase3Pipeline>,
     phase4: Arc<Phase4Pipeline>,
+    font_manager: Arc<FontManager>,
     batch_semaphore: Arc<Semaphore>,
     backend_type: String,
 }
@@ -44,6 +46,7 @@ impl BatchOrchestrator {
         let segmenter = Arc::new(SegmentationService::new(config.clone()).await?);
         let api_client = Arc::new(ApiClient::new(config.clone(), None, None)?);
         let cache = Arc::new(TranslationCache::new(config.cache_dir(), None, None, None).await?);
+        let font_manager = Arc::new(FontManager::new(config.cache_dir())?);
 
         // Log cache stats
         let (_cache_entries, _cache_size_mb) = cache.stats().await;
@@ -74,6 +77,7 @@ impl BatchOrchestrator {
             phase2,
             phase3,
             phase4,
+            font_manager,
             batch_semaphore,
             backend_type,
         })
@@ -276,9 +280,10 @@ impl BatchOrchestrator {
         let banana_mode = config.banana_mode.unwrap_or(app_config.banana_mode_enabled());
         let cache_enabled = config.cache_enabled.unwrap_or(true);
         let custom_api_keys = config.api_keys.as_deref();
+        let target_language = config.target_language.as_deref();
 
         let phase2_outputs = self.phase2
-            .execute_batch(&all_phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys)
+            .execute_batch(&all_phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys, target_language)
             .await;
 
         phase1_metrics.phase2_time = phase2_start.elapsed();
@@ -650,9 +655,10 @@ async fn process_single_batch(
     let banana_mode = config.banana_mode.unwrap_or(app_config.banana_mode_enabled());
     let cache_enabled = config.cache_enabled.unwrap_or(true);
     let custom_api_keys = config.api_keys.as_deref();
+    let target_language = config.target_language.as_deref();
 
     let phase2_outputs = phase2
-        .execute_batch(&phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys)
+        .execute_batch(&phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys, target_language)
         .await;
 
     batch_metrics.phase2_time = phase2_start.elapsed();
@@ -833,6 +839,7 @@ async fn process_single_page(
     phase2: &Phase2Pipeline,
     phase3: &Phase3Pipeline,
     phase4: &Phase4Pipeline,
+    font_manager: &FontManager,
     image_data: &ImageData,
     config: &ProcessingConfig,
     app_config: &Config,
@@ -840,7 +847,9 @@ async fn process_single_page(
     let mut metrics = PerformanceMetrics::default();
 
     // Extract config with defaults from app_config
+    let font_source = config.font_source.clone().unwrap_or_else(|| "builtin".to_string());
     let font_family = config.font_family.clone().unwrap_or_else(|| "arial".to_string());
+    let google_font_family = config.google_font_family.clone();
     let ocr_model_override = config.ocr_translation_model.as_deref();
     let banana_model_override = config.banana_image_model.as_deref();
     let include_free_text = config.include_free_text.unwrap_or(false);
@@ -891,6 +900,7 @@ async fn process_single_page(
 
     // Phase 2: API Calls
     let p2_start = Instant::now();
+    let target_language = config.target_language.as_deref();
     let phase2_output = phase2
         .execute(
             &optimized_image_data,
@@ -899,6 +909,7 @@ async fn process_single_page(
             banana_model_override,
             banana_mode,
             cache_enabled,
+            target_language,
         )
         .await
         .context("Phase 2 failed")?;
@@ -922,6 +933,33 @@ async fn process_single_page(
         .context("Phase 3 failed")?;
     metrics.phase3_time = p3_start.elapsed();
 
+    // Handle Google Fonts if needed
+    let final_font_family = if font_source == "google" {
+        if let Some(ref google_font) = google_font_family {
+            // Download and load Google Font
+            match font_manager.get_google_font(google_font).await {
+                Ok(font_data) => {
+                    // Load font into Phase4's renderer
+                    if let Err(e) = phase4.load_google_font(font_data, google_font).await {
+                        tracing::warn!("Failed to load Google Font '{}': {}. Falling back to built-in font.", google_font, e);
+                        font_family
+                    } else {
+                        google_font.clone()
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to download Google Font '{}': {}. Falling back to built-in font.", google_font, e);
+                    font_family
+                }
+            }
+        } else {
+            tracing::warn!("Google Fonts selected but no font family specified. Using default built-in font.");
+            font_family
+        }
+    } else {
+        font_family
+    };
+
     // Phase 4: Text Insertion
     let p4_start = Instant::now();
     let phase4_output = phase4
@@ -930,7 +968,7 @@ async fn process_single_page(
             &phase1_output,
             &phase2_output,
             &phase3_output,
-            &font_family,
+            &final_font_family,
             text_stroke,
         )
         .await

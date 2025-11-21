@@ -63,7 +63,17 @@ impl CosmicTextRenderer {
         FontSystem::new_with_locale_and_db("en-US".to_string(), db)
     }
 
+    /// Load a Google Font into the font system
+    /// The font_data should be the raw font file bytes (TTF, OTF, or WOFF2)
+    pub async fn load_google_font(&self, font_data: Vec<u8>, family_name: &str) -> Result<()> {
+        let mut font_system = self.font_system.lock().await;
+        font_system.db_mut().load_font_data(font_data);
+        info!("✓ Loaded Google Font: {}", family_name);
+        Ok(())
+    }
+
     /// Map font family string to cosmic-text Family
+    /// For Google Fonts, the family name is used directly
     fn parse_font_family(font_family: &str) -> Family<'static> {
         match font_family {
             "anime-ace" => Family::Name("Anime Ace"),
@@ -75,9 +85,15 @@ impl CosmicTextRenderer {
             "sans-serif-regular" | "sans-serif-bold" => Family::SansSerif,
             "serif-regular" | "serif-bold" => Family::Serif,
             "monospace-regular" | "monospace-bold" => Family::Monospace,
+            // For any other font (like Google Fonts), use the name directly
             _ => {
-                debug!("Unknown font family '{}', defaulting to SansSerif", font_family);
-                Family::SansSerif
+                // If it looks like a font name (contains spaces or capitals), use it as-is
+                if font_family.chars().any(|c| c.is_uppercase() || c == ' ') {
+                    Family::Name(Box::leak(font_family.to_string().into_boxed_str()))
+                } else {
+                    debug!("Unknown font family '{}', defaulting to SansSerif", font_family);
+                    Family::SansSerif
+                }
             }
         }
     }
