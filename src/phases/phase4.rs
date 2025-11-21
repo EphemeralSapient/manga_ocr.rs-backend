@@ -323,23 +323,22 @@ impl Phase4Pipeline {
         let text_width = (max_x - min_x).max(1) as f32;
         let text_height = (max_y - min_y).max(1) as f32;
 
-        // IMPROVED: Dynamic padding based on stroke width and font characteristics
-        let base_padding = 0.08;  // 8% base padding
+        // SIMPLIFIED: Minimal padding to maximize text space
+        let base_padding = 0.03;  // 3% base padding (reduced from 8%)
         let stroke_width_f32 = if text_stroke {
             self.config.text_stroke_width() as f32
         } else {
             0.0
         };
 
-        // Calculate additional padding needed for stroke
-        // Stroke extends on both sides, so we need to account for it in padding
-        let stroke_padding_ratio = (stroke_width_f32 * 2.0) / text_width.min(text_height);
+        // Calculate additional padding needed for stroke (simplified)
+        let stroke_padding_ratio = (stroke_width_f32 * 1.5) / text_width.min(text_height);
 
         // Dynamic padding: base + stroke contribution
         let padding = base_padding + stroke_padding_ratio;
 
-        let available_width = text_width * (1.0 - padding * 2.0).max(0.5);  // Ensure at least 50% available
-        let available_height = text_height * (1.0 - padding * 2.0).max(0.5);
+        let available_width = text_width * (1.0 - padding * 2.0).max(0.85);  // Use 85% of space minimum
+        let available_height = text_height * (1.0 - padding * 2.0).max(0.85);
 
         // RESOLUTION-ADAPTIVE font size limits
         let target_size = self.config.target_size() as f32;
@@ -399,50 +398,12 @@ impl Phase4Pipeline {
             Some(text_width),
         ).await?;
 
-        // Calculate stroke padding if stroke is enabled
-        let stroke_padding = if text_stroke {
-            // Stroke width from config, scaled by upscale factor
-            let stroke_width = self.config.text_stroke_width() as f32;
-            stroke_width * 2.0 // Account for stroke on both sides
-        } else {
-            0.0
-        };
-
-        // Detect and log overflow
-        if actual_text_width > text_width || actual_text_height > text_height {
-            tracing::warn!(
-                "Text overflow in render phase: region_size=({:.0}x{:.0}), text_size=({:.1}x{:.1}), overflow=({:+.1}x{:+.1}), font_size={:.1}px, text={:.40}...",
-                text_width,
-                text_height,
-                actual_text_width,
-                actual_text_height,
-                actual_text_width - text_width,
-                actual_text_height - text_height,
-                font_size,
-                text
-            );
-        }
-
-        // Calculate centered position with overflow handling
-        // If text overflows, position it at the padded boundary instead of centering
+        // SIMPLIFIED: Just center the text with minimal padding
         let padding_pixels_x = (text_width * padding) as i32;
         let padding_pixels_y = (text_height * padding) as i32;
 
-        let center_offset_x = if actual_text_width > text_width {
-            // Text overflows: start at padded boundary to maximize available space
-            padding_pixels_x as f32
-        } else {
-            // Text fits: center it within available space
-            ((text_width - actual_text_width) / 2.0).max(padding_pixels_x as f32)
-        };
-
-        let center_offset_y = if actual_text_height > text_height {
-            // Text overflows vertically: start at padded boundary
-            padding_pixels_y as f32
-        } else {
-            // Text fits: center it within available space
-            ((text_height - actual_text_height) / 2.0).max(padding_pixels_y as f32)
-        };
+        let center_offset_x = ((text_width - actual_text_width) / 2.0).max(padding_pixels_x as f32);
+        let center_offset_y = ((text_height - actual_text_height) / 2.0).max(padding_pixels_y as f32);
 
         // Render text on upscaled canvas at calculated position
         let scaled_x = ((min_x as f32 + center_offset_x) * upscale_factor as f32) as i32;
@@ -457,36 +418,9 @@ impl Phase4Pipeline {
             None
         };
 
-        // Calculate padded region boundaries for strict enforcement
-        // This ensures text stays within the padded area
-        // IMPORTANT: Add extra padding for stroke width and glyph overhangs to prevent clipping!
-        let stroke_padding_scaled = (stroke_padding * upscale_factor as f32) as i32;
-        let glyph_overhang_padding = (font_size * 0.15 * upscale_factor as f32) as i32; // 15% of font size for glyph overhangs
-
-        let extra_padding = stroke_padding_scaled + glyph_overhang_padding;
-
-        let padded_min_x = ((min_x + padding_pixels_x) * upscale_factor as i32) - extra_padding;
-        let padded_min_y = ((min_y + padding_pixels_y) * upscale_factor as i32) - extra_padding;
-        let padded_max_x = ((max_x - padding_pixels_x) * upscale_factor as i32) + extra_padding;
-        let padded_max_y = ((max_y - padding_pixels_y) * upscale_factor as i32) + extra_padding;
-
-        // Clamp bounds to canvas to prevent rendering outside the region
-        let padded_min_x = padded_min_x.max(0);
-        let padded_min_y = padded_min_y.max(0);
-        let padded_max_x = padded_max_x.min(upscaled_width as i32);
-        let padded_max_y = padded_max_y.min(upscaled_height as i32);
-
-        // CRITICAL: Validate region bounds after clamping
-        // If min >= max, the region is invalid (can happen with extreme padding or small regions)
-        let region_bounds = if padded_min_x >= padded_max_x || padded_min_y >= padded_max_y {
-            tracing::warn!(
-                "Invalid region bounds after clamping: min=({}, {}), max=({}, {}). Disabling bounds enforcement.",
-                padded_min_x, padded_min_y, padded_max_x, padded_max_y
-            );
-            None  // No bounds enforcement - render anywhere on canvas
-        } else {
-            Some((padded_min_x, padded_min_y, padded_max_x, padded_max_y))
-        };
+        // SIMPLIFIED: No strict bounds enforcement to prevent text clipping
+        // Text will render fully without being cut off
+        let region_bounds = None;
 
         self.renderer.render_text(
             &mut upscaled_canvas,

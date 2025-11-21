@@ -41,6 +41,16 @@ impl Phase1Pipeline {
         self.segmenter.cleanup_sessions();
     }
 
+    /// Cleanup only detection sessions (use when segmentation is still running)
+    pub fn cleanup_detection_sessions(&self) {
+        self.detector.cleanup_sessions();
+    }
+
+    /// Cleanup only segmentation sessions
+    pub fn cleanup_segmentation_sessions(&self) {
+        self.segmenter.cleanup_sessions();
+    }
+
     /// Check if using DirectML backend
     pub fn is_directml(&self) -> bool {
         self.detector.is_directml()

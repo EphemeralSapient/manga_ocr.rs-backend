@@ -289,9 +289,9 @@ impl BatchOrchestrator {
             Ok::<_, anyhow::Error>(phase1_outputs_for_seg)
         });
 
-        // CLEANUP: Free detection ONNX sessions (segmentation will clean up when done)
+        // CLEANUP: Free detection ONNX sessions only (segmentation still running)
         info!("🧹 [MEMORY OPTIMIZATION] Cleaning up detection sessions after Phase 1");
-        self.phase1.cleanup_sessions();
+        self.phase1.cleanup_detection_sessions();
         info!("✓ Detection complete, proceeding with Phase 2 while segmentation runs in background");
 
         // ===== PHASE 2: GLOBAL (ALL PAGES, SPLIT ACROSS KEYS) =====
@@ -365,6 +365,10 @@ impl BatchOrchestrator {
                 all_phase2_data.iter().map(|(_, p1, _)| p1.clone()).collect()
             }
         };
+
+        // CLEANUP: Free segmentation ONNX sessions now that segmentation is complete
+        info!("🧹 [MEMORY OPTIMIZATION] Cleaning up segmentation sessions after completion");
+        self.phase1.cleanup_segmentation_sessions();
 
         // Update all_phase2_data with completed segmentation masks
         let mut all_phase2_data_updated = Vec::new();
