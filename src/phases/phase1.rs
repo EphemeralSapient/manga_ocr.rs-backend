@@ -56,6 +56,7 @@ impl Phase1Pipeline {
     ///
     /// # Arguments
     /// * `target_size_override` - Optional target size override for detection model
+    /// * `filter_orphan_regions` - If true, discard label 1 regions not within any label 0
     ///
     /// # Returns
     /// Phase1Output with categorized regions
@@ -63,7 +64,7 @@ impl Phase1Pipeline {
         page_index = image_data.index,
         filename = %image_data.filename
     ))]
-    pub async fn execute(&self, image_data: &ImageData, use_mask: bool, target_size_override: Option<u32>) -> Result<Phase1Output> {
+    pub async fn execute(&self, image_data: &ImageData, use_mask: bool, target_size_override: Option<u32>, filter_orphan_regions: bool) -> Result<Phase1Output> {
         debug!(
             "Phase 1: Processing page {} ({})",
             image_data.index, image_data.filename
@@ -134,6 +135,7 @@ impl Phase1Pipeline {
             &label_1_detections,
             &label_2_detections,
             image_data.index,
+            filter_orphan_regions,
         )?;
 
         Ok(Phase1Output {
@@ -154,11 +156,13 @@ impl Phase1Pipeline {
     ///
     /// # Arguments
     /// * `target_size_override` - Optional target size override for detection model
+    /// * `filter_orphan_regions` - If true, discard label 1 regions not within any label 0
     pub async fn execute_detection_only(
         &self,
         images: &[ImageData],
         merge_img: bool,
         target_size_override: Option<u32>,
+        filter_orphan_regions: bool,
     ) -> Result<(Vec<Phase1Output>, Vec<DynamicImage>)> {
         if images.is_empty() {
             return Ok((Vec::new(), Vec::new()));
@@ -247,6 +251,7 @@ impl Phase1Pipeline {
                 &label_1_detections,
                 &label_2_detections,
                 image_data.index,
+                filter_orphan_regions,
             )?;
 
             // Empty segmentation mask placeholder
@@ -308,7 +313,8 @@ impl Phase1Pipeline {
     ///
     /// # Arguments
     /// * `target_size_override` - Optional target size override for detection model
-    pub async fn execute_batch(&self, images: &[ImageData], use_mask: bool, merge_img: bool, target_size_override: Option<u32>) -> Result<Vec<Phase1Output>> {
+    /// * `filter_orphan_regions` - If true, discard label 1 regions not within any label 0
+    pub async fn execute_batch(&self, images: &[ImageData], use_mask: bool, merge_img: bool, target_size_override: Option<u32>, filter_orphan_regions: bool) -> Result<Vec<Phase1Output>> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -421,6 +427,7 @@ impl Phase1Pipeline {
                 &label_1_detections,
                 &label_2_detections,
                 image_data.index,
+                filter_orphan_regions,
             )?;
 
             outputs.push(Phase1Output {
@@ -446,6 +453,9 @@ impl Phase1Pipeline {
 
     /// Categorize regions and validate label 1 within label 0
     ///
+    /// # Arguments
+    /// * `filter_orphan_regions` - If true, discard label 1 regions not within any label 0
+    ///
     /// # Returns
     /// (categorized_regions, validation_warnings)
     fn categorize_regions(
@@ -455,6 +465,7 @@ impl Phase1Pipeline {
         label_1: &[RegionDetection],
         label_2: &[RegionDetection],
         page_index: usize,
+        filter_orphan_regions: bool,
     ) -> Result<(Vec<CategorizedRegion>, Vec<String>)> {
         let mut regions = Vec::new();
         let mut warnings = Vec::new();
@@ -503,18 +514,36 @@ impl Phase1Pipeline {
             warnings.append(&mut local_warnings);
         }
 
-        // Process standalone label 1 (not within any label 0) - skip them with warning
+        // Process standalone label 1 (not within any label 0)
+        // Behavior depends on filter_orphan_regions flag
         for l1 in label_1 {
             let within_any_l0 = label_0.iter().any(|l0| self.is_bbox_within(l1.bbox, l0.bbox));
             if !within_any_l0 {
-                warn!(
-                    "Label 1 region {:?} not within any label 0 - discarding",
-                    l1.bbox
-                );
-                warnings.push(format!(
-                    "Label 1 region {:?} not within any label 0",
-                    l1.bbox
-                ));
+                if filter_orphan_regions {
+                    // Filter enabled: Discard orphan region with warning
+                    warn!(
+                        "Label 1 region {:?} not within any label 0 - discarding",
+                        l1.bbox
+                    );
+                    warnings.push(format!(
+                        "Label 1 region {:?} not within any label 0",
+                        l1.bbox
+                    ));
+                } else {
+                    // Filter disabled (default): Keep orphan region as standalone text region
+                    debug!(
+                        "Label 1 region {:?} not within any label 0 - keeping as standalone region",
+                        l1.bbox
+                    );
+                    regions.push(CategorizedRegion {
+                        region_id: region_id_counter.fetch_add(1, Ordering::Relaxed),
+                        page_index,
+                        label: 1,
+                        bbox: l1.bbox,
+                        background_type: BackgroundType::Complex,
+                        label_1_regions: vec![l1.bbox],
+                    });
+                }
             }
         }
 

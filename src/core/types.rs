@@ -112,6 +112,13 @@ pub struct ProcessingConfig {
     /// Higher values = better accuracy but slower processing
     #[serde(rename = "targetSize")]
     pub target_size: Option<u32>,
+
+    /// Filter orphan label 1 regions (not within any label 0)
+    /// When enabled: Discards label 1 regions that are not within any label 0 bubble
+    /// When disabled (default): Keeps all detected label 1 regions
+    /// If not provided, defaults to false (disabled)
+    #[serde(rename = "filterOrphanRegions")]
+    pub filter_orphan_regions: Option<bool>,
 }
 
 /// Detection label for region classification
