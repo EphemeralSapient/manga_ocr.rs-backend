@@ -275,9 +275,10 @@ impl BatchOrchestrator {
         let banana_model_override = config.banana_image_model.as_deref();
         let banana_mode = config.banana_mode.unwrap_or(app_config.banana_mode_enabled());
         let cache_enabled = config.cache_enabled.unwrap_or(true);
+        let custom_api_keys = config.api_keys.as_deref();
 
         let phase2_outputs = self.phase2
-            .execute_batch(&all_phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled)
+            .execute_batch(&all_phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys)
             .await;
 
         phase1_metrics.phase2_time = phase2_start.elapsed();
@@ -648,9 +649,10 @@ async fn process_single_batch(
     let banana_model_override = config.banana_image_model.as_deref();
     let banana_mode = config.banana_mode.unwrap_or(app_config.banana_mode_enabled());
     let cache_enabled = config.cache_enabled.unwrap_or(true);
+    let custom_api_keys = config.api_keys.as_deref();
 
     let phase2_outputs = phase2
-        .execute_batch(&phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled)
+        .execute_batch(&phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys)
         .await;
 
     batch_metrics.phase2_time = phase2_start.elapsed();

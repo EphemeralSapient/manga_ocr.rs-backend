@@ -7,23 +7,24 @@ High-performance Rust backend for manga text detection, translation, and renderi
 This service implements a 4-phase pipeline for processing manga pages:
 
 ### Phase 1: Detection & Categorization
-- Detects text bubbles and regions using ONNX models
-- Generates segmentation masks
-- Classifies backgrounds as simple or complex
+- Detects text regions using ONNX models (detector + segmentation)
+- Generates segmentation masks for precise text removal
+- Categorizes regions by background complexity (simple vs complex)
 
 ### Phase 2: Translation
-- Simple backgrounds: OCR + text translation (batched API calls)
-- Complex backgrounds: Image-to-image translation (optional banana mode)
-- Persistent LRU cache to minimize API calls
+- **Simple backgrounds**: OCR + text translation via batched API calls
+- **Complex backgrounds**: Image-to-image translation (banana mode, optional)
+- Persistent LRU cache to minimize API calls and costs
 
-### Phase 3: Layout Analysis
-- Calculates text positioning and flow
-- Determines font sizing and alignment
+### Phase 3: Mask-based Text Removal
+- Removes original text using segmentation masks
+- Creates cleaned region images ready for new text
+- Skips regions already processed by banana mode
 
-### Phase 4: Rendering
-- Renders translated text using cosmic-text
-- Supports multiple fonts (Arial, Comic Sans, Noto Sans Mono CJK)
-- Adaptive background handling (blur or solid fill)
+### Phase 4: Text Insertion & Compositing
+- Renders translated text onto cleaned regions using cosmic-text
+- Supports multiple fonts (Anime Ace, Arial Unicode, Comic Sans, Noto Sans Mono CJK, Microsoft YaHei)
+- Composites all regions back into final translated image
 
 ## Technical Stack
 
@@ -50,7 +51,8 @@ This service implements a 4-phase pipeline for processing manga pages:
 
 ## Installation
 
-### From Source
+<details>
+<summary><h3>Compile & Instructions</h3></summary>
 
 <details>
 <summary><b>Linux: Install Rust</b></summary>
@@ -182,6 +184,8 @@ docker run -d --gpus all -p 1420:1420 \
   manga_workflow
 ```
 
+</details>
+
 ## Usage
 
 ### Python CLI Client
@@ -212,7 +216,7 @@ For browser-based usage: https://github.com/EphemeralSapient/manga_ocr.rs-fronte
 
 All configuration options are documented in `.env.example`. Copy it to `.env` and adjust settings as needed. API keys should be placed in `.env.local`.
 
-## Production Deployment
+## Performance & Monitoring
 
 **Resource requirements:**
 - Memory: 2-4GB minimum, 8GB recommended for large batches

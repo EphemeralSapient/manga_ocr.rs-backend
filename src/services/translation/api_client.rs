@@ -76,6 +76,22 @@ impl ApiClient {
         self.api_key_pool.total_keys().await
     }
 
+    /// Create a temporary ApiClient with custom API keys for per-request override
+    pub fn with_custom_keys(
+        &self,
+        custom_keys: Vec<String>,
+    ) -> Arc<Self> {
+        let custom_pool = Arc::new(ApiKeyPool::new(custom_keys));
+
+        Arc::new(Self {
+            config: Arc::clone(&self.config),
+            api_key_pool: custom_pool,
+            http_client: self.http_client.clone(),
+            circuit_breaker: self.circuit_breaker.clone(),
+            metrics: self.metrics.clone(),
+        })
+    }
+
     /// Perform OCR and translation on a batch of images (simple backgrounds)
     ///
     /// # Arguments

@@ -28,6 +28,9 @@ jobs:
           - name: openvino
             features: "--features openvino"
             suffix: "openvino"
+          - name: cuda
+            features: "--features cuda"
+            suffix: "cuda"
 
     steps:
       - uses: actions/checkout@v5
@@ -103,6 +106,7 @@ jobs:
           mv binaries/manga_workflow-windows-x86_64-standard/manga_workflow.exe release/manga_workflow_standard.exe
           mv binaries/manga_workflow-windows-x86_64-directml/manga_workflow.exe release/manga_workflow_directml.exe
           mv binaries/manga_workflow-windows-x86_64-openvino/manga_workflow.exe release/manga_workflow_openvino.exe
+          mv binaries/manga_workflow-windows-x86_64-cuda/manga_workflow.exe release/manga_workflow_cuda.exe
           ls -lh release/
 
       - name: Create Release
@@ -112,6 +116,7 @@ jobs:
             release/manga_workflow_standard.exe
             release/manga_workflow_directml.exe
             release/manga_workflow_openvino.exe
+            release/manga_workflow_cuda.exe
           draft: false
           prerelease: false
           body: |
@@ -119,6 +124,7 @@ jobs:
             - `manga_workflow_standard.exe` - CPU only
             - `manga_workflow_directml.exe` - DirectML GPU acceleration (AMD/Intel/NVIDIA)
             - `manga_workflow_openvino.exe` - OpenVINO optimization (Intel CPUs)
+            - `manga_workflow_cuda.exe` - CUDA GPU acceleration (NVIDIA)
 
             ## Installation
             1. Clone the repository: `git clone <repo-url>`

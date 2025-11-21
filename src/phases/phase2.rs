@@ -306,6 +306,7 @@ impl Phase2Pipeline {
     /// * `banana_model_override` - Optional banana mode image model name override
     /// * `banana_mode` - Whether to use banana mode for complex backgrounds
     /// * `cache_enabled` - Whether to use translation cache
+    /// * `custom_api_keys` - Optional custom API keys to use instead of config keys
     ///
     /// # Returns
     /// Vector of Phase2Output for each page
@@ -316,12 +317,31 @@ impl Phase2Pipeline {
         banana_model_override: Option<&str>,
         banana_mode: bool,
         cache_enabled: bool,
+        custom_api_keys: Option<&[String]>,
     ) -> Result<Vec<Phase2Output>> {
         if pages.is_empty() {
             return Ok(Vec::new());
         }
 
         debug!("Phase 2 BATCH: Processing {} pages together", pages.len());
+
+        // Use custom API keys if provided, otherwise use default client
+        let api_client: Arc<ApiClient> = if let Some(custom_keys) = custom_api_keys {
+            if !custom_keys.is_empty() {
+                debug!("Using {} custom API keys from request", custom_keys.len());
+                self.api_client.with_custom_keys(custom_keys.to_vec())
+            } else {
+                debug!("Custom API keys array is empty, falling back to config keys");
+                Arc::clone(&self.api_client)
+            }
+        } else {
+            Arc::clone(&self.api_client)
+        };
+
+        // Verify we have API keys
+        if api_client.total_keys().await == 0 {
+            anyhow::bail!("No API keys available. Please provide API keys in request or configure GEMINI_API_KEYS in .env");
+        }
 
         // Collect all regions from all pages with their metadata
         // (page_index, region_id, source_image_hash, bbox, background_type, cropped_bytes)
@@ -404,7 +424,7 @@ impl Phase2Pipeline {
         // Process all simple regions SPLIT ACROSS API KEYS for parallelism
         let simple_translations = if !all_simple_regions.is_empty() {
             // Get number of available API keys
-            let num_keys = self.api_client.total_keys().await.max(1);
+            let num_keys = api_client.total_keys().await.max(1);
 
             debug!(
                 "Splitting {} simple regions across {} API keys for parallel processing",
@@ -429,7 +449,7 @@ impl Phase2Pipeline {
             let tasks: Vec<_> = chunks
                 .into_iter()
                 .map(|chunk| {
-                    let api_client = Arc::clone(&self.api_client);
+                    let api_client = Arc::clone(&api_client);
                     let model_override = ocr_model_override.map(|s| s.to_string());
 
                     tokio::spawn(async move {
@@ -479,7 +499,7 @@ impl Phase2Pipeline {
             let tasks: Vec<_> = all_complex_regions
                 .into_iter()
                 .map(|(page_index, region_id, _bbox, png_bytes)| {
-                    let api_client = Arc::clone(&self.api_client);
+                    let api_client = Arc::clone(&api_client);
                     let model_override = banana_model_override.map(|s| s.to_string());
 
                     tokio::spawn(async move {
