@@ -88,6 +88,24 @@ impl BatchOrchestrator {
         &self.backend_type
     }
 
+    /// Format ProcessingConfig for logging without exposing sensitive data
+    fn format_config_for_logging(config: &ProcessingConfig) -> String {
+        format!(
+            "model={}, banana_mode={}, cache={}, mask={}, merge_img={}, sessions={}, include_free_text={}, text_stroke={}, blur_bg={}, tighter_bounds={}, api_keys={}",
+            config.ocr_translation_model.as_deref().unwrap_or("default"),
+            config.banana_mode.unwrap_or(false),
+            config.cache_enabled.unwrap_or(true),
+            config.use_mask.unwrap_or(true),
+            config.merge_img.unwrap_or(false),
+            config.session_limit.map(|s| s.to_string()).unwrap_or_else(|| "default".to_string()),
+            config.include_free_text.unwrap_or(false),
+            config.text_stroke.unwrap_or(false),
+            config.blur_free_text_bg.unwrap_or(false),
+            config.tighter_bounds.unwrap_or(true),
+            config.api_keys.as_ref().map(|keys| format!("[{} keys]", keys.len())).unwrap_or_else(|| "[default]".to_string())
+        )
+    }
+
     /// Process multiple batches of images
     ///
     /// # Workflow:
@@ -101,7 +119,7 @@ impl BatchOrchestrator {
     ///
     /// # Returns:
     /// BatchResult with all results and analytics
-    #[instrument(skip(self, images), fields(total_images = images.len()))]
+    #[instrument(skip(self, images, config), fields(total_images = images.len()))]
     pub async fn process_batch(
         &self,
         images: Vec<ImageData>,
@@ -111,6 +129,7 @@ impl BatchOrchestrator {
         let total_images = images.len();
 
         info!("Processing {} images", total_images);
+        info!("Config: {}", Self::format_config_for_logging(config));
 
         // Divide images into batches of N
         let batch_size_n = self.config.batch_size_n();

@@ -57,10 +57,13 @@ async fn main() -> Result<()> {
         level_str
     ));
 
+    use tracing_subscriber::fmt::format::FmtSpan;
+
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)  // Show module paths
         .with_thread_ids(false)  // Cleaner output
+        .with_span_events(FmtSpan::NONE)  // Don't show span context on every log line
         .init();
 
     info!("Logging initialized at level: {}", level_str.to_uppercase());
@@ -465,7 +468,29 @@ async fn process_images(
         ));
     }
 
-    info!("Processing {} images", images.len());
+    // Calculate total size of all images in MB
+    let total_bytes: usize = images.iter().map(|img| img.image_bytes.len()).sum();
+    let total_mb = total_bytes as f64 / (1024.0 * 1024.0);
+
+    // Get font information
+    let font_info = if let Some(ref google_font) = config.google_font_family {
+        format!("Google:{}", google_font)
+    } else if let Some(ref font) = config.font_family {
+        format!("Builtin:{}", font)
+    } else {
+        "default".to_string()
+    };
+
+    // Get target language
+    let language = config.target_language.as_deref().unwrap_or("English");
+
+    info!(
+        "Processing {} images, {:.2} MB total, font={}, language={}",
+        images.len(),
+        total_mb,
+        font_info,
+        language
+    );
 
     // Apply global settings if not overridden in request config
     if config.use_mask.is_none() {
