@@ -91,7 +91,7 @@ impl BatchOrchestrator {
     /// Format ProcessingConfig for logging without exposing sensitive data
     fn format_config_for_logging(config: &ProcessingConfig) -> String {
         format!(
-            "model={}, banana_mode={}, cache={}, mask={}, merge_img={}, sessions={}, include_free_text={}, text_stroke={}, blur_bg={}, tighter_bounds={}, api_keys={}",
+            "model={}, banana_mode={}, cache={}, mask={}, merge_img={}, sessions={}, include_free_text={}, text_stroke={}, blur_bg={}, tighter_bounds={}, target_size={}, api_keys={}",
             config.ocr_translation_model.as_deref().unwrap_or("default"),
             config.banana_mode.unwrap_or(false),
             config.cache_enabled.unwrap_or(true),
@@ -102,6 +102,7 @@ impl BatchOrchestrator {
             config.text_stroke.unwrap_or(false),
             config.blur_free_text_bg.unwrap_or(false),
             config.tighter_bounds.unwrap_or(true),
+            config.target_size.map(|s| if s == 0 { "source".to_string() } else { s.to_string() }).unwrap_or_else(|| "default".to_string()),
             config.api_keys.as_ref().map(|keys| format!("[{} keys]", keys.len())).unwrap_or_else(|| "[default]".to_string())
         )
     }
@@ -176,7 +177,7 @@ impl BatchOrchestrator {
             info!("🔄 DirectML detected: Processing {} batches sequentially (detection only)", batches.len());
 
             for batch in batches.into_iter() {
-                match self.phase1.execute_detection_only(&batch.images, merge_img).await {
+                match self.phase1.execute_detection_only(&batch.images, merge_img, config.target_size).await {
                     Ok((mut outputs, decoded_images)) => {
                         for (i, output) in outputs.iter_mut().enumerate() {
                             // Filter out label 2 if not included
@@ -220,9 +221,10 @@ impl BatchOrchestrator {
             for batch in batches {
                 let phase1 = Arc::clone(&self.phase1);
                 let images = batch.images.clone();
+                let target_size = config.target_size;
 
                 let task = tokio::spawn(async move {
-                    let (outputs, decoded_images) = phase1.execute_detection_only(&images, merge_img).await?;
+                    let (outputs, decoded_images) = phase1.execute_detection_only(&images, merge_img, target_size).await?;
                     Ok::<_, anyhow::Error>((images, outputs, decoded_images))
                 });
 
@@ -568,7 +570,7 @@ async fn process_single_batch(
     let phase1_results: Vec<Result<Result<(ImageData, crate::core::types::Phase1Output), anyhow::Error>, tokio::task::JoinError>> = if merge_img {
         // BATCH MODE: Run detection for all images in single ONNX inference
         // Execute batch Phase 1
-        let batch_outputs = phase1.execute_batch(&batch.images, use_mask, merge_img).await;
+        let batch_outputs = phase1.execute_batch(&batch.images, use_mask, merge_img, config.target_size).await;
 
         match batch_outputs {
             Ok(outputs) => {
@@ -610,7 +612,7 @@ async fn process_single_batch(
                 let mut optimized_image_data = image_data.clone();
                 optimized_image_data.decoded_image = Some(decoded_image);
 
-                let mut phase1_output = phase1.execute(&optimized_image_data, use_mask).await?;
+                let mut phase1_output = phase1.execute(&optimized_image_data, use_mask, config.target_size).await?;
 
                 // Filter out label 2 if not included
                 if !include_free_text {
@@ -898,7 +900,7 @@ async fn process_single_page(
     // Phase 1: Detection & Categorization
     let p1_start = Instant::now();
     let mut phase1_output = phase1
-        .execute(&optimized_image_data, use_mask)
+        .execute(&optimized_image_data, use_mask, config.target_size)
         .await
         .context("Phase 1 failed")?;
 

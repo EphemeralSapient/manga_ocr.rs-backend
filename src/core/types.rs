@@ -104,6 +104,14 @@ pub struct ProcessingConfig {
     /// If not provided, defaults to true (enabled)
     #[serde(rename = "tighterBounds")]
     pub tighter_bounds: Option<bool>,
+
+    /// Target size for model input (pixels)
+    /// If not provided, uses TARGET_SIZE from .env (default: 640)
+    /// If set to 0, uses source image resolution (no resizing)
+    /// Valid range: 0 (source), or [320, 2048]
+    /// Higher values = better accuracy but slower processing
+    #[serde(rename = "targetSize")]
+    pub target_size: Option<u32>,
 }
 
 /// Detection label for region classification

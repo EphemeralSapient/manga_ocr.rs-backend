@@ -360,11 +360,43 @@ impl Phase4Pipeline {
             Some(text_width),
         ).await?;
 
-        // Calculate centered position
-        let center_offset_x = ((text_width - actual_text_width) / 2.0).max(0.0);
-        let center_offset_y = ((text_height - actual_text_height) / 2.0).max(0.0);
+        // Detect and log overflow
+        if actual_text_width > text_width || actual_text_height > text_height {
+            tracing::warn!(
+                "Text overflow in render phase: region_size=({:.0}x{:.0}), text_size=({:.1}x{:.1}), overflow=({:+.1}x{:+.1}), font_size={:.1}px, text={:.40}...",
+                text_width,
+                text_height,
+                actual_text_width,
+                actual_text_height,
+                actual_text_width - text_width,
+                actual_text_height - text_height,
+                font_size,
+                text
+            );
+        }
 
-        // Render text on upscaled canvas at centered position
+        // Calculate centered position with overflow handling
+        // If text overflows, position it at the padded boundary instead of centering
+        let padding_pixels_x = (text_width * padding) as i32;
+        let padding_pixels_y = (text_height * padding) as i32;
+
+        let center_offset_x = if actual_text_width > text_width {
+            // Text overflows: start at padded boundary to maximize available space
+            padding_pixels_x as f32
+        } else {
+            // Text fits: center it within available space
+            ((text_width - actual_text_width) / 2.0).max(padding_pixels_x as f32)
+        };
+
+        let center_offset_y = if actual_text_height > text_height {
+            // Text overflows vertically: start at padded boundary
+            padding_pixels_y as f32
+        } else {
+            // Text fits: center it within available space
+            ((text_height - actual_text_height) / 2.0).max(padding_pixels_y as f32)
+        };
+
+        // Render text on upscaled canvas at calculated position
         let scaled_x = ((min_x as f32 + center_offset_x) * upscale_factor as f32) as i32;
         let scaled_y = ((min_y as f32 + center_offset_y) * upscale_factor as f32) as i32;
         let scaled_font_size = font_size * upscale_factor as f32;
@@ -377,6 +409,15 @@ impl Phase4Pipeline {
             None
         };
 
+        // Calculate padded region boundaries for strict enforcement
+        // This ensures text stays within the padded area (10% padding on each side)
+        // Note: padding_pixels_x and padding_pixels_y already calculated above for centering
+        let padded_min_x = (min_x + padding_pixels_x) * upscale_factor as i32;
+        let padded_min_y = (min_y + padding_pixels_y) * upscale_factor as i32;
+        let padded_max_x = (max_x - padding_pixels_x) * upscale_factor as i32;
+        let padded_max_y = (max_y - padding_pixels_y) * upscale_factor as i32;
+        let region_bounds = Some((padded_min_x, padded_min_y, padded_max_x, padded_max_y));
+
         self.renderer.render_text(
             &mut upscaled_canvas,
             text,
@@ -387,6 +428,7 @@ impl Phase4Pipeline {
             scaled_y,
             scaled_max_width,
             stroke_width,
+            region_bounds,
         ).await?;
 
         // Downscale back

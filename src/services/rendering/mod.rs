@@ -140,8 +140,8 @@ impl CosmicTextRenderer {
             buffer.set_size(&mut font_system, Some(width), None);
         }
 
-        // Enable word wrapping for comic text
-        buffer.set_wrap(&mut font_system, Wrap::Word);
+        // Enable word wrapping for comic text (WordOrGlyph allows breaking long words)
+        buffer.set_wrap(&mut font_system, Wrap::WordOrGlyph);
 
         let attrs = Attrs::new().family(family).weight(weight);
         buffer.set_text(
@@ -163,6 +163,9 @@ impl CosmicTextRenderer {
     }
 
     /// Render text with advanced shaping and optional stroke
+    ///
+    /// # Arguments
+    /// * `region_bounds` - Optional (min_x, min_y, max_x, max_y) to constrain rendering within specific region
     pub async fn render_text(
         &self,
         img: &mut RgbaImage,
@@ -174,6 +177,7 @@ impl CosmicTextRenderer {
         y: i32,
         max_width: Option<f32>,
         stroke_width: Option<i32>,
+        region_bounds: Option<(i32, i32, i32, i32)>,
     ) -> Result<()> {
         let stroke_color = stroke_width.map(|_| Self::get_stroke_color(color));
 
@@ -198,6 +202,7 @@ impl CosmicTextRenderer {
                             x + offset_x,
                             y + offset_y,
                             max_width,
+                            region_bounds, // Apply region bounds to stroke as well
                         ).await?;
                     }
                 }
@@ -205,13 +210,16 @@ impl CosmicTextRenderer {
         }
 
         // Render fill text
-        self.render_text_internal(img, text, font_family, font_size, color, x, y, max_width).await?;
+        self.render_text_internal(img, text, font_family, font_size, color, x, y, max_width, region_bounds).await?;
 
         Ok(())
     }
 
     /// Internal text rendering implementation
     /// OPTIMIZED: Minimized lock scope to reduce contention (20-30% faster under load)
+    ///
+    /// # Arguments
+    /// * `region_bounds` - Optional (min_x, min_y, max_x, max_y) to constrain rendering within specific region
     async fn render_text_internal(
         &self,
         img: &mut RgbaImage,
@@ -222,6 +230,7 @@ impl CosmicTextRenderer {
         x: i32,
         y: i32,
         max_width: Option<f32>,
+        region_bounds: Option<(i32, i32, i32, i32)>,
     ) -> Result<()> {
         let family = Self::parse_font_family(font_family);
         let weight = Self::is_bold_font(font_family);
@@ -266,7 +275,18 @@ impl CosmicTextRenderer {
                 let img_x = x + px_x;
                 let img_y = y + px_y;
 
-                if img_x >= 0 && img_x < img.width() as i32 && img_y >= 0 && img_y < img.height() as i32 {
+                // Check canvas bounds
+                let within_canvas = img_x >= 0 && img_x < img.width() as i32
+                    && img_y >= 0 && img_y < img.height() as i32;
+
+                // Check region bounds if provided
+                let within_region = if let Some((min_x, min_y, max_x, max_y)) = region_bounds {
+                    img_x >= min_x && img_x < max_x && img_y >= min_y && img_y < max_y
+                } else {
+                    true // No region constraint
+                };
+
+                if within_canvas && within_region {
                     let existing = img.get_pixel(img_x as u32, img_y as u32);
 
                     // Alpha blend
@@ -366,6 +386,7 @@ impl CosmicTextRenderer {
                             x + offset_x,
                             y + y_offset + offset_y,
                             Some(max_width),
+                            None, // No region bounds for stroke
                         ).await?;
                     }
                 }
@@ -373,12 +394,13 @@ impl CosmicTextRenderer {
         }
 
         // Render fill
-        self.render_text_internal(img, text, font_family, font_size, color, x, y + y_offset, Some(max_width)).await?;
+        self.render_text_internal(img, text, font_family, font_size, color, x, y + y_offset, Some(max_width), None).await?;
 
         Ok(())
     }
 
     /// Find optimal font size to fit text in given dimensions
+    /// Includes post-verification to ensure text actually fits (handles long words that exceed max_width)
     pub async fn find_optimal_font_size(
         &self,
         text: &str,
@@ -388,6 +410,10 @@ impl CosmicTextRenderer {
         min_size: f32,
         max_size: f32,
     ) -> Result<f32> {
+        // Use 95% of available space as safety margin to ensure text fits
+        let safe_max_width = max_width * 0.95;
+        let safe_max_height = max_height * 0.95;
+
         let mut low = min_size;
         let mut high = max_size;
         let mut best_size = min_size;
@@ -395,13 +421,57 @@ impl CosmicTextRenderer {
         // Binary search for optimal font size
         for _ in 0..25 {
             let mid = (low + high) / 2.0;
-            let (width, height) = self.measure_text(text, font_family, mid, Some(max_width)).await?;
+            let (width, height) = self.measure_text(text, font_family, mid, Some(safe_max_width)).await?;
 
-            if width <= max_width && height <= max_height {
+            if width <= safe_max_width && height <= safe_max_height {
                 best_size = mid;
                 low = mid; // Try larger
             } else {
                 high = mid; // Try smaller
+            }
+        }
+
+        // Post-verification: Ensure the chosen size actually fits
+        // This handles edge cases where long words exceed max_width despite word wrapping
+        let (final_width, final_height) = self.measure_text(text, font_family, best_size, Some(safe_max_width)).await?;
+
+        if final_width > safe_max_width || final_height > safe_max_height {
+            // Text still doesn't fit! Reduce font size incrementally until it does
+            tracing::warn!(
+                "Text overflow detected after binary search: text={:.50}..., size={:.1}px, actual=({:.1}x{:.1}), max=({:.1}x{:.1})",
+                text,
+                best_size,
+                final_width,
+                final_height,
+                safe_max_width,
+                safe_max_height
+            );
+
+            let mut fallback_size = best_size * 0.9; // Start at 90% of binary search result
+            let absolute_min = min_size * 0.7; // Allow going below min_size as last resort
+
+            while fallback_size >= absolute_min {
+                let (test_width, test_height) = self.measure_text(text, font_family, fallback_size, Some(safe_max_width)).await?;
+
+                if test_width <= safe_max_width && test_height <= safe_max_height {
+                    best_size = fallback_size;
+                    tracing::debug!(
+                        "Overflow resolved by reducing font size to {:.1}px",
+                        best_size
+                    );
+                    break;
+                }
+
+                fallback_size *= 0.95; // Reduce by 5% each iteration
+            }
+
+            // If we still don't fit, use the absolute minimum
+            if fallback_size < absolute_min {
+                best_size = absolute_min;
+                tracing::warn!(
+                    "Text still overflows even at minimum size {:.1}px - text will be clipped",
+                    best_size
+                );
             }
         }
 

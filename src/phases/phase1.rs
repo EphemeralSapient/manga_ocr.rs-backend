@@ -54,13 +54,16 @@ impl Phase1Pipeline {
     /// 3. Validate label 1 regions are within label 0
     /// 4. Categorize simple vs complex backgrounds
     ///
+    /// # Arguments
+    /// * `target_size_override` - Optional target size override for detection model
+    ///
     /// # Returns
     /// Phase1Output with categorized regions
     #[instrument(skip(self, image_data), fields(
         page_index = image_data.index,
         filename = %image_data.filename
     ))]
-    pub async fn execute(&self, image_data: &ImageData, use_mask: bool) -> Result<Phase1Output> {
+    pub async fn execute(&self, image_data: &ImageData, use_mask: bool, target_size_override: Option<u32>) -> Result<Phase1Output> {
         debug!(
             "Phase 1: Processing page {} ({})",
             image_data.index, image_data.filename
@@ -86,7 +89,7 @@ impl Phase1Pipeline {
             // Run both in parallel
             let (detection_result, segmentation_result) =
                 tokio::join!(
-                    self.detector.detect_all_labels(&img, image_data.index),
+                    self.detector.detect_all_labels(&img, image_data.index, target_size_override),
                     self.segmenter.generate_mask(&img)
                 );
 
@@ -95,7 +98,7 @@ impl Phase1Pipeline {
             (l0, l1, l2, mask)
         } else {
             // Only run detection, return empty mask
-            let (l0, l1, l2) = self.detector.detect_all_labels(&img, image_data.index).await
+            let (l0, l1, l2) = self.detector.detect_all_labels(&img, image_data.index, target_size_override).await
                 .context("Failed to detect regions")?;
             // Empty mask as Vec<u8> (same format as generate_mask returns)
             let empty_mask: Vec<u8> = vec![0u8; (img.width() * img.height()) as usize];
@@ -148,10 +151,14 @@ impl Phase1Pipeline {
     /// Returns detection results + decoded images for later segmentation
     ///
     /// This allows Phase 2 to start immediately while segmentation runs in background
+    ///
+    /// # Arguments
+    /// * `target_size_override` - Optional target size override for detection model
     pub async fn execute_detection_only(
         &self,
         images: &[ImageData],
         merge_img: bool,
+        target_size_override: Option<u32>,
     ) -> Result<(Vec<Phase1Output>, Vec<DynamicImage>)> {
         if images.is_empty() {
             return Ok((Vec::new(), Vec::new()));
@@ -185,7 +192,7 @@ impl Phase1Pipeline {
                 .map(|(img, data)| (img, data.index))
                 .collect();
 
-            self.detector.detect_all_labels_batch(&batch_refs).await
+            self.detector.detect_all_labels_batch(&batch_refs, target_size_override).await
                 .context("Batch detection failed")?
         } else {
             debug!("Running PARALLEL detection ({} individual ONNX calls)...", images.len());
@@ -197,7 +204,7 @@ impl Phase1Pipeline {
                     let img_ref = img;
                     let index = data.index;
                     async move {
-                        detector.detect_all_labels(img_ref, index).await
+                        detector.detect_all_labels(img_ref, index, target_size_override).await
                     }
                 })
                 .collect();
@@ -298,7 +305,10 @@ impl Phase1Pipeline {
     /// - merge_img=true: Single batched ONNX inference (faster for multiple images)
     /// - merge_img=false: Individual ONNX inferences in parallel (uses multiple sessions)
     /// - use_mask: Enable/disable segmentation mask generation
-    pub async fn execute_batch(&self, images: &[ImageData], use_mask: bool, merge_img: bool) -> Result<Vec<Phase1Output>> {
+    ///
+    /// # Arguments
+    /// * `target_size_override` - Optional target size override for detection model
+    pub async fn execute_batch(&self, images: &[ImageData], use_mask: bool, merge_img: bool, target_size_override: Option<u32>) -> Result<Vec<Phase1Output>> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -333,7 +343,7 @@ impl Phase1Pipeline {
                 .map(|(img, data)| (img, data.index))
                 .collect();
 
-            self.detector.detect_all_labels_batch(&batch_refs).await
+            self.detector.detect_all_labels_batch(&batch_refs, target_size_override).await
                 .context("Batch detection failed")?
         } else {
             // PARALLEL MODE: Individual ONNX inferences (uses multiple sessions)
@@ -346,7 +356,7 @@ impl Phase1Pipeline {
                     let img_ref = img;
                     let index = data.index;
                     async move {
-                        detector.detect_all_labels(img_ref, index).await
+                        detector.detect_all_labels(img_ref, index, target_size_override).await
                     }
                 })
                 .collect();

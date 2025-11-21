@@ -100,7 +100,7 @@ impl DetectionService {
         let dummy_img = image::DynamicImage::new_rgb8(target_size, target_size);
 
         // Run inference on one session to trigger optimization
-        let (preprocessed, original_size) = self.preprocess_image(&dummy_img);
+        let (preprocessed, original_size) = self.preprocess_image(&dummy_img, None);
 
         let images_value = Value::from_array(preprocessed)?;
         let sizes_value = Value::from_array(original_size)?;
@@ -457,8 +457,25 @@ impl DetectionService {
               count, count * 42);
     }
 
-    fn preprocess_image(&self, img: &DynamicImage) -> (Array4<f32>, Array2<i64>) {
-        let target_size = self.config.target_size();
+    fn preprocess_image(&self, img: &DynamicImage, target_size_override: Option<u32>) -> (Array4<f32>, Array2<i64>) {
+        // Determine target size: use override if provided, otherwise use config default
+        let target_size = match target_size_override {
+            Some(0) => {
+                // 0 means use source resolution (no resizing)
+                debug!("Using source image resolution: {}x{} (no resizing)", img.width(), img.height());
+                // For square target, use the maximum dimension to avoid distortion
+                img.width().max(img.height())
+            }
+            Some(size) => {
+                debug!("Using override target size: {}", size);
+                size
+            }
+            None => {
+                debug!("Using config default target size: {}", self.config.target_size());
+                self.config.target_size()
+            }
+        };
+
         trace!("Preprocessing image: {}x{} → {}x{}",
             img.width(), img.height(),
             target_size, target_size);
@@ -559,15 +576,20 @@ impl DetectionService {
 
     /// Detect ALL regions (all labels) in a single inference pass
     /// This is MUCH more efficient than calling detect_with_label 3 times
+    ///
+    /// # Arguments
+    /// * `target_size_override` - Optional target size override. If None, uses config default.
+    ///                            If Some(0), uses source image resolution (no resizing).
     pub async fn detect_all_labels(
         &self,
         img: &DynamicImage,
         page_index: usize,
+        target_size_override: Option<u32>,
     ) -> Result<(Vec<BubbleDetection>, Vec<BubbleDetection>, Vec<BubbleDetection>)> {
         debug!("🔍 [DETECTION] Starting detection for ALL labels on page {}", page_index);
         let detection_start = std::time::Instant::now();
 
-        let (preprocessed, original_size) = self.preprocess_image(img);
+        let (preprocessed, original_size) = self.preprocess_image(img, target_size_override);
 
         let images_value = Value::from_array(preprocessed)?;
         let sizes_value = Value::from_array(original_size)?;
@@ -662,12 +684,15 @@ impl DetectionService {
     ///
     /// # Arguments
     /// * `images` - Vector of (image, page_index) tuples
+    /// * `target_size_override` - Optional target size override. If None, uses config default.
+    ///                            If Some(0), uses max dimension from batch (no fixed resizing).
     ///
     /// # Returns
     /// Vector of (label_0, label_1, label_2) detection tuples, one per input image
     pub async fn detect_all_labels_batch(
         &self,
         images: &[(&DynamicImage, usize)],
+        target_size_override: Option<u32>,
     ) -> Result<Vec<(Vec<BubbleDetection>, Vec<BubbleDetection>, Vec<BubbleDetection>)>> {
         if images.is_empty() {
             return Ok(Vec::new());
@@ -677,7 +702,26 @@ impl DetectionService {
         debug!("🔍 [BATCH DETECTION] Starting batched detection for {} images", batch_size);
         let detection_start = std::time::Instant::now();
 
-        let target_size = self.config.target_size();
+        // Determine target size: use override if provided, otherwise use config default
+        let target_size = match target_size_override {
+            Some(0) => {
+                // 0 means use source resolution - find max dimension across all images
+                let max_dim = images.iter()
+                    .map(|(img, _)| img.width().max(img.height()))
+                    .max()
+                    .unwrap_or(self.config.target_size());
+                debug!("Using source resolution (batch max dimension): {}", max_dim);
+                max_dim
+            }
+            Some(size) => {
+                debug!("Using override target size for batch: {}", size);
+                size
+            }
+            None => {
+                debug!("Using config default target size for batch: {}", self.config.target_size());
+                self.config.target_size()
+            }
+        };
         let target = target_size as usize;
 
         // Preprocess all images and stack into batch tensor
@@ -826,7 +870,7 @@ impl DetectionService {
             target_label, label_name, page_index);
         let detection_start = std::time::Instant::now();
 
-        let (preprocessed, original_size) = self.preprocess_image(img);
+        let (preprocessed, original_size) = self.preprocess_image(img, None);
 
         let images_value = Value::from_array(preprocessed)?;
         let sizes_value = Value::from_array(original_size)?;
