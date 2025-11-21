@@ -82,11 +82,48 @@ jobs:
       - name: Build release binary (${{ matrix.variant.name }})
         run: cargo build --release --locked --target x86_64-pc-windows-msvc ${{ matrix.variant.features }}
 
+      - name: Bundle ONNX Runtime DLLs for CUDA build
+        if: matrix.variant.name == 'cuda'
+        run: |
+          $targetDir = "target\x86_64-pc-windows-msvc\release"
+          $bundleDir = "bundle-cuda"
+          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+
+          # Copy executable
+          Copy-Item "$targetDir\manga_workflow.exe" "$bundleDir\"
+
+          # Copy ONNX Runtime DLLs (required for CUDA execution provider)
+          $requiredDlls = @(
+            "onnxruntime.dll",
+            "onnxruntime_providers_shared.dll",
+            "onnxruntime_providers_cuda.dll"
+          )
+
+          foreach ($dll in $requiredDlls) {
+            if (Test-Path "$targetDir\$dll") {
+              Copy-Item "$targetDir\$dll" "$bundleDir\"
+              Write-Host "✓ Bundled: $dll"
+            } else {
+              Write-Host "✗ Missing: $dll - checking deps directory..."
+              $depsPath = "$targetDir\deps\$dll"
+              if (Test-Path $depsPath) {
+                Copy-Item $depsPath "$bundleDir\"
+                Write-Host "✓ Bundled from deps: $dll"
+              } else {
+                Write-Warning "Missing required DLL: $dll"
+              }
+            }
+          }
+
+          Write-Host "`nBundle contents:"
+          Get-ChildItem $bundleDir | Format-Table Name, Length
+
       - name: Upload artifact (${{ matrix.variant.name }})
         uses: actions/upload-artifact@v4
         with:
           name: manga_workflow-windows-x86_64-${{ matrix.variant.suffix }}
-          path: target/x86_64-pc-windows-msvc/release/manga_workflow.exe
+          path: |
+            ${{ matrix.variant.name == 'cuda' && 'bundle-cuda/*' || 'target/x86_64-pc-windows-msvc/release/manga_workflow.exe' }}
 
   release:
     name: Create Release
@@ -103,11 +140,26 @@ jobs:
       - name: Prepare release files
         run: |
           mkdir -p release
+
+          # Standard builds (single .exe files)
           mv binaries/manga_workflow-windows-x86_64-standard/manga_workflow.exe release/manga_workflow_standard.exe
           mv binaries/manga_workflow-windows-x86_64-directml/manga_workflow.exe release/manga_workflow_directml.exe
           mv binaries/manga_workflow-windows-x86_64-openvino/manga_workflow.exe release/manga_workflow_openvino.exe
-          mv binaries/manga_workflow-windows-x86_64-cuda/manga_workflow.exe release/manga_workflow_cuda.exe
+
+          # CUDA build (bundle with DLLs)
+          mkdir -p release/cuda-bundle
+          cp -r binaries/manga_workflow-windows-x86_64-cuda/* release/cuda-bundle/
+
+          # Create CUDA zip archive (includes exe + required ONNX Runtime DLLs)
+          cd release/cuda-bundle
+          zip -r ../manga_workflow_cuda.zip .
+          cd ../..
+
+          echo "Release files:"
           ls -lh release/
+          echo ""
+          echo "CUDA bundle contents:"
+          ls -lh release/cuda-bundle/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -116,7 +168,7 @@ jobs:
             release/manga_workflow_standard.exe
             release/manga_workflow_directml.exe
             release/manga_workflow_openvino.exe
-            release/manga_workflow_cuda.exe
+            release/manga_workflow_cuda.zip
           draft: false
           prerelease: false
           body: |
@@ -124,15 +176,28 @@ jobs:
             - `manga_workflow_standard.exe` - CPU only
             - `manga_workflow_directml.exe` - DirectML GPU acceleration (AMD/Intel/NVIDIA)
             - `manga_workflow_openvino.exe` - OpenVINO optimization (Intel CPUs)
-            - `manga_workflow_cuda.exe` - CUDA GPU acceleration (NVIDIA)
+            - `manga_workflow_cuda.zip` - CUDA GPU acceleration (NVIDIA) - **Extract entire zip to preserve DLLs**
 
             ## Installation
-            1. Clone the repository: `git clone <repo-url>`
-            2. Install Git LFS: `git lfs install && git lfs pull`
-            3. Build with: `cargo build --release --features directml`
-            4. DirectML.dll v1.15.4 is auto-copied to output (fixes System32 v1.8 conflict)
 
-            ## Pre-built Binaries
-            Download executables above and clone repo to get required libraries (DirectML.dll via Git LFS).
+            ### Standard/DirectML/OpenVINO Builds
+            1. Download the `.exe` file
+            2. Clone the repository: `git clone <repo-url>`
+            3. Install Git LFS: `git lfs install && git lfs pull`
+            4. Run the executable from the repo directory
+
+            ### CUDA Build
+            1. Download `manga_workflow_cuda.zip`
+            2. **Extract the entire zip** - includes required ONNX Runtime DLLs:
+               - `onnxruntime.dll`
+               - `onnxruntime_providers_shared.dll`
+               - `onnxruntime_providers_cuda.dll`
+            3. Clone the repository: `git clone <repo-url>`
+            4. Install Git LFS: `git lfs install && git lfs pull`
+            5. Run `manga_workflow.exe` from the extracted folder
+
+            ## Building from Source
+            - DirectML: `cargo build --release --features directml`
+            - CUDA: `cargo build --release --features cuda` (DLLs auto-downloaded by ort crate)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -41,6 +41,39 @@ fn main() {
 
     if env::var("CARGO_FEATURE_CUDA").is_ok() {
         gpu_features.push("CUDA");
+
+        // Copy ONNX Runtime CUDA DLLs to output directory
+        // The ort crate downloads these during build, but they need to be distributed with the executable
+        if target.contains("windows") {
+            let out_dir = env::var("OUT_DIR").unwrap();
+            let profile = env::var("PROFILE").unwrap();
+
+            // Calculate target directory (e.g., target/x86_64-pc-windows-msvc/release)
+            let target_dir = std::path::Path::new(&out_dir)
+                .ancestors()
+                .nth(3)
+                .unwrap()
+                .join(&profile);
+
+            // ONNX Runtime DLLs are placed by ort crate in target directory
+            // We need to find and note their locations for the workflow to bundle them
+            let required_dlls = vec![
+                "onnxruntime.dll",
+                "onnxruntime_providers_shared.dll",
+                "onnxruntime_providers_cuda.dll",
+            ];
+
+            println!("cargo:warning=CUDA build requires these DLLs to be distributed with executable:");
+            for dll in &required_dlls {
+                let dll_path = target_dir.join(dll);
+                if dll_path.exists() {
+                    println!("cargo:warning=  ✓ Found: {}", dll);
+                } else {
+                    println!("cargo:warning=  ✗ Missing: {} (will be downloaded by ort during build)", dll);
+                }
+            }
+            println!("cargo:warning=Ensure GitHub workflow bundles these DLLs with the executable!");
+        }
     }
     if env::var("CARGO_FEATURE_TENSORRT").is_ok() {
         gpu_features.push("TensorRT");
