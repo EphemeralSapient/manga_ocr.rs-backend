@@ -269,14 +269,14 @@ pub fn build_session_with_acceleration(
         // IMPORTANT: DirectML requires specific settings for stability
         // - parallel_execution(false): Sequential execution required
         // - memory_pattern(false): Memory pattern must be disabled
-        // - Level1 optimization: Conservative optimization level for stability
+        // - Level2 optimization: Balanced optimization for better performance
         if let Ok(session) = Session::builder()
             .and_then(|b| b.with_execution_providers([
                 DirectMLExecutionProvider::default().build()  // GPU acceleration only
             ]))
             .and_then(|b| b.with_parallel_execution(false))  // REQUIRED: Sequential execution
             .and_then(|b| b.with_memory_pattern(false))      // Disable memory pattern for stability
-            .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level1))
+            .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level2))
             .and_then(|b| b.with_intra_threads(optimal_intra_op_threads()))
             .and_then(|b| b.with_inter_threads(1))
             .and_then(|b| b.commit_from_memory(model_bytes))

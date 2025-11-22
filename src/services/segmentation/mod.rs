@@ -220,7 +220,15 @@ impl SegmentationService {
     }
 
     /// Drain all sessions and free memory (call after phase 1 complete)
+    ///
+    /// IMPORTANT: DirectML keeps persistent sessions (no cleanup)
     pub fn cleanup_sessions(&self) {
+        // DirectML: Keep persistent session (no cleanup/recreation overhead)
+        if self.is_directml() {
+            debug!("DirectML: Keeping persistent segmentation session (no cleanup)");
+            return;
+        }
+
         let sessions = self.session_pool.drain_all();
         let count = sessions.len();
         drop(sessions); // Explicit drop to ensure memory is freed

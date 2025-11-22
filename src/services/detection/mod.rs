@@ -183,7 +183,7 @@ impl DetectionService {
                     ])?
                     .with_parallel_execution(false)?   // REQUIRED: Sequential execution
                     .with_memory_pattern(false)?       // Disable memory pattern for stability
-                    .with_optimization_level(GraphOptimizationLevel::Level1)?
+                    .with_optimization_level(GraphOptimizationLevel::Level2)?
                     .with_intra_threads(num_cpus::get())?
                     .commit_from_memory(model_bytes)?;
                 info!("✓ Successfully initialized DirectML backend (GPU-only, no CPU fallback)");
@@ -337,7 +337,7 @@ impl DetectionService {
                 ]))
                 .and_then(|b| b.with_parallel_execution(false))  // REQUIRED: Sequential execution
                 .and_then(|b| b.with_memory_pattern(false))      // Disable memory pattern for stability
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level1))
+                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level2))
                 .and_then(|b| b.with_intra_threads(num_cpus::get()))
                 .and_then(|b| b.commit_from_memory(&model_bytes))
             {
@@ -407,7 +407,14 @@ impl DetectionService {
 
     /// Expand session pool if under capacity (lazy allocation)
     /// Expands aggressively when high contention detected
+    ///
+    /// IMPORTANT: DirectML processes sequentially, so pool expansion is disabled
     fn expand_if_needed(&self) {
+        // DirectML can only use 1 session at a time (sequential processing)
+        if self.is_directml() {
+            return;
+        }
+
         let available = self.session_pool.available();
         let in_use = self.session_pool.in_use();
         let total = available + in_use;
@@ -447,7 +454,15 @@ impl DetectionService {
     }
 
     /// Drain all sessions and free memory (call after phase 1 complete)
+    ///
+    /// IMPORTANT: DirectML keeps persistent sessions (no cleanup)
     pub fn cleanup_sessions(&self) {
+        // DirectML: Keep persistent session (no cleanup/recreation overhead)
+        if self.is_directml() {
+            debug!("DirectML: Keeping persistent detection session (no cleanup)");
+            return;
+        }
+
         let sessions = self.session_pool.drain_all();
         let count = sessions.len();
         drop(sessions); // Explicit drop to ensure memory is freed
