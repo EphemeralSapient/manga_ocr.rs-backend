@@ -203,7 +203,7 @@ impl Phase4Pipeline {
         text_stroke: bool,
     ) -> Result<()> {
         // Load cleaned region image
-        let mut cleaned_img = image::load_from_memory(cleaned_bytes)
+        let cleaned_img = image::load_from_memory(cleaned_bytes)
             .context("Failed to load cleaned region")?
             .to_rgba8();
 
@@ -218,6 +218,7 @@ impl Phase4Pipeline {
         }
 
         // Render text on transparent canvas using local coordinates
+        // Note: text_canvas is now expanded to allow overflow
         let text_canvas = self.render_text_for_region(
             width,
             height,
@@ -227,22 +228,34 @@ impl Phase4Pipeline {
             text_stroke,
         ).await?;
 
+        // Calculate expansion margin (50% on each side)
+        let overflow_margin = 0.5;
+        let margin_x = (width as f32 * overflow_margin) as u32;
+        let margin_y = (height as f32 * overflow_margin) as u32;
+        let expanded_width = text_canvas.width();
+        let expanded_height = text_canvas.height();
+
+        // Expand cleaned_img to match text_canvas size by placing it in center with transparent margins
+        let mut expanded_cleaned = ImageBuffer::from_pixel(
+            expanded_width,
+            expanded_height,
+            Rgba([0, 0, 0, 0]),
+        );
+        image::imageops::overlay(&mut expanded_cleaned, &cleaned_img, margin_x as i64, margin_y as i64);
+
         // OPTIMIZATION: Parallelize alpha blending using rayon with pre-allocated buffer
-        // For 640x640 region, this is 409,600 pixels. Parallel processing
-        // provides ~10-15% speedup on multi-core systems.
-        // Pre-allocate buffer and process rows in parallel
-        let total_pixels = (width * height) as usize;
+        let total_pixels = (expanded_width * expanded_height) as usize;
         let mut img_data = Vec::with_capacity(total_pixels * 4);
 
-        let row_data: Vec<Vec<u8>> = (0..height)
+        let row_data: Vec<Vec<u8>> = (0..expanded_height)
             .into_par_iter()
             .map(|y| {
-                let mut row_bytes = Vec::with_capacity((width * 4) as usize);
-                for x in 0..width {
+                let mut row_bytes = Vec::with_capacity((expanded_width * 4) as usize);
+                for x in 0..expanded_width {
                     let text_pixel = text_canvas.get_pixel(x, y);
                     if text_pixel[3] > 0 {
                         // Has alpha - blend it
-                        let bg_pixel = cleaned_img.get_pixel(x, y);
+                        let bg_pixel = expanded_cleaned.get_pixel(x, y);
                         let alpha = text_pixel[3] as f32 / 255.0;
 
                         row_bytes.push(((text_pixel[0] as f32 * alpha) + (bg_pixel[0] as f32 * (1.0 - alpha))) as u8);
@@ -251,7 +264,7 @@ impl Phase4Pipeline {
                         row_bytes.push(255u8);
                     } else {
                         // No alpha - keep background
-                        let bg = cleaned_img.get_pixel(x, y);
+                        let bg = expanded_cleaned.get_pixel(x, y);
                         row_bytes.push(bg[0]);
                         row_bytes.push(bg[1]);
                         row_bytes.push(bg[2]);
@@ -267,12 +280,14 @@ impl Phase4Pipeline {
             img_data.extend_from_slice(&row);
         }
 
-        // Replace cleaned_img pixels with blended result
-        cleaned_img = ImageBuffer::from_vec(width, height, img_data)
+        // Create blended result with expanded size
+        let blended_result = ImageBuffer::from_vec(expanded_width, expanded_height, img_data)
             .context("Failed to create blended image buffer")?;
 
-        // Paste composited result onto final image
-        image::imageops::overlay(final_image, &cleaned_img, x1 as i64, y1 as i64);
+        // Paste expanded composited result onto final image (offset by margin)
+        let paste_x = (x1 as i64) - (margin_x as i64);
+        let paste_y = (y1 as i64) - (margin_y as i64);
+        image::imageops::overlay(final_image, &blended_result, paste_x, paste_y);
 
         Ok(())
     }
@@ -380,8 +395,15 @@ impl Phase4Pipeline {
             self.config.upscale_factor()  // Use fixed upscale factor
         };
 
-        let upscaled_width = canvas_width * upscale_factor;
-        let upscaled_height = canvas_height * upscale_factor;
+        // Expand canvas by 50% on all sides to allow text overflow without clipping
+        let overflow_margin = 0.5;
+        let margin_x = (canvas_width as f32 * overflow_margin) as u32;
+        let margin_y = (canvas_height as f32 * overflow_margin) as u32;
+        let expanded_width = canvas_width + margin_x * 2;
+        let expanded_height = canvas_height + margin_y * 2;
+
+        let upscaled_width = expanded_width * upscale_factor;
+        let upscaled_height = expanded_height * upscale_factor;
 
         let mut upscaled_canvas = ImageBuffer::from_pixel(
             upscaled_width,
@@ -405,9 +427,9 @@ impl Phase4Pipeline {
         let center_offset_x = ((text_width - actual_text_width) / 2.0).max(padding_pixels_x as f32);
         let center_offset_y = ((text_height - actual_text_height) / 2.0).max(padding_pixels_y as f32);
 
-        // Render text on upscaled canvas at calculated position
-        let scaled_x = ((min_x as f32 + center_offset_x) * upscale_factor as f32) as i32;
-        let scaled_y = ((min_y as f32 + center_offset_y) * upscale_factor as f32) as i32;
+        // Render text on upscaled canvas at calculated position (accounting for margin)
+        let scaled_x = ((min_x as f32 + center_offset_x + margin_x as f32) * upscale_factor as f32) as i32;
+        let scaled_y = ((min_y as f32 + center_offset_y + margin_y as f32) * upscale_factor as f32) as i32;
         let scaled_font_size = font_size * upscale_factor as f32;
         let scaled_max_width = Some(text_width * upscale_factor as f32);
 
@@ -435,11 +457,11 @@ impl Phase4Pipeline {
             region_bounds,
         ).await?;
 
-        // Downscale back
+        // Downscale back (keep expanded size to allow text overflow)
         let final_canvas = image::imageops::resize(
             &upscaled_canvas,
-            canvas_width,
-            canvas_height,
+            expanded_width,
+            expanded_height,
             image::imageops::FilterType::Lanczos3,
         );
 

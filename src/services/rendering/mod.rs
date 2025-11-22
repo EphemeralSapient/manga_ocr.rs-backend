@@ -273,7 +273,7 @@ impl CosmicTextRenderer {
         y: i32,
         max_width: Option<f32>,
         stroke_width: Option<i32>,
-        region_bounds: Option<(i32, i32, i32, i32)>,
+        _region_bounds: Option<(i32, i32, i32, i32)>,
     ) -> Result<()> {
         let stroke_color = stroke_width.map(|_| Self::get_stroke_color(color));
 
@@ -298,7 +298,7 @@ impl CosmicTextRenderer {
                             x + offset_x,
                             y + offset_y,
                             max_width,
-                            region_bounds, // Apply region bounds to stroke as well
+                            _region_bounds, // Apply region bounds to stroke as well
                         ).await?;
                     }
                 }
@@ -306,7 +306,7 @@ impl CosmicTextRenderer {
         }
 
         // Render fill text
-        self.render_text_internal(img, text, font_family, font_size, color, x, y, max_width, region_bounds).await?;
+        self.render_text_internal(img, text, font_family, font_size, color, x, y, max_width, _region_bounds).await?;
 
         Ok(())
     }
@@ -327,7 +327,7 @@ impl CosmicTextRenderer {
         x: i32,
         y: i32,
         max_width: Option<f32>,
-        region_bounds: Option<(i32, i32, i32, i32)>,
+        _region_bounds: Option<(i32, i32, i32, i32)>,
     ) -> Result<()> {
         let family = Self::parse_font_family(font_family);
         let weight = Self::is_bold_font(font_family);
@@ -375,18 +375,10 @@ impl CosmicTextRenderer {
                 let img_x = x + px_x;
                 let img_y = y + px_y;
 
-                // Check canvas bounds
-                let within_canvas = img_x >= 0 && img_x < img.width() as i32
-                    && img_y >= 0 && img_y < img.height() as i32;
-
-                // Check region bounds if provided
-                let within_region = if let Some((min_x, min_y, max_x, max_y)) = region_bounds {
-                    img_x >= min_x && img_x < max_x && img_y >= min_y && img_y < max_y
-                } else {
-                    true // No region constraint
-                };
-
-                if within_canvas && within_region {
+                // Only check bounds to prevent crashes, don't clip text rendering
+                // Text can now overflow freely without being clipped
+                if img_x >= 0 && img_x < img.width() as i32
+                    && img_y >= 0 && img_y < img.height() as i32 {
                     let existing = img.get_pixel(img_x as u32, img_y as u32);
 
                     // Alpha blend

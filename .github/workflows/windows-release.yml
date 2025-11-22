@@ -108,25 +108,14 @@ jobs:
         run: |
           mkdir -p release
 
-          # Standard builds (single .exe files)
+          # All builds (single .exe files)
           mv binaries/manga_workflow-windows-x86_64-standard/manga_workflow.exe release/manga_workflow_standard.exe
           mv binaries/manga_workflow-windows-x86_64-directml/manga_workflow.exe release/manga_workflow_directml.exe
           mv binaries/manga_workflow-windows-x86_64-openvino/manga_workflow.exe release/manga_workflow_openvino.exe
-
-          # CUDA build (bundle with DLLs)
-          mkdir -p release/cuda-bundle
-          cp -r binaries/manga_workflow-windows-x86_64-cuda/* release/cuda-bundle/
-
-          # Create CUDA zip archive (includes exe + required ONNX Runtime DLLs)
-          cd release/cuda-bundle
-          zip -r ../manga_workflow_cuda.zip .
-          cd ../..
+          mv binaries/manga_workflow-windows-x86_64-cuda/manga_workflow.exe release/manga_workflow_cuda.exe
 
           echo "Release files:"
           ls -lh release/
-          echo ""
-          echo "CUDA bundle contents:"
-          ls -lh release/cuda-bundle/
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -135,7 +124,7 @@ jobs:
             release/manga_workflow_standard.exe
             release/manga_workflow_directml.exe
             release/manga_workflow_openvino.exe
-            release/manga_workflow_cuda.zip
+            release/manga_workflow_cuda.exe
           draft: false
           prerelease: false
           body: |
@@ -143,26 +132,18 @@ jobs:
             - `manga_workflow_standard.exe` - CPU only
             - `manga_workflow_directml.exe` - DirectML GPU acceleration (AMD/Intel/NVIDIA)
             - `manga_workflow_openvino.exe` - OpenVINO optimization (Intel CPUs)
-            - `manga_workflow_cuda.zip` - CUDA GPU acceleration (NVIDIA) - **Extract entire zip to preserve DLLs**
+            - `manga_workflow_cuda.exe` - CUDA GPU acceleration (NVIDIA)
 
             ## Installation
-
-            ### Standard/DirectML/OpenVINO Builds
-            1. Download the `.exe` file
+            1. Download the `.exe` file for your preferred backend
             2. Clone the repository: `git clone <repo-url>`
             3. Install Git LFS: `git lfs install && git lfs pull`
             4. Run the executable from the repo directory
 
-            ### CUDA Build
-            1. Download `manga_workflow_cuda.zip`
-            2. **Extract the entire zip** - includes required ONNX Runtime DLL:
-               - `onnxruntime.dll`
-            3. Clone the repository: `git clone <repo-url>`
-            4. Install Git LFS: `git lfs install && git lfs pull`
-            5. Run `manga_workflow.exe` from the extracted folder
-
             ## Building from Source
+            - Standard (CPU): `cargo build --release`
             - DirectML: `cargo build --release --features directml`
-            - CUDA: `cargo build --release --features cuda` (DLLs auto-downloaded by ort crate)
+            - OpenVINO: `cargo build --release --features openvino`
+            - CUDA: `cargo build --release --features cuda`
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

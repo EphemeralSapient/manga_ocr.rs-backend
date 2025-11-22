@@ -294,21 +294,42 @@ impl Phase1Pipeline {
             return Ok(());
         }
 
-        debug!("Running segmentation for {} images in parallel...", decoded_images.len());
         let seg_start = std::time::Instant::now();
+        let is_directml = self.segmenter.is_directml();
 
-        let segmentation_tasks: Vec<_> = decoded_images.iter().map(|img| {
-            self.segmenter.generate_mask(img)
-        }).collect();
+        if is_directml {
+            // DirectML: Sequential processing through single session (no parallelism)
+            debug!("Running segmentation for {} images sequentially (DirectML)...", decoded_images.len());
 
-        let segmentation_results = futures::future::join_all(segmentation_tasks).await;
-        debug!("✓ Segmentation completed in {:.2}ms", seg_start.elapsed().as_secs_f64() * 1000.0);
+            let mut segmentation_results = Vec::with_capacity(decoded_images.len());
+            for img in decoded_images.iter() {
+                let mask = self.segmenter.generate_mask(img).await
+                    .context("Failed to generate segmentation mask")?;
+                segmentation_results.push(mask);
+            }
 
-        // Update outputs with segmentation masks
-        for (i, seg_result) in segmentation_results.into_iter().enumerate() {
-            let mask = seg_result.context("Failed to generate segmentation mask")?;
-            outputs[i].segmentation_mask = mask;
+            // Update outputs with segmentation masks
+            for (i, mask) in segmentation_results.into_iter().enumerate() {
+                outputs[i].segmentation_mask = mask;
+            }
+        } else {
+            // Non-DirectML: Parallel processing
+            debug!("Running segmentation for {} images in parallel...", decoded_images.len());
+
+            let segmentation_tasks: Vec<_> = decoded_images.iter().map(|img| {
+                self.segmenter.generate_mask(img)
+            }).collect();
+
+            let segmentation_results = futures::future::join_all(segmentation_tasks).await;
+
+            // Update outputs with segmentation masks
+            for (i, seg_result) in segmentation_results.into_iter().enumerate() {
+                let mask = seg_result.context("Failed to generate segmentation mask")?;
+                outputs[i].segmentation_mask = mask;
+            }
         }
+
+        debug!("✓ Segmentation completed in {:.2}ms", seg_start.elapsed().as_secs_f64() * 1000.0);
 
         Ok(())
     }
@@ -387,15 +408,31 @@ impl Phase1Pipeline {
                detection_start.elapsed().as_secs_f64() * 1000.0,
                if merge_img { "BATCH" } else { "PARALLEL" });
 
-        // Run segmentation in parallel for each image (only if use_mask is true)
+        // Run segmentation for each image (only if use_mask is true)
         let segmentation_results: Vec<Result<Vec<u8>, anyhow::Error>> = if use_mask {
-            debug!("Running segmentation for {} images in parallel...", images.len());
             let seg_start = std::time::Instant::now();
-            let segmentation_tasks: Vec<_> = decoded_images.iter().map(|img| {
-                self.segmenter.generate_mask(img)
-            }).collect();
+            let is_directml = self.segmenter.is_directml();
 
-            let results = futures::future::join_all(segmentation_tasks).await;
+            let results = if is_directml {
+                // DirectML: Sequential processing through single session (no parallelism)
+                debug!("Running segmentation for {} images sequentially (DirectML)...", images.len());
+
+                let mut masks = Vec::with_capacity(decoded_images.len());
+                for img in decoded_images.iter() {
+                    masks.push(self.segmenter.generate_mask(img).await);
+                }
+                masks
+            } else {
+                // Non-DirectML: Parallel processing
+                debug!("Running segmentation for {} images in parallel...", images.len());
+
+                let segmentation_tasks: Vec<_> = decoded_images.iter().map(|img| {
+                    self.segmenter.generate_mask(img)
+                }).collect();
+
+                futures::future::join_all(segmentation_tasks).await
+            };
+
             debug!("✓ Segmentation completed in {:.2}ms", seg_start.elapsed().as_secs_f64() * 1000.0);
             results
         } else {
