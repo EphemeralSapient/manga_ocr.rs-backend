@@ -150,151 +150,202 @@ impl ApiClient {
 
         let start = Instant::now();
 
-        // Get API key (either pinned or healthy round-robin)
-        let (key_idx, api_key) = if let Some(idx) = pinned_key_index {
-            self.api_key_pool
-                .get_key_by_index(idx)
-                .await
-                .context(format!("API key {} is not available", idx))?
-        } else {
-            self.api_key_pool
-                .get_healthy_key()
-                .await
-                .context("No healthy API keys available")?
-        };
+        // Try with different keys until success or all keys exhausted
+        let max_key_attempts = self.api_key_pool.total_keys().await.max(1);
+        let mut last_error = None;
 
-        // Prepare request
-        let model = model_override.unwrap_or_else(|| self.config.ocr_translation_model());
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model, api_key
-        );
+        for attempt in 0..max_key_attempts {
+            // Get API key (either pinned on first attempt, or any healthy key)
+            let key_result = if attempt == 0 && pinned_key_index.is_some() {
+                self.api_key_pool
+                    .get_key_by_index(pinned_key_index.unwrap())
+                    .await
+            } else {
+                self.api_key_pool
+                    .get_healthy_key()
+                    .await
+            };
 
-        // Build multipart content with all images
-        // OPTIMIZATION: Parallel base64 encoding (10-15% faster for batches >5)
-        let contents: Vec<_> = image_bytes_batch
-            .par_iter()
-            .map(|image_bytes| {
-                let base64_image = general_purpose::STANDARD.encode(image_bytes);
-                serde_json::json!({
-                    "inline_data": {
-                        "mime_type": "image/png",
-                        "data": base64_image
+            let (key_idx, api_key) = match key_result {
+                Some((idx, key)) => {
+                    if attempt > 0 {
+                        debug!("Retrying with API key {} (attempt {}/{})", idx, attempt + 1, max_key_attempts);
                     }
-                })
-            })
-            .collect();
+                    (idx, key)
+                },
+                None => {
+                    if attempt > 0 {
+                        debug!("No healthy keys available on attempt {}/{}, waiting 10s before retry", attempt + 1, max_key_attempts);
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        continue;
+                    } else {
+                        anyhow::bail!("No healthy API keys available");
+                    }
+                }
+            };
 
-        let mut contents = contents;
+            // Prepare request
+            let model = model_override.unwrap_or_else(|| self.config.ocr_translation_model());
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                model, api_key
+            );
 
-        // Add text prompt with target language
-        let target_lang = target_language.unwrap_or("English");
-        let prompt = format!(
-            "For each image provided, extract the original text found in the image and translate it to {}. \
-             Return a JSON array with {} objects, each containing 'original_text' and 'translated_text' fields. \
-             Maintain the order of images. If no text is found, use empty strings.",
-            target_lang,
-            image_bytes_batch.len()
-        );
-        contents.push(serde_json::json!({"text": prompt}));
-
-        let mut request_body = serde_json::json!({
-            "contents": [{
-                "parts": contents
-            }],
-            "generationConfig": {
-                "response_mime_type": "application/json",
-                "response_schema": {
-                    "type": "object",
-                    "properties": {
-                        "translations": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "original_text": {"type": "string"},
-                                    "translated_text": {"type": "string"}
-                                },
-                                "required": ["original_text", "translated_text"]
-                            }
+            // Build multipart content with all images
+            // OPTIMIZATION: Parallel base64 encoding (10-15% faster for batches >5)
+            let contents: Vec<_> = image_bytes_batch
+                .par_iter()
+                .map(|image_bytes| {
+                    let base64_image = general_purpose::STANDARD.encode(image_bytes);
+                    serde_json::json!({
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": base64_image
                         }
-                    },
-                    "required": ["translations"]
-                }
-            }
-        });
-
-        // Disable thinking by default for faster responses and lower token usage
-        // Can be enabled via GEMINI_ENABLE_THINKING=true environment variable
-        let enable_thinking = std::env::var("GEMINI_ENABLE_THINKING")
-            .ok()
-            .and_then(|s| s.parse::<bool>().ok())
-            .unwrap_or(false);
-
-        if !enable_thinking {
-            // For Gemini 2.5+, disable thinking by setting thinking_budget to 0
-            request_body["generationConfig"]["thinkingConfig"] = serde_json::json!({
-                "thinking_budget": 0
-            });
-        }
-
-        // Send request with retries
-        let result = self
-            .send_with_retries(&url, &request_body, key_idx)
-            .await;
-
-        let duration = start.elapsed();
-
-        match result {
-            Ok(response_text) => {
-                // Record success
-                self.circuit_breaker.record_success();
-                self.api_key_pool.record_success(key_idx).await;
-
-                // Parse response
-                let response: serde_json::Value = serde_json::from_str(&response_text)
-                    .context("Failed to parse API response")?;
-
-                // Extract token usage if available
-                let (input_tokens, output_tokens) = extract_token_usage(&response);
-
-                // Record metrics
-                if let Some(ref m) = self.metrics {
-                    m.record_api_call(true, duration, input_tokens, output_tokens);
-                }
-
-                // Extract translations
-                let translations_json = response["candidates"][0]["content"]["parts"][0]["text"]
-                    .as_str()
-                    .context("Missing text in API response")?;
-
-                let batch_response: BatchOCRResponse = serde_json::from_str(translations_json)
-                    .context("Failed to parse batch OCR response")?;
-
-                // Convert to OCRTranslation with Arc<str> for efficient cloning
-                let results = batch_response
-                    .translations
-                    .into_iter()
-                    .map(|t| OCRTranslation {
-                        original_text: Arc::from(t.original_text.as_str()),
-                        translated_text: Arc::from(t.translated_text.as_str()),
                     })
-                    .collect();
+                })
+                .collect();
 
-                Ok(results)
-            }
-            Err(e) => {
-                // Record failure
-                self.circuit_breaker.record_failure();
-                self.api_key_pool.record_failure(key_idx).await;
+            let mut contents = contents;
 
-                if let Some(ref m) = self.metrics {
-                    m.record_api_call(false, duration, 0, 0);
+            // Add text prompt with target language
+            let target_lang = target_language.unwrap_or("English");
+            let prompt = format!(
+                "For each image provided, extract the original text found in the image and translate it to {}. \
+                 Return a JSON array with {} objects, each containing 'original_text' and 'translated_text' fields. \
+                 Maintain the order of images. If no text is found, use empty strings.",
+                target_lang,
+                image_bytes_batch.len()
+            );
+            contents.push(serde_json::json!({"text": prompt}));
+
+            let mut request_body = serde_json::json!({
+                "contents": [{
+                    "parts": contents
+                }],
+                "generationConfig": {
+                    "response_mime_type": "application/json",
+                    "response_schema": {
+                        "type": "object",
+                        "properties": {
+                            "translations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "original_text": {"type": "string"},
+                                        "translated_text": {"type": "string"}
+                                    },
+                                    "required": ["original_text", "translated_text"]
+                                }
+                            }
+                        },
+                        "required": ["translations"]
+                    }
                 }
+            });
 
-                Err(e)
+            // Disable thinking by default for faster responses and lower token usage
+            // Can be enabled via GEMINI_ENABLE_THINKING=true environment variable
+            let enable_thinking = std::env::var("GEMINI_ENABLE_THINKING")
+                .ok()
+                .and_then(|s| s.parse::<bool>().ok())
+                .unwrap_or(false);
+
+            if !enable_thinking {
+                // For Gemini 2.5+, disable thinking by setting thinking_budget to 0
+                request_body["generationConfig"]["thinkingConfig"] = serde_json::json!({
+                    "thinking_budget": 0
+                });
+            }
+
+            // Send request with retries
+            let result = self
+                .send_with_retries(&url, &request_body, key_idx)
+                .await;
+
+            let duration = start.elapsed();
+
+            match result {
+                Ok(response_text) => {
+                    // Record success
+                    self.circuit_breaker.record_success();
+                    self.api_key_pool.record_success(key_idx).await;
+
+                    // Parse response
+                    let response: serde_json::Value = serde_json::from_str(&response_text)
+                        .context("Failed to parse API response")?;
+
+                    // Extract token usage if available
+                    let (input_tokens, output_tokens) = extract_token_usage(&response);
+
+                    // Record metrics
+                    if let Some(ref m) = self.metrics {
+                        m.record_api_call(true, duration, input_tokens, output_tokens);
+                    }
+
+                    // Extract translations
+                    let translations_json = response["candidates"][0]["content"]["parts"][0]["text"]
+                        .as_str()
+                        .context("Missing text in API response")?;
+
+                    let batch_response: BatchOCRResponse = serde_json::from_str(translations_json)
+                        .context("Failed to parse batch OCR response")?;
+
+                    // Convert to OCRTranslation with Arc<str> for efficient cloning
+                    let results = batch_response
+                        .translations
+                        .into_iter()
+                        .map(|t| OCRTranslation {
+                            original_text: Arc::from(t.original_text.as_str()),
+                            translated_text: Arc::from(t.translated_text.as_str()),
+                        })
+                        .collect();
+
+                    return Ok(results);
+                }
+                Err(e) => {
+                    // Record failure
+                    self.circuit_breaker.record_failure();
+                    self.api_key_pool.record_failure(key_idx).await;
+
+                    if let Some(ref m) = self.metrics {
+                        m.record_api_call(false, duration, 0, 0);
+                    }
+
+                    // Check if this is a retryable error (429, 503)
+                    let error_string = e.to_string();
+                    let is_rate_limit = error_string.contains("429") || error_string.contains("quota");
+                    let is_overload = error_string.contains("503") || error_string.contains("overload");
+
+                    if is_rate_limit || is_overload {
+                        warn!(
+                            "API key {} failed with {} error (attempt {}/{}): {}",
+                            key_idx,
+                            if is_rate_limit { "rate limit" } else { "overload" },
+                            attempt + 1,
+                            max_key_attempts,
+                            e
+                        );
+
+                        last_error = Some(e);
+
+                        // Wait 10 seconds before trying next key
+                        if attempt < max_key_attempts - 1 {
+                            debug!("Waiting 10 seconds before trying next key...");
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    } else {
+                        // Non-retryable error, fail immediately
+                        return Err(e);
+                    }
+                }
             }
         }
+
+        // All keys exhausted, return last error
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All API keys exhausted")))
     }
 
     /// Process a single complex background region with banana mode
@@ -325,95 +376,147 @@ impl ApiClient {
 
         let start = Instant::now();
 
-        // Get healthy API key
-        let (key_idx, api_key) = self
-            .api_key_pool
-            .get_healthy_key()
-            .await
-            .context("No healthy API keys available")?;
+        // Try with different keys until success or all keys exhausted
+        let max_key_attempts = self.api_key_pool.total_keys().await.max(1);
+        let mut last_error = None;
 
-        // Prepare request
-        let model = model_override.unwrap_or_else(|| self.config.banana_image_model());
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            model, api_key
-        );
+        for attempt in 0..max_key_attempts {
+            // Get healthy API key
+            let key_result = self
+                .api_key_pool
+                .get_healthy_key()
+                .await;
 
-        let base64_image = general_purpose::STANDARD.encode(&image_bytes);
-
-        let target_lang = target_language.unwrap_or("English");
-        let prompt = format!(
-            "Replace any text found in this image with {} translation, matching the original style, font, and background exactly.",
-            target_lang
-        );
-
-        let request_body = serde_json::json!({
-            "contents": [{
-                "parts": [
-                    {"text": prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/png",
-                            "data": base64_image
-                        }
+            let (key_idx, api_key) = match key_result {
+                Some((idx, key)) => {
+                    if attempt > 0 {
+                        debug!("Banana: Retrying with API key {} (attempt {}/{})", idx, attempt + 1, max_key_attempts);
                     }
-                ]
-            }]
-        });
-
-        // Send request with retries
-        let result = self
-            .send_with_retries(&url, &request_body, key_idx)
-            .await;
-
-        let duration = start.elapsed();
-
-        match result {
-            Ok(response_text) => {
-                // Record success
-                self.circuit_breaker.record_success();
-                self.api_key_pool.record_success(key_idx).await;
-
-                // Parse response
-                let response: serde_json::Value = serde_json::from_str(&response_text)
-                    .context("Failed to parse banana API response")?;
-
-                // Extract token usage
-                let (input_tokens, output_tokens) = extract_token_usage(&response);
-
-                // Record metrics
-                if let Some(ref m) = self.metrics {
-                    m.record_api_call(true, duration, input_tokens, output_tokens);
+                    (idx, key)
+                },
+                None => {
+                    if attempt > 0 {
+                        debug!("Banana: No healthy keys available on attempt {}/{}, waiting 10s before retry", attempt + 1, max_key_attempts);
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        continue;
+                    } else {
+                        anyhow::bail!("No healthy API keys available");
+                    }
                 }
+            };
 
-                // Extract image data
-                let inline_data = &response["candidates"][0]["content"]["parts"][0]["inline_data"];
-                let image_data_base64 = inline_data["data"]
-                    .as_str()
-                    .context("Missing inline_data in banana response")?;
+            // Prepare request
+            let model = model_override.unwrap_or_else(|| self.config.banana_image_model());
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                model, api_key
+            );
 
-                // Decode base64
-                let translated_image_bytes = general_purpose::STANDARD
-                    .decode(image_data_base64)
-                    .context("Failed to decode banana image")?;
+            let base64_image = general_purpose::STANDARD.encode(&image_bytes);
 
-                Ok(BananaResult {
-                    region_id,
-                    translated_image_bytes,
-                })
-            }
-            Err(e) => {
-                // Record failure
-                self.circuit_breaker.record_failure();
-                self.api_key_pool.record_failure(key_idx).await;
+            let target_lang = target_language.unwrap_or("English");
+            let prompt = format!(
+                "Replace any text found in this image with {} translation, matching the original style, font, and background exactly.",
+                target_lang
+            );
 
-                if let Some(ref m) = self.metrics {
-                    m.record_api_call(false, duration, 0, 0);
+            let request_body = serde_json::json!({
+                "contents": [{
+                    "parts": [
+                        {"text": prompt},
+                        {
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": base64_image
+                            }
+                        }
+                    ]
+                }]
+            });
+
+            // Send request with retries
+            let result = self
+                .send_with_retries(&url, &request_body, key_idx)
+                .await;
+
+            let duration = start.elapsed();
+
+            match result {
+                Ok(response_text) => {
+                    // Record success
+                    self.circuit_breaker.record_success();
+                    self.api_key_pool.record_success(key_idx).await;
+
+                    // Parse response
+                    let response: serde_json::Value = serde_json::from_str(&response_text)
+                        .context("Failed to parse banana API response")?;
+
+                    // Extract token usage
+                    let (input_tokens, output_tokens) = extract_token_usage(&response);
+
+                    // Record metrics
+                    if let Some(ref m) = self.metrics {
+                        m.record_api_call(true, duration, input_tokens, output_tokens);
+                    }
+
+                    // Extract image data
+                    let inline_data = &response["candidates"][0]["content"]["parts"][0]["inline_data"];
+                    let image_data_base64 = inline_data["data"]
+                        .as_str()
+                        .context("Missing inline_data in banana response")?;
+
+                    // Decode base64
+                    let translated_image_bytes = general_purpose::STANDARD
+                        .decode(image_data_base64)
+                        .context("Failed to decode banana image")?;
+
+                    return Ok(BananaResult {
+                        region_id,
+                        translated_image_bytes,
+                    });
                 }
+                Err(e) => {
+                    // Record failure
+                    self.circuit_breaker.record_failure();
+                    self.api_key_pool.record_failure(key_idx).await;
 
-                Err(e)
+                    if let Some(ref m) = self.metrics {
+                        m.record_api_call(false, duration, 0, 0);
+                    }
+
+                    // Check if this is a retryable error (429, 503)
+                    let error_string = e.to_string();
+                    let is_rate_limit = error_string.contains("429") || error_string.contains("quota");
+                    let is_overload = error_string.contains("503") || error_string.contains("overload");
+
+                    if is_rate_limit || is_overload {
+                        warn!(
+                            "Banana API key {} failed with {} error (attempt {}/{}): {}",
+                            key_idx,
+                            if is_rate_limit { "rate limit" } else { "overload" },
+                            attempt + 1,
+                            max_key_attempts,
+                            e
+                        );
+
+                        last_error = Some(e);
+
+                        // Wait 10 seconds before trying next key
+                        if attempt < max_key_attempts - 1 {
+                            debug!("Waiting 10 seconds before trying next key...");
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    } else {
+                        // Non-retryable error, fail immediately
+                        return Err(e);
+                    }
+                }
             }
         }
+
+        // All keys exhausted, return last error
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All API keys exhausted for banana translate")))
     }
 
     /// Send HTTP request with retries and jitter
@@ -445,9 +548,12 @@ impl ApiClient {
                         let status = response.status();
                         let error_text = response.text().await.unwrap_or_default();
 
-                        // Record API key failure for specific error codes
-                        if status.is_client_error() && status.as_u16() == 429 {
-                            // Rate limit error
+                        // Check if this is a rate limit (429) or overload (503) error
+                        let is_rate_limit = status.as_u16() == 429;
+                        let is_overload = status.as_u16() == 503;
+
+                        // Record API key failure for rate limits
+                        if is_rate_limit {
                             self.api_key_pool.record_failure(key_idx).await;
                         }
 
@@ -459,13 +565,20 @@ impl ApiClient {
                                 attempt + 1,
                                 max_retries
                             );
-                            // Exponential backoff with jitter
-                            let base_delay = 2_u64.pow(attempt);
-                            let jitter = rand::random::<u64>() % 1000; // 0-999ms
-                            tokio::time::sleep(Duration::from_millis(
-                                base_delay * 1000 + jitter,
-                            ))
-                            .await;
+
+                            // Use 10s wait for 429/503, exponential backoff for others
+                            if is_rate_limit || is_overload {
+                                debug!("Rate limit or overload detected, waiting 10 seconds before retry");
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                            } else {
+                                // Exponential backoff with jitter for other errors
+                                let base_delay = 2_u64.pow(attempt);
+                                let jitter = rand::random::<u64>() % 1000; // 0-999ms
+                                tokio::time::sleep(Duration::from_millis(
+                                    base_delay * 1000 + jitter,
+                                ))
+                                .await;
+                            }
                             continue;
                         } else {
                             anyhow::bail!("API request failed: {} - {}", status, error_text);

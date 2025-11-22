@@ -106,9 +106,10 @@ impl ApiKey {
     }
 
     fn should_recover(&self) -> bool {
-        // Allow recovery attempt if unhealthy for more than 5 minutes
+        // Allow recovery attempt if unhealthy for more than 1 minute
+        // This allows the system to retry keys more frequently when all are exhausted
         if let Some(last_failure) = self.last_failure {
-            last_failure.elapsed() > Duration::from_secs(300)
+            last_failure.elapsed() > Duration::from_secs(60)
         } else {
             true
         }
