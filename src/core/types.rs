@@ -86,6 +86,13 @@ pub struct ProcessingConfig {
     #[serde(rename = "useMask")]
     pub use_mask: Option<bool>,
 
+    /// Segmentation model mode: "fast" (YOLOv8-seg) or "accuracy" (SAM 2.1-tiny)
+    /// Fast: 104MB model, ~100ms per image, 640x640 processing
+    /// Accuracy: 149MB models, ~5s per bubble, 1024x1024 processing, better edge detection
+    /// If not provided, defaults to "fast"
+    #[serde(rename = "maskMode")]
+    pub mask_mode: Option<String>,
+
     /// Enable batch inference mode (merge multiple images into single tensor)
     /// Processes N images in one ONNX inference pass for better GPU utilization
     /// If not provided, defaults to false

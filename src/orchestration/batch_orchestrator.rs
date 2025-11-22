@@ -91,11 +91,12 @@ impl BatchOrchestrator {
     /// Format ProcessingConfig for logging without exposing sensitive data
     fn format_config_for_logging(config: &ProcessingConfig) -> String {
         format!(
-            "model={}, banana_mode={}, cache={}, mask={}, merge_img={}, sessions={}, include_free_text={}, text_stroke={}, blur_bg={}, tighter_bounds={}, target_size={}, filter_orphans={}, api_keys={}",
+            "model={}, banana_mode={}, cache={}, mask={}, mask_mode={}, merge_img={}, sessions={}, include_free_text={}, text_stroke={}, blur_bg={}, tighter_bounds={}, target_size={}, filter_orphans={}, api_keys={}",
             config.ocr_translation_model.as_deref().unwrap_or("default"),
             config.banana_mode.unwrap_or(false),
             config.cache_enabled.unwrap_or(true),
             config.use_mask.unwrap_or(true),
+            config.mask_mode.as_deref().unwrap_or("fast"),
             config.merge_img.unwrap_or(false),
             config.session_limit.map(|s| s.to_string()).unwrap_or_else(|| "default".to_string()),
             config.include_free_text.unwrap_or(false),
@@ -286,9 +287,10 @@ impl BatchOrchestrator {
         let phase1_clone = Arc::clone(&self.phase1);
         let mut phase1_outputs_for_seg: Vec<_> = all_phase1_data.iter().map(|(_, output)| output.clone()).collect();
 
+        let mask_mode = config.mask_mode.clone();
         let updated_phase1_outputs = if use_mask {
             let segmentation_task = tokio::spawn(async move {
-                phase1_clone.complete_segmentation(&mut phase1_outputs_for_seg, &all_decoded_images, use_mask).await?;
+                phase1_clone.complete_segmentation(&mut phase1_outputs_for_seg, &all_decoded_images, use_mask, mask_mode.as_deref()).await?;
                 Ok::<_, anyhow::Error>(phase1_outputs_for_seg)
             });
 
@@ -615,7 +617,7 @@ async fn process_single_batch(
                 let mut optimized_image_data = image_data.clone();
                 optimized_image_data.decoded_image = Some(decoded_image);
 
-                let mut phase1_output = phase1.execute(&optimized_image_data, use_mask, config.target_size, filter_orphan_regions).await?;
+                let mut phase1_output = phase1.execute(&optimized_image_data, use_mask, config.mask_mode.as_deref(), config.target_size, filter_orphan_regions).await?;
 
                 // Filter out label 2 if not included
                 if !include_free_text {
@@ -905,7 +907,7 @@ async fn process_single_page(
     // Phase 1: Detection & Categorization
     let p1_start = Instant::now();
     let mut phase1_output = phase1
-        .execute(&optimized_image_data, use_mask, config.target_size, filter_orphan_regions)
+        .execute(&optimized_image_data, use_mask, config.mask_mode.as_deref(), config.target_size, filter_orphan_regions)
         .await
         .context("Phase 1 failed")?;
 

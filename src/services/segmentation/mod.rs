@@ -1,4 +1,6 @@
-// Segmentation service using mask.onnx model
+// Segmentation service with mode switching: Fast (YOLOv8) vs Accuracy (SAM 2.1)
+
+mod sam21_tiny;
 
 use anyhow::{Context, Result};
 use image::{DynamicImage, ImageBuffer, Luma};
@@ -9,6 +11,28 @@ use tracing::{debug, info, instrument};
 
 use crate::core::config::Config;
 use crate::services::onnx_builder::{self};
+
+pub use sam21_tiny::{RegionDetection, Sam21TinyService};
+
+/// Segmentation mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaskMode {
+    /// Fast mode using YOLOv8-seg (104MB, ~100ms per image, 640x640)
+    Fast,
+    /// Accuracy mode using SAM 2.1-tiny (149MB, ~5s per bubble, 1024x1024)
+    Accuracy,
+}
+
+impl MaskMode {
+    /// Parse from string
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "fast" => Ok(MaskMode::Fast),
+            "accuracy" => Ok(MaskMode::Accuracy),
+            _ => anyhow::bail!("Invalid mask mode: '{}'. Expected 'fast' or 'accuracy'", s),
+        }
+    }
+}
 
 // Embed the mask model at compile time
 // If LFS not checked out, this will be a small stub - load from runtime path instead
@@ -32,17 +56,22 @@ fn load_model_bytes(config: &Config) -> Result<Vec<u8>> {
 use crate::services::onnx_builder::DynamicSessionPool;
 
 /// Segmentation service for generating text region masks
+/// Supports two modes: Fast (YOLOv8-seg) and Accuracy (SAM 2.1-tiny)
 pub struct SegmentationService {
-    session_pool: Arc<DynamicSessionPool>,
+    mode: MaskMode,
+    // YOLOv8-seg fields (Fast mode)
+    session_pool: Option<Arc<DynamicSessionPool>>,
     target_size: u32,
     #[allow(dead_code)]
     device_type: String,
     max_sessions: usize,
     config: Arc<Config>,
+    // SAM 2.1-tiny service (Accuracy mode)
+    sam_service: Option<Arc<Sam21TinyService>>,
 }
 
 impl SegmentationService {
-    /// Create a new segmentation service
+    /// Create a new segmentation service with default Fast mode
     ///
     /// # Arguments
     /// * `config` - Application configuration
@@ -51,58 +80,96 @@ impl SegmentationService {
     /// Result containing the segmentation service or an error
     #[instrument(skip(config), fields(target_size = config.target_size()))]
     pub async fn new(config: Arc<Config>) -> Result<Self> {
-        Self::new_with_limit(config, None).await
+        Self::new_with_mode(config, MaskMode::Fast, None).await
     }
 
-    /// Create segmentation service with optional session limit override
+    /// Create segmentation service with optional session limit override (Fast mode)
     pub async fn new_with_limit(config: Arc<Config>, session_limit: Option<usize>) -> Result<Self> {
+        Self::new_with_mode(config, MaskMode::Fast, session_limit).await
+    }
+
+    /// Create segmentation service with specific mode and optional session limit
+    pub async fn new_with_mode(
+        config: Arc<Config>,
+        mode: MaskMode,
+        session_limit: Option<usize>,
+    ) -> Result<Self> {
         // Use provided limit or fall back to config default
         let max_sessions = session_limit.unwrap_or_else(|| config.onnx_pool_size());
 
-        info!("🚀 [DYNAMIC ALLOCATION] Creating segmentation service with max {} sessions", max_sessions);
-        info!("   Starting with 1 session for warmup, will expand on demand");
+        match mode {
+            MaskMode::Fast => {
+                info!("🚀 [DYNAMIC ALLOCATION] Creating Fast segmentation service (YOLOv8) with max {} sessions", max_sessions);
+                info!("   Starting with 1 session for warmup, will expand on demand");
 
-        // Create first session to determine device type
-        let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
+                // Create first session to determine device type
+                let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
 
-        // Create dynamic session pool with capacity for max_sessions
-        let session_pool = DynamicSessionPool::new(max_sessions);
+                // Create dynamic session pool with capacity for max_sessions
+                let session_pool = DynamicSessionPool::new(max_sessions);
 
-        // Add ONLY the first session
-        session_pool.add_session(first_session);
+                // Add ONLY the first session
+                session_pool.add_session(first_session);
 
-        let session_pool = Arc::new(session_pool);
+                let session_pool = Arc::new(session_pool);
 
-        let service = Self {
-            session_pool,
-            target_size: config.target_size(),
-            device_type: device_type.clone(),
-            max_sessions,
-            config: Arc::clone(&config),
-        };
+                let service = Self {
+                    mode,
+                    session_pool: Some(session_pool),
+                    target_size: config.target_size(),
+                    device_type: device_type.clone(),
+                    max_sessions,
+                    config: Arc::clone(&config),
+                    sam_service: None,
+                };
 
-        // Warmup inference to trigger JIT compilation
-        info!("Running warmup inference for segmentation...");
-        let warmup_start = std::time::Instant::now();
-        service.warmup().await?;
-        info!("✓ Segmentation warmup completed in {:.2}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
+                // Warmup inference to trigger JIT compilation
+                info!("Running warmup inference for Fast segmentation...");
+                let warmup_start = std::time::Instant::now();
+                service.warmup_fast().await?;
+                info!("✓ Fast segmentation warmup completed in {:.2}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
 
-        // Log DirectML limitation
-        if service.is_directml() {
-            info!("✓ Segmentation: {} (1/1 sessions, ~40 MB used) [DirectML: pool expansion disabled]",
-                  device_type);
-        } else {
-            info!("✓ Segmentation: {} (1/{} sessions allocated, ~40 MB used, {} MB max)",
-                  device_type, max_sessions, max_sessions * 40);
+                // Log DirectML limitation
+                if service.is_directml() {
+                    info!("✓ Segmentation (Fast): {} (1/1 sessions, ~40 MB used) [DirectML: pool expansion disabled]",
+                          device_type);
+                } else {
+                    info!("✓ Segmentation (Fast): {} (1/{} sessions allocated, ~40 MB used, {} MB max)",
+                          device_type, max_sessions, max_sessions * 40);
+                }
+
+                Ok(service)
+            }
+            MaskMode::Accuracy => {
+                info!("🚀 Creating Accuracy segmentation service (SAM 2.1-tiny)");
+
+                // Create SAM service
+                let sam_service = Arc::new(Sam21TinyService::new(Arc::clone(&config)).await?);
+
+                let service = Self {
+                    mode,
+                    session_pool: None,
+                    target_size: config.target_size(),
+                    device_type: "SAM 2.1-tiny".to_string(),
+                    max_sessions: 0,
+                    config: Arc::clone(&config),
+                    sam_service: Some(sam_service),
+                };
+
+                info!("✓ Segmentation (Accuracy): SAM 2.1-tiny ready (~155 MB per session pair)");
+
+                Ok(service)
+            }
         }
-
-        Ok(service)
     }
 
-    /// Run warmup inference to trigger JIT compilation and memory allocation
-    async fn warmup(&self) -> Result<()> {
+    /// Run warmup inference for Fast mode to trigger JIT compilation and memory allocation
+    async fn warmup_fast(&self) -> Result<()> {
         // Create a small dummy image (just needs to match expected dimensions)
         let dummy_img = image::DynamicImage::new_rgb8(self.target_size, self.target_size);
+
+        let session_pool = self.session_pool.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Session pool not initialized for Fast mode"))?;
 
         // Run inference on one session to trigger optimization
         // Preprocess: resize and normalize
@@ -128,12 +195,12 @@ impl SegmentationService {
         let input_value = ort::value::Value::from_array(array)?;
 
         // Acquire session and run dummy inference
-        let mut session = self.session_pool.acquire();
+        let mut session = session_pool.acquire();
         {
             let _outputs = session.run(ort::inputs!["images" => input_value])?;
             // outputs dropped here before releasing session
         }
-        self.session_pool.release(session);
+        session_pool.release(session);
 
         Ok(())
     }
@@ -179,14 +246,21 @@ impl SegmentationService {
     /// Expands aggressively when high contention detected
     ///
     /// IMPORTANT: DirectML processes sequentially, so pool expansion is disabled
+    /// Only applicable to Fast mode (YOLOv8)
     fn expand_if_needed(&self) {
+        // Only applicable to Fast mode
+        let session_pool = match self.session_pool.as_ref() {
+            Some(pool) => pool,
+            None => return,
+        };
+
         // DirectML can only use 1 session at a time (sequential processing)
         if self.is_directml() {
             return;
         }
 
-        let available = self.session_pool.available();
-        let in_use = self.session_pool.in_use();
+        let available = session_pool.available();
+        let in_use = session_pool.in_use();
         let total = available + in_use;
 
         // Aggressive expansion: create multiple sessions if under pressure
@@ -204,7 +278,7 @@ impl SegmentationService {
             let mut created = 0;
             for _ in 0..sessions_to_create {
                 if let Ok((_, new_session)) = Self::initialize_with_acceleration(&self.config) {
-                    self.session_pool.add_session(new_session);
+                    session_pool.add_session(new_session);
                     created += 1;
                 } else {
                     debug!("⚠️  Failed to create additional segmentation session");
@@ -222,14 +296,24 @@ impl SegmentationService {
     /// Drain all sessions and free memory (call after phase 1 complete)
     ///
     /// IMPORTANT: DirectML keeps persistent sessions (no cleanup)
+    /// Only applicable to Fast mode (YOLOv8)
     pub fn cleanup_sessions(&self) {
+        // Only applicable to Fast mode
+        let session_pool = match self.session_pool.as_ref() {
+            Some(pool) => pool,
+            None => {
+                debug!("Accuracy mode (SAM): No session pool to cleanup");
+                return;
+            }
+        };
+
         // DirectML: Keep persistent session (no cleanup/recreation overhead)
         if self.is_directml() {
             debug!("DirectML: Keeping persistent segmentation session (no cleanup)");
             return;
         }
 
-        let sessions = self.session_pool.drain_all();
+        let sessions = session_pool.drain_all();
         let count = sessions.len();
         drop(sessions); // Explicit drop to ensure memory is freed
         info!("🧹 [CLEANUP] Dropped {} segmentation sessions (~{} MB freed)",
@@ -240,9 +324,24 @@ impl SegmentationService {
     ///
     /// # Arguments
     /// * `img` - Input image
+    /// * `regions` - Optional detected regions (required for Accuracy mode)
     ///
     /// # Returns
     /// Result containing flattened binary mask (0 or 255) of shape (h*w)
+    #[instrument(skip(self, img, regions), fields(width = img.width(), height = img.height(), mode = ?self.mode))]
+    pub async fn generate_mask(&self, img: &DynamicImage, regions: Option<&[RegionDetection]>) -> Result<Vec<u8>> {
+        match self.mode {
+            MaskMode::Fast => self.generate_mask_fast(img).await,
+            MaskMode::Accuracy => {
+                let regions = regions.ok_or_else(|| {
+                    anyhow::anyhow!("Accuracy mode requires detected regions for prompting")
+                })?;
+                self.generate_mask_sam(img, regions).await
+            }
+        }
+    }
+
+    /// Generate mask using Fast mode (YOLOv8-seg)
     ///
     /// # Implementation
     /// Based on minimal_code.py lines 55-72:
@@ -254,8 +353,9 @@ impl SegmentationService {
     ///   - Resize to original size
     ///   - Threshold at 0.5
     /// - Combine all masks with bitwise OR
-    #[instrument(skip(self, img), fields(width = img.width(), height = img.height()))]
-    pub async fn generate_mask(&self, img: &DynamicImage) -> Result<Vec<u8>> {
+    async fn generate_mask_fast(&self, img: &DynamicImage) -> Result<Vec<u8>> {
+        let session_pool = self.session_pool.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Session pool not initialized for Fast mode"))?;
         let start = std::time::Instant::now();
         let orig_width = img.width();
         let orig_height = img.height();
@@ -276,7 +376,7 @@ impl SegmentationService {
 
         // Acquire session from pool, run inference, and extract data
         let (det_output, proto_masks) = {
-            let mut session = self.session_pool.acquire();
+            let mut session = session_pool.acquire();
             let outputs = session
                 .run(ort::inputs!["images" => images_value])?;
 
@@ -303,7 +403,7 @@ impl SegmentationService {
 
             // Drop outputs and return session to pool
             drop(outputs);
-            self.session_pool.release(session);  // No await - crossbeam is sync!
+            session_pool.release(session);  // No await - crossbeam is sync!
 
             (det_output, proto_masks)
         };
@@ -469,5 +569,13 @@ impl SegmentationService {
         );
 
         Ok(all_seg_mask)
+    }
+
+    /// Generate mask using Accuracy mode (SAM 2.1-tiny)
+    async fn generate_mask_sam(&self, img: &DynamicImage, regions: &[RegionDetection]) -> Result<Vec<u8>> {
+        let sam_service = self.sam_service.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SAM service not initialized for Accuracy mode"))?;
+
+        sam_service.generate_mask(img, regions).await
     }
 }
