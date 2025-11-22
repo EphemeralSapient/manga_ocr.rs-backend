@@ -119,6 +119,11 @@ impl Sam21TinyService {
             model_bytes.len() as f32 / 1_048_576.0
         )?;
 
+        // DEBUG: Log model input/output metadata
+        debug!("SAM encoder model metadata:");
+        debug!("  Inputs: {:?}", session.inputs.iter().map(|i| &i.name).collect::<Vec<_>>());
+        debug!("  Outputs: {:?}", session.outputs.iter().map(|o| &o.name).collect::<Vec<_>>());
+
         Ok((backend, session))
     }
 
@@ -354,6 +359,12 @@ impl Sam21TinyService {
         // Acquire encoder session and run
         let mut session = self.encoder_pool.acquire();
         let outputs = session.run(ort::inputs!["input" => input_value])?;
+
+        // DEBUG: Log all available output names to diagnose the issue
+        debug!("SAM encoder outputs available:");
+        for (idx, (name, value)) in outputs.iter().enumerate() {
+            debug!("  Output #{}: '{}' (shape: {:?})", idx, name, value.shape());
+        }
 
         // Extract embeddings (3 output tensors)
         // Try different naming conventions for compatibility with different model versions
