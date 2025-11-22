@@ -215,6 +215,7 @@ impl Phase1Pipeline {
             height: image_data.height,
             regions,
             segmentation_mask,
+            mask_mode: mode_str.to_string(),
             validation_warnings,
         })
     }
@@ -334,6 +335,7 @@ impl Phase1Pipeline {
                 height: image_data.height,
                 regions,
                 segmentation_mask: empty_mask,
+                mask_mode: "fast".to_string(), // Placeholder, will be updated by complete_segmentation
                 validation_warnings,
             });
         }
@@ -406,9 +408,10 @@ impl Phase1Pipeline {
                 segmentation_results.push(mask);
             }
 
-            // Update outputs with segmentation masks
+            // Update outputs with segmentation masks and mask_mode
             for (i, mask) in segmentation_results.into_iter().enumerate() {
                 outputs[i].segmentation_mask = mask;
+                outputs[i].mask_mode = mode_str.to_string();
             }
         } else {
             // Non-DirectML: Parallel processing
@@ -449,10 +452,11 @@ impl Phase1Pipeline {
 
             let segmentation_results = futures::future::join_all(segmentation_tasks).await;
 
-            // Update outputs with segmentation masks
+            // Update outputs with segmentation masks and mask_mode
             for (i, seg_result) in segmentation_results.into_iter().enumerate() {
                 let mask = seg_result.context("Failed to generate segmentation mask")?;
                 outputs[i].segmentation_mask = mask;
+                outputs[i].mask_mode = mode_str.to_string();
             }
         }
 
@@ -615,6 +619,7 @@ impl Phase1Pipeline {
                 height: image_data.height,
                 regions,
                 segmentation_mask,
+                mask_mode: "fast".to_string(), // execute_batch always uses Fast mode
                 validation_warnings,
             });
         }

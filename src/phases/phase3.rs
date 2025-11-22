@@ -59,6 +59,7 @@ impl Phase3Pipeline {
         use_mask: bool,
         tighter_bounds: bool,
     ) -> Result<Phase3Output> {
+        let is_accurate_mode = phase1_output.mask_mode == "accurate";
         // Use pre-decoded image if available, otherwise load from bytes
         // OPTIMIZATION: Pre-decoded image eliminates redundant decoding across phases
         // Use Arc reference instead of cloning the entire image (saves ~8MB per phase!)
@@ -91,7 +92,7 @@ impl Phase3Pipeline {
             }
 
             let cleaned_bytes = self
-                .clean_region(&img, region, &seg_mask, blur_free_text, use_mask, tighter_bounds)
+                .clean_region(&img, region, &seg_mask, blur_free_text, use_mask, tighter_bounds, is_accurate_mode)
                 .context("Failed to clean region")?;
 
             cleaned_regions.push((region.region_id, cleaned_bytes));
@@ -114,6 +115,10 @@ impl Phase3Pipeline {
     /// When use_mask is false:
     /// - Label 0/1: Fill entire label 1 region with white (no mask)
     /// - Label 2: Always fill entire region (blur or white)
+    ///
+    /// Mask mode logic:
+    /// - Fast mode: seg_mask AND label1_mask (restrict to label 1)
+    /// - Accurate mode (SAM): seg_mask AND label0_mask (can exceed label 1, stay in label 0)
     fn clean_region(
         &self,
         img: &DynamicImage,
@@ -122,6 +127,7 @@ impl Phase3Pipeline {
         blur_free_text: bool,
         use_mask: bool,
         tighter_bounds: bool,
+        is_accurate_mode: bool,
     ) -> Result<Vec<u8>> {
         let [x1, y1, x2, y2] = region.bbox;
         let width = (x2 - x1).max(1) as u32;
@@ -164,33 +170,44 @@ impl Phase3Pipeline {
             return Ok(png_bytes);
         }
 
-        // Create label 1 mask for this region (mask mode enabled)
-        let mut label_1_mask = ImageBuffer::<Luma<u8>, Vec<u8>>::new(width, height);
+        // Create mask based on mode:
+        // - Fast mode: Create label 1 mask to restrict segmentation within label 1
+        // - Accurate mode (SAM): Use label 0 bbox (already cropped to region), no label 1 restriction
+        let constraint_mask = if is_accurate_mode {
+            // Accurate mode: No label 1 restriction, use full region (label 0) as constraint
+            ImageBuffer::<Luma<u8>, Vec<u8>>::from_pixel(width, height, Luma([255u8]))
+        } else {
+            // Fast mode: Create label 1 mask to restrict segmentation
+            let mut label_1_mask = ImageBuffer::<Luma<u8>, Vec<u8>>::new(width, height);
 
-        for l1_bbox in &region.label_1_regions {
-            let [l1_x1, l1_y1, l1_x2, l1_y2] = *l1_bbox;
-            // Convert to region-local coordinates
-            let local_x1 = ((l1_x1 - x1).max(0)) as u32;
-            let local_y1 = ((l1_y1 - y1).max(0)) as u32;
-            let local_x2 = ((l1_x2 - x1).min(width as i32)) as u32;
-            let local_y2 = ((l1_y2 - y1).min(height as i32)) as u32;
+            for l1_bbox in &region.label_1_regions {
+                let [l1_x1, l1_y1, l1_x2, l1_y2] = *l1_bbox;
+                // Convert to region-local coordinates
+                let local_x1 = ((l1_x1 - x1).max(0)) as u32;
+                let local_y1 = ((l1_y1 - y1).max(0)) as u32;
+                let local_x2 = ((l1_x2 - x1).min(width as i32)) as u32;
+                let local_y2 = ((l1_y2 - y1).min(height as i32)) as u32;
 
-            // Fill label 1 region with 255
-            for y in local_y1..local_y2 {
-                for x in local_x1..local_x2 {
-                    if x < width && y < height {
-                        label_1_mask.put_pixel(x, y, Luma([255u8]));
+                // Fill label 1 region with 255
+                for y in local_y1..local_y2 {
+                    for x in local_x1..local_x2 {
+                        if x < width && y < height {
+                            label_1_mask.put_pixel(x, y, Luma([255u8]));
+                        }
                     }
                 }
             }
-        }
 
-        // Optionally erode label 1 mask for tighter fit (minimal_code.py lines 47-48)
+            label_1_mask
+        };
+
+        // Optionally erode mask for tighter fit (minimal_code.py lines 47-48)
         // When tighter_bounds is disabled, use the original mask without erosion
-        let eroded_label_1_mask = if tighter_bounds {
-            self.opencv_erode(&label_1_mask, EROSION_KERNEL_SIZE, EROSION_ITERATIONS)?
+        // Note: For accurate mode with full region, erosion doesn't make sense, skip it
+        let eroded_constraint_mask = if tighter_bounds && !is_accurate_mode {
+            self.opencv_erode(&constraint_mask, EROSION_KERNEL_SIZE, EROSION_ITERATIONS)?
         } else {
-            label_1_mask.clone()
+            constraint_mask.clone()
         };
 
         // Crop segmentation mask to region (optimized with pre-calculated bounds)
@@ -211,14 +228,16 @@ impl Phase3Pipeline {
             }
         }
 
-        // Final mask = eroded_label_1 AND segmentation (minimal_code.py line 75)
+        // Final mask = constraint_mask AND segmentation
+        // Fast mode: constraint is label 1, so mask restricted to label 1
+        // Accurate mode: constraint is label 0 (full region), so mask can go beyond label 1
         let mut final_mask = ImageBuffer::<Luma<u8>, Vec<u8>>::new(width, height);
         for y in 0..height {
             for x in 0..width {
-                let label1_val = eroded_label_1_mask.get_pixel(x, y)[0];
+                let constraint_val = eroded_constraint_mask.get_pixel(x, y)[0];
                 let seg_val = seg_mask_cropped.get_pixel(x, y)[0];
                 // Bitwise AND
-                final_mask.put_pixel(x, y, Luma([if label1_val > 0 && seg_val > 0 { 255 } else { 0 }]));
+                final_mask.put_pixel(x, y, Luma([if constraint_val > 0 && seg_val > 0 { 255 } else { 0 }]));
             }
         }
 

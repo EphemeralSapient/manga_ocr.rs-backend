@@ -119,11 +119,6 @@ impl Sam21TinyService {
             model_bytes.len() as f32 / 1_048_576.0
         )?;
 
-        // DEBUG: Log model input/output metadata
-        debug!("SAM encoder model metadata:");
-        debug!("  Inputs: {:?}", session.inputs.iter().map(|i| &i.name).collect::<Vec<_>>());
-        debug!("  Outputs: {:?}", session.outputs.iter().map(|o| &o.name).collect::<Vec<_>>());
-
         Ok((backend, session))
     }
 
@@ -360,12 +355,6 @@ impl Sam21TinyService {
         let mut session = self.encoder_pool.acquire();
         let outputs = session.run(ort::inputs!["input" => input_value])?;
 
-        // DEBUG: Log all available output names to diagnose the issue
-        debug!("SAM encoder outputs available:");
-        for (idx, (name, value)) in outputs.iter().enumerate() {
-            debug!("  Output #{}: '{}' (shape: {:?})", idx, name, value.shape());
-        }
-
         // Extract embeddings (3 output tensors)
         // Try different naming conventions for compatibility with different model versions
         let (_, img_emb_data) = outputs
@@ -379,10 +368,11 @@ impl Sam21TinyService {
         )?;
 
         let (_, hr1_data) = outputs
-            .get("high_res_features_0")
+            .get("high_res_features1")
+            .or_else(|| outputs.get("high_res_features_0"))
             .or_else(|| outputs.get("/conv_s0/Conv_output_0"))
             .or_else(|| outputs.get("high_res_feats_0"))
-            .context("Could not find high-res features 0 output (tried: high_res_features_0, /conv_s0/Conv_output_0, high_res_feats_0)")?
+            .context("Could not find high-res features 0 output (tried: high_res_features1, high_res_features_0, /conv_s0/Conv_output_0, high_res_feats_0)")?
             .try_extract_tensor::<f32>()?;
         let high_res_features1 = Array4::from_shape_vec(
             (1, 32, 256, 256),
@@ -390,10 +380,11 @@ impl Sam21TinyService {
         )?;
 
         let (_, hr2_data) = outputs
-            .get("high_res_features_1")
+            .get("high_res_features2")
+            .or_else(|| outputs.get("high_res_features_1"))
             .or_else(|| outputs.get("/conv_s1/Conv_output_0"))
             .or_else(|| outputs.get("high_res_feats_1"))
-            .context("Could not find high-res features 1 output (tried: high_res_features_1, /conv_s1/Conv_output_0, high_res_feats_1)")?
+            .context("Could not find high-res features 1 output (tried: high_res_features2, high_res_features_1, /conv_s1/Conv_output_0, high_res_feats_1)")?
             .try_extract_tensor::<f32>()?;
         let high_res_features2 = Array4::from_shape_vec(
             (1, 64, 128, 128),
@@ -442,8 +433,8 @@ impl Sam21TinyService {
         let mut session = self.decoder_pool.acquire();
         let outputs = session.run(ort::inputs![
             "image_embeddings" => img_emb_value,
-            "high_res_features_0" => hr1_value,
-            "high_res_features_1" => hr2_value,
+            "high_res_features1" => hr1_value,
+            "high_res_features2" => hr2_value,
             "point_coords" => coords_value,
             "point_labels" => labels_value,
             "mask_input" => mask_input_value,

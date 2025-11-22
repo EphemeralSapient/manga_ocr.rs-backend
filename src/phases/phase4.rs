@@ -121,22 +121,33 @@ impl Phase4Pipeline {
                 .get(&region_id)
                 .context(format!("No cleaned image found for region {}", region_id))?;
 
-            // Convert label_1_regions from absolute to local coordinates
-            let [x1, y1, _, _] = region.bbox;
-            let local_label_1_regions: Vec<[i32; 4]> = region
-                .label_1_regions
-                .iter()
-                .map(|&[lx1, ly1, lx2, ly2]| {
-                    [lx1 - x1, ly1 - y1, lx2 - x1, ly2 - y1]
-                })
-                .collect();
+            // For accurate mode (SAM): use full region bbox as text area
+            // For fast mode: use label_1_regions as text area
+            let is_accurate_mode = phase1_output.mask_mode == "accurate";
+            let [x1, y1, x2, y2] = region.bbox;
+            let width = (x2 - x1).max(1) as u32;
+            let height = (y2 - y1).max(1) as u32;
+
+            let local_text_regions: Vec<[i32; 4]> = if is_accurate_mode {
+                // Accurate mode: use full region (label 0) as text bounding box
+                vec![[0, 0, width as i32, height as i32]]
+            } else {
+                // Fast mode: use label_1_regions as text bounding box
+                region
+                    .label_1_regions
+                    .iter()
+                    .map(|&[lx1, ly1, lx2, ly2]| {
+                        [lx1 - x1, ly1 - y1, lx2 - x1, ly2 - y1]
+                    })
+                    .collect()
+            };
 
             self.composite_rendered_text(
                 &mut final_image,
                 region,
                 cleaned_bytes,
                 translation,
-                &local_label_1_regions,
+                &local_text_regions,
                 font_family,
                 text_stroke,
             )

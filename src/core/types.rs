@@ -236,6 +236,7 @@ pub struct Phase1Output {
     pub height: u32,
     pub regions: Vec<CategorizedRegion>,
     pub segmentation_mask: Vec<u8>, // Flattened (h*w)
+    pub mask_mode: String, // "fast" or "accurate" - determines Phase 3 mask logic
     pub validation_warnings: Vec<String>, // e.g., label 1 not in label 0
 }
 
