@@ -28,8 +28,8 @@ impl MaskMode {
     pub fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "fast" => Ok(MaskMode::Fast),
-            "accuracy" => Ok(MaskMode::Accuracy),
-            _ => anyhow::bail!("Invalid mask mode: '{}'. Expected 'fast' or 'accuracy'", s),
+            "accuracy" | "accurate" => Ok(MaskMode::Accuracy),
+            _ => anyhow::bail!("Invalid mask mode: '{}'. Expected 'fast', 'accurate', or 'accuracy'", s),
         }
     }
 }
@@ -54,122 +54,131 @@ fn load_model_bytes(config: &Config) -> Result<Vec<u8>> {
 }
 
 use crate::services::onnx_builder::DynamicSessionPool;
+use tokio::sync::OnceCell;
 
 /// Segmentation service for generating text region masks
 /// Supports two modes: Fast (YOLOv8-seg) and Accuracy (SAM 2.1-tiny)
+/// Both modes are lazily initialized on first use
 pub struct SegmentationService {
-    mode: MaskMode,
-    // YOLOv8-seg fields (Fast mode)
-    session_pool: Option<Arc<DynamicSessionPool>>,
     target_size: u32,
-    #[allow(dead_code)]
-    device_type: String,
     max_sessions: usize,
     config: Arc<Config>,
-    // SAM 2.1-tiny service (Accuracy mode)
-    sam_service: Option<Arc<Sam21TinyService>>,
+    // Lazy-initialized Fast mode (YOLOv8-seg)
+    fast_session_pool: Arc<OnceCell<Arc<DynamicSessionPool>>>,
+    fast_device_type: Arc<OnceCell<String>>,
+    // Lazy-initialized Accuracy mode (SAM 2.1-tiny)
+    sam_service: Arc<OnceCell<Arc<Sam21TinyService>>>,
 }
 
 impl SegmentationService {
-    /// Create a new segmentation service with default Fast mode
+    /// Create a new segmentation service with lazy initialization
+    /// Models are NOT loaded at startup - they initialize on first use
     ///
     /// # Arguments
     /// * `config` - Application configuration
     ///
     /// # Returns
-    /// Result containing the segmentation service or an error
+    /// Segmentation service ready for lazy initialization
     #[instrument(skip(config), fields(target_size = config.target_size()))]
     pub async fn new(config: Arc<Config>) -> Result<Self> {
-        Self::new_with_mode(config, MaskMode::Fast, None).await
+        let max_sessions = config.onnx_pool_size();
+
+        info!("🚀 Creating segmentation service with LAZY initialization");
+        info!("   Fast mode (YOLOv8): Will load on first request with mask_mode=fast");
+        info!("   Accuracy mode (SAM 2.1): Will load on first request with mask_mode=accurate");
+
+        Ok(Self {
+            target_size: config.target_size(),
+            max_sessions,
+            config,
+            fast_session_pool: Arc::new(OnceCell::new()),
+            fast_device_type: Arc::new(OnceCell::new()),
+            sam_service: Arc::new(OnceCell::new()),
+        })
     }
 
-    /// Create segmentation service with optional session limit override (Fast mode)
+    /// Create segmentation service with optional session limit override
     pub async fn new_with_limit(config: Arc<Config>, session_limit: Option<usize>) -> Result<Self> {
-        Self::new_with_mode(config, MaskMode::Fast, session_limit).await
-    }
-
-    /// Create segmentation service with specific mode and optional session limit
-    pub async fn new_with_mode(
-        config: Arc<Config>,
-        mode: MaskMode,
-        session_limit: Option<usize>,
-    ) -> Result<Self> {
-        // Use provided limit or fall back to config default
         let max_sessions = session_limit.unwrap_or_else(|| config.onnx_pool_size());
 
-        match mode {
-            MaskMode::Fast => {
-                info!("🚀 [DYNAMIC ALLOCATION] Creating Fast segmentation service (YOLOv8) with max {} sessions", max_sessions);
-                info!("   Starting with 1 session for warmup, will expand on demand");
+        info!("🚀 Creating segmentation service with LAZY initialization (session limit: {})", max_sessions);
 
-                // Create first session to determine device type
-                let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
+        Ok(Self {
+            target_size: config.target_size(),
+            max_sessions,
+            config,
+            fast_session_pool: Arc::new(OnceCell::new()),
+            fast_device_type: Arc::new(OnceCell::new()),
+            sam_service: Arc::new(OnceCell::new()),
+        })
+    }
 
-                // Create dynamic session pool with capacity for max_sessions
-                let session_pool = DynamicSessionPool::new(max_sessions);
-
-                // Add ONLY the first session
-                session_pool.add_session(first_session);
-
-                let session_pool = Arc::new(session_pool);
-
-                let service = Self {
-                    mode,
-                    session_pool: Some(session_pool),
-                    target_size: config.target_size(),
-                    device_type: device_type.clone(),
-                    max_sessions,
-                    config: Arc::clone(&config),
-                    sam_service: None,
-                };
-
-                // Warmup inference to trigger JIT compilation
-                info!("Running warmup inference for Fast segmentation...");
-                let warmup_start = std::time::Instant::now();
-                service.warmup_fast().await?;
-                info!("✓ Fast segmentation warmup completed in {:.2}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
-
-                // Log DirectML limitation
-                if service.is_directml() {
-                    info!("✓ Segmentation (Fast): {} (1/1 sessions, ~40 MB used) [DirectML: pool expansion disabled]",
-                          device_type);
-                } else {
-                    info!("✓ Segmentation (Fast): {} (1/{} sessions allocated, ~40 MB used, {} MB max)",
-                          device_type, max_sessions, max_sessions * 40);
-                }
-
-                Ok(service)
-            }
-            MaskMode::Accuracy => {
-                info!("🚀 Creating Accuracy segmentation service (SAM 2.1-tiny)");
-
-                // Create SAM service
-                let sam_service = Arc::new(Sam21TinyService::new(Arc::clone(&config)).await?);
-
-                let service = Self {
-                    mode,
-                    session_pool: None,
-                    target_size: config.target_size(),
-                    device_type: "SAM 2.1-tiny".to_string(),
-                    max_sessions: 0,
-                    config: Arc::clone(&config),
-                    sam_service: Some(sam_service),
-                };
-
-                info!("✓ Segmentation (Accuracy): SAM 2.1-tiny ready (~155 MB per session pair)");
-
-                Ok(service)
-            }
+    /// Lazy initialize Fast mode (YOLOv8-seg) on first use
+    async fn ensure_fast_initialized(&self) -> Result<()> {
+        // Check if already initialized
+        if self.fast_session_pool.get().is_some() {
+            return Ok(());
         }
+
+        info!("🔄 [LAZY INIT] Initializing Fast segmentation (YOLOv8) on first use...");
+        let init_start = std::time::Instant::now();
+
+        // Create first session to determine device type
+        let (device_type, first_session) = Self::initialize_with_acceleration(&self.config)?;
+
+        // Create dynamic session pool with capacity for max_sessions
+        let session_pool = DynamicSessionPool::new(self.max_sessions);
+        session_pool.add_session(first_session);
+        let session_pool = Arc::new(session_pool);
+
+        // Warmup inference
+        info!("Running warmup inference for Fast segmentation...");
+        let warmup_start = std::time::Instant::now();
+        self.warmup_fast(&session_pool).await?;
+        info!("✓ Fast segmentation warmup completed in {:.2}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
+
+        // Store in OnceCell (this can only succeed once)
+        let _ = self.fast_session_pool.set(session_pool);
+        let _ = self.fast_device_type.set(device_type.clone());
+
+        let is_directml = device_type.contains("DirectML");
+        if is_directml {
+            info!("✓ Fast segmentation initialized: {} (1/1 sessions, ~40 MB used) [DirectML: pool expansion disabled] in {:.2}ms",
+                  device_type, init_start.elapsed().as_secs_f64() * 1000.0);
+        } else {
+            info!("✓ Fast segmentation initialized: {} (1/{} sessions allocated, ~40 MB used, {} MB max) in {:.2}ms",
+                  device_type, self.max_sessions, self.max_sessions * 40, init_start.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        Ok(())
+    }
+
+    /// Lazy initialize Accuracy mode (SAM 2.1-tiny) on first use
+    async fn ensure_sam_initialized(&self) -> Result<()> {
+        // Check if already initialized
+        if self.sam_service.get().is_some() {
+            return Ok(());
+        }
+
+        info!("🔄 [LAZY INIT] Initializing Accuracy segmentation (SAM 2.1-tiny) on first use...");
+        let init_start = std::time::Instant::now();
+
+        // Create SAM service
+        let sam = Arc::new(Sam21TinyService::new(Arc::clone(&self.config)).await?);
+
+        // Store in OnceCell (this can only succeed once)
+        let _ = self.sam_service.set(sam);
+
+        info!("✓ Accuracy segmentation initialized: SAM 2.1-tiny (~155 MB per session pair) in {:.2}ms",
+              init_start.elapsed().as_secs_f64() * 1000.0);
+
+        Ok(())
     }
 
     /// Run warmup inference for Fast mode to trigger JIT compilation and memory allocation
-    async fn warmup_fast(&self) -> Result<()> {
+    async fn warmup_fast(&self, session_pool: &DynamicSessionPool) -> Result<()> {
         // Create a small dummy image (just needs to match expected dimensions)
         let dummy_img = image::DynamicImage::new_rgb8(self.target_size, self.target_size);
-
-        let session_pool = self.session_pool.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Session pool not initialized for Fast mode"))?;
 
         // Run inference on one session to trigger optimization
         // Preprocess: resize and normalize
@@ -237,9 +246,13 @@ impl SegmentationService {
         Ok((backend, session))
     }
 
-    /// Check if using DirectML backend
+    /// Check if using DirectML backend (for Fast mode)
     pub fn is_directml(&self) -> bool {
-        self.device_type.contains("DirectML")
+        if let Some(device_type) = self.fast_device_type.get() {
+            device_type.contains("DirectML")
+        } else {
+            false  // Not initialized yet, assume false
+        }
     }
 
     /// Expand session pool if under capacity (lazy allocation)
@@ -249,9 +262,9 @@ impl SegmentationService {
     /// Only applicable to Fast mode (YOLOv8)
     fn expand_if_needed(&self) {
         // Only applicable to Fast mode
-        let session_pool = match self.session_pool.as_ref() {
+        let session_pool = match self.fast_session_pool.get() {
             Some(pool) => pool,
-            None => return,
+            None => return,  // Not initialized yet
         };
 
         // DirectML can only use 1 session at a time (sequential processing)
@@ -299,10 +312,10 @@ impl SegmentationService {
     /// Only applicable to Fast mode (YOLOv8)
     pub fn cleanup_sessions(&self) {
         // Only applicable to Fast mode
-        let session_pool = match self.session_pool.as_ref() {
+        let session_pool = match self.fast_session_pool.get() {
             Some(pool) => pool,
             None => {
-                debug!("Accuracy mode (SAM): No session pool to cleanup");
+                debug!("Fast mode not initialized yet - nothing to cleanup");
                 return;
             }
         };
@@ -320,19 +333,26 @@ impl SegmentationService {
               count, count * 40);
     }
 
-    /// Generate segmentation mask for an image
+    /// Generate segmentation mask for an image with dynamic mode selection
     ///
     /// # Arguments
     /// * `img` - Input image
+    /// * `mode` - Segmentation mode to use (Fast or Accuracy)
     /// * `regions` - Optional detected regions (required for Accuracy mode)
     ///
     /// # Returns
     /// Result containing flattened binary mask (0 or 255) of shape (h*w)
-    #[instrument(skip(self, img, regions), fields(width = img.width(), height = img.height(), mode = ?self.mode))]
-    pub async fn generate_mask(&self, img: &DynamicImage, regions: Option<&[RegionDetection]>) -> Result<Vec<u8>> {
-        match self.mode {
-            MaskMode::Fast => self.generate_mask_fast(img).await,
+    #[instrument(skip(self, img, regions), fields(width = img.width(), height = img.height(), mode = ?mode))]
+    pub async fn generate_mask(&self, img: &DynamicImage, mode: MaskMode, regions: Option<&[RegionDetection]>) -> Result<Vec<u8>> {
+        match mode {
+            MaskMode::Fast => {
+                // Lazy initialize Fast mode if not already initialized
+                self.ensure_fast_initialized().await?;
+                self.generate_mask_fast(img).await
+            }
             MaskMode::Accuracy => {
+                // Lazy initialize SAM if not already initialized
+                self.ensure_sam_initialized().await?;
                 let regions = regions.ok_or_else(|| {
                     anyhow::anyhow!("Accuracy mode requires detected regions for prompting")
                 })?;
@@ -354,8 +374,8 @@ impl SegmentationService {
     ///   - Threshold at 0.5
     /// - Combine all masks with bitwise OR
     async fn generate_mask_fast(&self, img: &DynamicImage) -> Result<Vec<u8>> {
-        let session_pool = self.session_pool.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Session pool not initialized for Fast mode"))?;
+        let session_pool = self.fast_session_pool.get()
+            .ok_or_else(|| anyhow::anyhow!("Fast mode session pool not initialized - call ensure_fast_initialized() first"))?;
         let start = std::time::Instant::now();
         let orig_width = img.width();
         let orig_height = img.height();
@@ -573,8 +593,8 @@ impl SegmentationService {
 
     /// Generate mask using Accuracy mode (SAM 2.1-tiny)
     async fn generate_mask_sam(&self, img: &DynamicImage, regions: &[RegionDetection]) -> Result<Vec<u8>> {
-        let sam_service = self.sam_service.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("SAM service not initialized for Accuracy mode"))?;
+        let sam_service = self.sam_service.get()
+            .ok_or_else(|| anyhow::anyhow!("SAM service not initialized - call ensure_sam_initialized() first"))?;
 
         sam_service.generate_mask(img, regions).await
     }

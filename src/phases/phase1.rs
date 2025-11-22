@@ -126,7 +126,7 @@ impl Phase1Pipeline {
             let (detection_result, segmentation_result) =
                 tokio::join!(
                     self.detector.detect_all_labels(&img, image_data.index, target_size_override),
-                    self.segmenter.generate_mask(&img, None)
+                    self.segmenter.generate_mask(&img, mode, None)
                 );
 
             let (l0, l1, l2) = detection_result.context("Failed to detect regions")?;
@@ -160,7 +160,7 @@ impl Phase1Pipeline {
                 .collect();
 
             debug!("Running SAM segmentation with {} detected regions...", regions.len());
-            let mask = self.segmenter.generate_mask(&img, Some(&regions)).await
+            let mask = self.segmenter.generate_mask(&img, mode, Some(&regions)).await
                 .context("Failed to generate Accuracy segmentation mask (SAM)")?;
 
             (l0, l1, l2, mask)
@@ -396,10 +396,10 @@ impl Phase1Pipeline {
                 };
 
                 let mask = if let Some(ref region_vec) = regions {
-                    self.segmenter.generate_mask(img, Some(region_vec)).await
+                    self.segmenter.generate_mask(img, mode, Some(region_vec)).await
                         .context("Failed to generate Accuracy segmentation mask (SAM)")?
                 } else {
-                    self.segmenter.generate_mask(img, None).await
+                    self.segmenter.generate_mask(img, mode, None).await
                         .context("Failed to generate Fast segmentation mask")?
                 };
 
@@ -440,9 +440,9 @@ impl Phase1Pipeline {
 
                 async move {
                     if let Some(region_vec) = regions {
-                        self.segmenter.generate_mask(img, Some(&region_vec)).await
+                        self.segmenter.generate_mask(img, mode, Some(&region_vec)).await
                     } else {
-                        self.segmenter.generate_mask(img, None).await
+                        self.segmenter.generate_mask(img, mode, None).await
                     }
                 }
             }).collect();
@@ -548,7 +548,8 @@ impl Phase1Pipeline {
 
                 let mut masks = Vec::with_capacity(decoded_images.len());
                 for img in decoded_images.iter() {
-                    masks.push(self.segmenter.generate_mask(img, None).await);
+                    // Use Fast mode (default) for batch execution
+                    masks.push(self.segmenter.generate_mask(img, MaskMode::Fast, None).await);
                 }
                 masks
             } else {
@@ -556,7 +557,8 @@ impl Phase1Pipeline {
                 debug!("Running segmentation for {} images in parallel...", images.len());
 
                 let segmentation_tasks: Vec<_> = decoded_images.iter().map(|img| {
-                    self.segmenter.generate_mask(img, None)
+                    // Use Fast mode (default) for batch execution
+                    self.segmenter.generate_mask(img, MaskMode::Fast, None)
                 }).collect();
 
                 futures::future::join_all(segmentation_tasks).await
