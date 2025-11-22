@@ -330,30 +330,6 @@ impl Sam21TinyService {
         (point_coords, point_labels)
     }
 
-    /// Find output key from a list of possible names
-    fn find_output_key<'a>(
-        outputs: &'a ort::SessionOutputs,
-        possible_names: &[&str],
-    ) -> Result<&'a str> {
-        for name in possible_names {
-            if outputs.contains_key(name) {
-                debug!("Found encoder output: {}", name);
-                return Ok(name);
-            }
-        }
-
-        // If not found, print available outputs for debugging
-        warn!("Available encoder outputs:");
-        for (idx, (key, _)) in outputs.iter().enumerate() {
-            warn!("  [{}] {}", idx, key);
-        }
-
-        anyhow::bail!(
-            "Could not find encoder output. Tried: {:?}. Check logs above for available outputs.",
-            possible_names
-        )
-    }
-
     /// Run encoder on 1024x1024 crop
     async fn run_encoder(&self, crop: &DynamicImage) -> Result<SamEmbeddings> {
         // Resize to 1024x1024
@@ -381,24 +357,32 @@ impl Sam21TinyService {
 
         // Extract embeddings (3 output tensors)
         // Try different naming conventions for compatibility with different model versions
-        let img_emb_key = Self::find_output_key(&outputs, &["image_embeddings", "image_embed"])?;
-        let (_, img_emb_data) = outputs[img_emb_key]
+        let (_, img_emb_data) = outputs
+            .get("image_embeddings")
+            .or_else(|| outputs.get("image_embed"))
+            .context("Could not find image embeddings output (tried: image_embeddings, image_embed)")?
             .try_extract_tensor::<f32>()?;
         let image_embeddings = Array4::from_shape_vec(
             (1, 256, 64, 64),
             img_emb_data.to_vec(),
         )?;
 
-        let hr1_key = Self::find_output_key(&outputs, &["high_res_features_0", "/conv_s0/Conv_output_0", "high_res_feats_0"])?;
-        let (_, hr1_data) = outputs[hr1_key]
+        let (_, hr1_data) = outputs
+            .get("high_res_features_0")
+            .or_else(|| outputs.get("/conv_s0/Conv_output_0"))
+            .or_else(|| outputs.get("high_res_feats_0"))
+            .context("Could not find high-res features 0 output (tried: high_res_features_0, /conv_s0/Conv_output_0, high_res_feats_0)")?
             .try_extract_tensor::<f32>()?;
         let high_res_features1 = Array4::from_shape_vec(
             (1, 32, 256, 256),
             hr1_data.to_vec(),
         )?;
 
-        let hr2_key = Self::find_output_key(&outputs, &["high_res_features_1", "/conv_s1/Conv_output_0", "high_res_feats_1"])?;
-        let (_, hr2_data) = outputs[hr2_key]
+        let (_, hr2_data) = outputs
+            .get("high_res_features_1")
+            .or_else(|| outputs.get("/conv_s1/Conv_output_0"))
+            .or_else(|| outputs.get("high_res_feats_1"))
+            .context("Could not find high-res features 1 output (tried: high_res_features_1, /conv_s1/Conv_output_0, high_res_feats_1)")?
             .try_extract_tensor::<f32>()?;
         let high_res_features2 = Array4::from_shape_vec(
             (1, 64, 128, 128),
