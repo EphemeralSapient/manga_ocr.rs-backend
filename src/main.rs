@@ -25,8 +25,6 @@ struct AppState {
     config: Arc<Config>,
     orchestrator: Arc<BatchOrchestrator>,
     metrics: Metrics,
-    /// Global mask mode setting (true = use segmentation mask, false = fill with white)
-    mask_enabled: Arc<AtomicBool>,
     /// Current session limit per model (detection and segmentation each get this many)
     session_limit: Arc<AtomicUsize>,
     /// Global batch inference mode (true = merge images into single tensor)
@@ -87,7 +85,6 @@ async fn main() -> Result<()> {
         config: config.clone(),
         orchestrator,
         metrics,
-        mask_enabled: Arc::new(AtomicBool::new(true)), // Default: mask enabled
         session_limit: Arc::new(AtomicUsize::new(initial_session_limit)),
         merge_img_enabled: Arc::new(AtomicBool::new(false)), // Default: batch mode disabled
         gemini_thinking_enabled: Arc::new(AtomicBool::new(false)), // Default: thinking disabled
@@ -107,8 +104,6 @@ async fn main() -> Result<()> {
         .route("/metrics", get(metrics_endpoint))
         .route("/stats", get(stats_endpoint))
         .route("/process", post(process_images))
-        .route("/mask-toggle", post(mask_toggle))
-        .route("/mask-status", get(mask_status))
         .route("/sessions-limit", post(sessions_limit))
         .route("/sessions-status", get(sessions_status))
         .route("/mergeimg-toggle", post(mergeimg_toggle))
@@ -130,8 +125,6 @@ async fn main() -> Result<()> {
     info!("  GET  /metrics         - Prometheus metrics");
     info!("  GET  /stats           - Detailed statistics");
     info!("  POST /process         - Process images (multipart/form-data)");
-    info!("  POST /mask-toggle     - Toggle mask segmentation mode");
-    info!("  GET  /mask-status     - Get current mask mode status");
     info!("  POST /sessions-limit  - Set session limit (requires restart)");
     info!("  GET  /sessions-status - Get current session configuration");
     info!("  POST /mergeimg-toggle - Toggle batch inference mode");
@@ -149,7 +142,6 @@ async fn root() -> &'static str {
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let mask_enabled = state.mask_enabled.load(Ordering::SeqCst);
     let merge_img_enabled = state.merge_img_enabled.load(Ordering::SeqCst);
     let session_limit = state.session_limit.load(Ordering::SeqCst);
     let gemini_thinking_enabled = state.gemini_thinking_enabled.load(Ordering::SeqCst);
@@ -160,7 +152,6 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "backend": backend_type,
         "config": {
-            "mask_enabled": mask_enabled,
             "merge_img_enabled": merge_img_enabled,
             "gemini_thinking_enabled": gemini_thinking_enabled,
             "session_limit": session_limit,
@@ -205,45 +196,6 @@ async fn stats_endpoint(
                 format!("Failed to serialize metrics: {}", e),
             )
         })
-}
-
-/// Toggle mask segmentation mode
-///
-/// When mask is enabled (default): Uses segmentation mask for precise text removal
-/// When mask is disabled: Fills entire label 1 region with white background
-///
-/// Label 2 (free text) always fills entire region (never uses mask)
-async fn mask_toggle(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let current = state.mask_enabled.load(Ordering::SeqCst);
-    let new_value = !current;
-    state.mask_enabled.store(new_value, Ordering::SeqCst);
-
-    info!("Mask mode toggled: {} -> {}",
-        if current { "enabled" } else { "disabled" },
-        if new_value { "enabled" } else { "disabled" }
-    );
-
-    Json(serde_json::json!({
-        "mask_enabled": new_value,
-        "message": if new_value {
-            "Mask mode enabled - using segmentation mask for text removal"
-        } else {
-            "Mask mode disabled - filling entire label 1 region with white"
-        }
-    }))
-}
-
-/// Get current mask mode status
-async fn mask_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let enabled = state.mask_enabled.load(Ordering::SeqCst);
-    Json(serde_json::json!({
-        "mask_enabled": enabled,
-        "description": if enabled {
-            "Using segmentation mask for precise text removal"
-        } else {
-            "Filling entire label 1 region with white background"
-        }
-    }))
 }
 
 /// Session limit request body
@@ -295,30 +247,24 @@ async fn sessions_limit(
 async fn sessions_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let current_limit = state.config.onnx_pool_size();
     let desired_limit = state.session_limit.load(Ordering::SeqCst);
-    let mask_enabled = state.mask_enabled.load(Ordering::SeqCst);
 
-    // Calculate memory usage
+    // Calculate memory usage (both detection and segmentation)
     let detection_mem_mb = current_limit * 42;
-    let segmentation_mem_mb = if mask_enabled { current_limit * 40 } else { 0 };
+    let segmentation_mem_mb = current_limit * 40;
     let total_mem_mb = detection_mem_mb + segmentation_mem_mb;
 
     Json(serde_json::json!({
         "current": {
             "detection_sessions": current_limit,
-            "segmentation_sessions": if mask_enabled { current_limit } else { 0 },
-            "total_sessions": if mask_enabled { current_limit * 2 } else { current_limit },
+            "segmentation_sessions": current_limit,
+            "total_sessions": current_limit * 2,
             "estimated_memory_mb": total_mem_mb
         },
         "desired": {
             "limit": desired_limit,
             "needs_restart": desired_limit != current_limit
         },
-        "mask_enabled": mask_enabled,
-        "note": if !mask_enabled {
-            "Segmentation sessions not used when mask is disabled"
-        } else {
-            "Both detection and segmentation sessions active"
-        }
+        "note": "Both detection and segmentation sessions are available for use based on request configuration"
     }))
 }
 
@@ -493,9 +439,6 @@ async fn process_images(
     );
 
     // Apply global settings if not overridden in request config
-    if config.use_mask.is_none() {
-        config.use_mask = Some(state.mask_enabled.load(Ordering::SeqCst));
-    }
     if config.merge_img.is_none() {
         config.merge_img = Some(state.merge_img_enabled.load(Ordering::SeqCst));
     }
