@@ -20,6 +20,8 @@ pub struct DetectionConfig {
     pub inference_backend: Option<String>,
     pub detector_model_path: String,
     pub mask_model_path: String,
+    pub sam_encoder_model_path: String,
+    pub sam_decoder_model_path: String,
 }
 
 /// API configuration
@@ -178,6 +180,10 @@ impl Config {
                     .unwrap_or_else(|_| "models/detector.onnx".to_string()),
                 mask_model_path: env::var("MASK_MODEL_PATH")
                     .unwrap_or_else(|_| "models/mask.onnx".to_string()),
+                sam_encoder_model_path: env::var("SAM_ENCODER_MODEL_PATH")
+                    .unwrap_or_else(|_| "models/sam2.1_tiny_preprocess.onnx".to_string()),
+                sam_decoder_model_path: env::var("SAM_DECODER_MODEL_PATH")
+                    .unwrap_or_else(|_| "models/sam2.1_tiny.onnx".to_string()),
             },
             api: ApiConfig {
                 api_keys,

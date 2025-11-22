@@ -12,8 +12,39 @@ use crate::core::config::Config;
 use crate::services::onnx_builder::{self, DynamicSessionPool};
 
 // Embed SAM models at compile time
+// If LFS not checked out, these will be small stubs - load from runtime path instead
 static SAM_ENCODER_BYTES: &[u8] = include_bytes!("../../../models/sam2.1_tiny_preprocess.onnx");
 static SAM_DECODER_BYTES: &[u8] = include_bytes!("../../../models/sam2.1_tiny.onnx");
+
+/// Load encoder model bytes from embedded or runtime path
+fn load_encoder_bytes(config: &Config) -> Result<Vec<u8>> {
+    // Check if embedded model is real (>10KB means it's not an LFS stub)
+    if SAM_ENCODER_BYTES.len() > 10_000 {
+        debug!("Using embedded SAM encoder model ({:.1} MB)", SAM_ENCODER_BYTES.len() as f64 / 1_048_576.0);
+        Ok(SAM_ENCODER_BYTES.to_vec())
+    } else {
+        // Load from runtime path
+        let path = &config.detection.sam_encoder_model_path;
+        debug!("Loading SAM encoder model from: {}", path);
+        std::fs::read(path)
+            .with_context(|| format!("Failed to load SAM encoder model from {}", path))
+    }
+}
+
+/// Load decoder model bytes from embedded or runtime path
+fn load_decoder_bytes(config: &Config) -> Result<Vec<u8>> {
+    // Check if embedded model is real (>10KB means it's not an LFS stub)
+    if SAM_DECODER_BYTES.len() > 10_000 {
+        debug!("Using embedded SAM decoder model ({:.1} MB)", SAM_DECODER_BYTES.len() as f64 / 1_048_576.0);
+        Ok(SAM_DECODER_BYTES.to_vec())
+    } else {
+        // Load from runtime path
+        let path = &config.detection.sam_decoder_model_path;
+        debug!("Loading SAM decoder model from: {}", path);
+        std::fs::read(path)
+            .with_context(|| format!("Failed to load SAM decoder model from {}", path))
+    }
+}
 
 /// SAM 2.1-tiny segmentation service for high-accuracy edge detection
 ///
@@ -77,38 +108,30 @@ impl Sam21TinyService {
     }
 
     /// Initialize encoder session
-    fn initialize_encoder(_config: &Config) -> Result<(String, Session)> {
-        debug!("Loading SAM encoder model ({:.1} MB)", SAM_ENCODER_BYTES.len() as f64 / 1_048_576.0);
+    fn initialize_encoder(config: &Config) -> Result<(String, Session)> {
+        let model_bytes = load_encoder_bytes(config)?;
 
-        if SAM_ENCODER_BYTES.len() < 10_000 {
-            anyhow::bail!(
-                "SAM encoder model file is too small. Ensure Git LFS is installed and model is checked out."
-            );
-        }
+        info!("Loading SAM encoder model ({:.1} MB)", model_bytes.len() as f64 / 1_048_576.0);
 
         let (backend, session) = onnx_builder::build_session_with_acceleration(
-            SAM_ENCODER_BYTES,
+            &model_bytes,
             "sam-encoder",
-            SAM_ENCODER_BYTES.len() as f32 / 1_048_576.0
+            model_bytes.len() as f32 / 1_048_576.0
         )?;
 
         Ok((backend, session))
     }
 
     /// Initialize decoder session
-    fn initialize_decoder(_config: &Config) -> Result<(String, Session)> {
-        debug!("Loading SAM decoder model ({:.1} MB)", SAM_DECODER_BYTES.len() as f64 / 1_048_576.0);
+    fn initialize_decoder(config: &Config) -> Result<(String, Session)> {
+        let model_bytes = load_decoder_bytes(config)?;
 
-        if SAM_DECODER_BYTES.len() < 10_000 {
-            anyhow::bail!(
-                "SAM decoder model file is too small. Ensure Git LFS is installed and model is checked out."
-            );
-        }
+        info!("Loading SAM decoder model ({:.1} MB)", model_bytes.len() as f64 / 1_048_576.0);
 
         let (backend, session) = onnx_builder::build_session_with_acceleration(
-            SAM_DECODER_BYTES,
+            &model_bytes,
             "sam-decoder",
-            SAM_DECODER_BYTES.len() as f32 / 1_048_576.0
+            model_bytes.len() as f32 / 1_048_576.0
         )?;
 
         Ok((backend, session))
