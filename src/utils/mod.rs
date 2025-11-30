@@ -10,5 +10,9 @@ pub use image_ops::{
     load_image_from_memory_async,
     overlay_image_async,
     resize_image_async,
+    // Visual numbering system for bubble identification
+    add_number_to_region,
+    add_numbers_to_regions_batch,
+    NumberingConfig,
 };
 pub use metrics::Metrics;

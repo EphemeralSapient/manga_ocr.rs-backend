@@ -1,10 +1,16 @@
 // Phase 2: API Calls Pipeline (OCR/Translation and Banana Mode)
+//
+// VISUAL NUMBERING SYSTEM:
+// This phase now supports visual bubble numbering for 100% accurate translation matching.
+// When enabled (default: true), each region crop gets a visible number prepended to the left.
+// Gemini identifies bubbles by their visible number, eliminating spatial ambiguity.
 
 use anyhow::{Context, Result};
 use futures::future::try_join_all;
 use image::DynamicImage;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::services::translation::api_client::ApiClient;
@@ -14,6 +20,7 @@ use crate::core::types::{
     BackgroundType, BananaResult, CategorizedRegion, ImageData, OCRTranslation, Phase1Output,
     Phase2Output,
 };
+use crate::utils::{add_number_to_region, NumberingConfig};
 
 /// Phase 2 pipeline: API calls for translation
 pub struct Phase2Pipeline {
@@ -432,109 +439,57 @@ impl Phase2Pipeline {
             cached_results.len()
         );
 
-        // Process all simple regions SPLIT ACROSS API KEYS with REUSE_FACTOR for parallelism
+        // =======================================================================
+        // VISUAL NUMBERING SYSTEM: Process regions with visible bubble numbers
+        // This ensures 100% accurate translation-to-bubble matching
+        // =======================================================================
+
+        // Check if visual numbering is enabled (default: true for accuracy)
+        let use_visual_numbering = std::env::var("USE_VISUAL_NUMBERING")
+            .ok()
+            .and_then(|s| s.parse::<bool>().ok())
+            .unwrap_or(true);
+
         let simple_translations = if !all_simple_regions.is_empty() {
-            // Get number of available API keys
             let num_keys = api_client.total_keys().await.max(1);
 
-            debug!(
-                "🔑 Phase 2: {} regions, {} keys, reuse_factor={}",
-                all_simple_regions.len(),
-                num_keys,
-                reuse_factor
-            );
-
-            // Step 1: Split regions into chunks for each API key
-            let chunk_size = (all_simple_regions.len() + num_keys - 1) / num_keys; // Round up
-            let key_chunks: Vec<Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>> = all_simple_regions
-                .chunks(chunk_size)
-                .map(|chunk| chunk.to_vec())
-                .collect();
-
-            // Step 2: Further split each key's chunk by reuse_factor
-            let mut all_sub_chunks: Vec<(usize, Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>)> = Vec::new();
-
-            for (key_idx, key_chunk) in key_chunks.into_iter().enumerate() {
-                if key_chunk.is_empty() {
-                    continue;
-                }
-
-                // Calculate sub-chunk size for this key
-                let sub_chunk_size = (key_chunk.len() + reuse_factor - 1) / reuse_factor; // Round up
-                let sub_chunks: Vec<Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>> = key_chunk
-                    .chunks(sub_chunk_size)
-                    .map(|sub| sub.to_vec())
-                    .collect();
-
-                debug!(
-                    "  Key {}: {} regions → {} sub-chunks of ~{} regions each",
-                    key_idx,
-                    key_chunk.len(),
-                    sub_chunks.len(),
-                    sub_chunk_size
+            if use_visual_numbering {
+                info!(
+                    "🔢 Phase 2 NUMBERED: {} regions, {} keys, reuse_factor={}",
+                    all_simple_regions.len(),
+                    num_keys,
+                    reuse_factor
                 );
 
-                // Store with key index for pinning
-                for sub_chunk in sub_chunks {
-                    all_sub_chunks.push((key_idx, sub_chunk));
-                }
+                // NUMBERED APPROACH: Add visible numbers to images for accurate matching
+                self.process_regions_with_numbering(
+                    all_simple_regions,
+                    &api_client,
+                    num_keys,
+                    reuse_factor,
+                    ocr_model_override,
+                    target_language,
+                    cache_enabled,
+                ).await?
+            } else {
+                debug!(
+                    "🔑 Phase 2 LEGACY: {} regions, {} keys, reuse_factor={}",
+                    all_simple_regions.len(),
+                    num_keys,
+                    reuse_factor
+                );
+
+                // LEGACY APPROACH: Array-order matching (less accurate)
+                self.process_regions_legacy(
+                    all_simple_regions,
+                    &api_client,
+                    num_keys,
+                    reuse_factor,
+                    ocr_model_override,
+                    target_language,
+                    cache_enabled,
+                ).await?
             }
-
-            debug!(
-                "✓ Created {} total API calls ({} keys × {} reuse_factor)",
-                all_sub_chunks.len(),
-                num_keys,
-                reuse_factor
-            );
-
-            // Step 3: Process all sub-chunks in parallel with pinned keys
-            let target_language_str = target_language.map(|s| s.to_string());
-            let tasks: Vec<_> = all_sub_chunks
-                .into_iter()
-                .map(|(key_idx, sub_chunk)| {
-                    let api_client = Arc::clone(&api_client);
-                    let model_override = ocr_model_override.map(|s| s.to_string());
-                    let target_language = target_language_str.clone();
-
-                    tokio::spawn(async move {
-                        let image_bytes: Vec<Vec<u8>> = sub_chunk
-                            .iter()
-                            .map(|(_, _, _, _, bytes)| bytes.clone())
-                            .collect();
-
-                        // Use pinned key for this sub-chunk
-                        let translations = api_client
-                            .ocr_translate_batch_with_key(image_bytes, model_override.as_deref(), target_language.as_deref(), key_idx)
-                            .await?;
-
-                        Ok::<_, anyhow::Error>((sub_chunk, translations))
-                    })
-                })
-                .collect();
-
-            // Wait for all parallel API calls
-            let results = try_join_all(tasks)
-                .await
-                .context("One or more API tasks panicked")?
-                .into_iter()
-                .collect::<Result<Vec<_>>>()
-                .context("One or more API calls failed")?;
-
-            // Flatten results and cache
-            let mut all_translations = Vec::new();
-            for (chunk, translations) in results {
-                for ((page_index, region_id, source_hash, bbox, _), translation) in
-                    chunk.iter().zip(translations.iter())
-                {
-                    if cache_enabled {
-                        let cache_key = TranslationCache::generate_key_from_source(*source_hash, bbox);
-                        self.cache.put(cache_key, translation);
-                    }
-                    all_translations.push((*page_index, *region_id, translation.clone()));
-                }
-            }
-
-            all_translations
         } else {
             Vec::new()
         };
@@ -612,5 +567,289 @@ impl Phase2Pipeline {
         debug!("Phase 2 BATCH: Completed processing {} pages", pages.len());
 
         Ok(outputs)
+    }
+
+    // =========================================================================
+    // HELPER METHODS FOR VISUAL NUMBERING SYSTEM
+    // =========================================================================
+
+    /// Process regions with visual numbering for 100% accurate matching
+    ///
+    /// This method:
+    /// 1. Adds visible numbers to each region image
+    /// 2. Sends to Gemini with numbered prompt
+    /// 3. Matches translations back by bubble_number field
+    async fn process_regions_with_numbering(
+        &self,
+        all_simple_regions: Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>,
+        api_client: &Arc<ApiClient>,
+        num_keys: usize,
+        reuse_factor: usize,
+        ocr_model_override: Option<&str>,
+        target_language: Option<&str>,
+        cache_enabled: bool,
+    ) -> Result<Vec<(usize, usize, OCRTranslation)>> {
+        use rayon::prelude::*;
+
+        // Step 1: Add visible numbers to all images (parallel processing)
+        // Create mapping: display_number (1-indexed) → (page_index, region_id, source_hash, bbox)
+        let numbering_config = NumberingConfig::default();
+
+        let numbered_data: Vec<_> = all_simple_regions
+            .par_iter()
+            .enumerate()
+            .map(|(idx, (page_index, region_id, source_hash, bbox, png_bytes))| {
+                let display_number = idx + 1; // 1-indexed for Gemini
+                let (numbered_bytes, _panel_width) = add_number_to_region(
+                    png_bytes,
+                    display_number,
+                    Some(numbering_config.clone()),
+                )?;
+                Ok((display_number, *page_index, *region_id, *source_hash, *bbox, numbered_bytes))
+            })
+            .collect::<Result<Vec<_>>>()
+            .context("Failed to add numbers to region images")?;
+
+        debug!("✓ Added visible numbers to {} regions", numbered_data.len());
+
+        // Build lookup map: display_number → (page_index, region_id, source_hash, bbox)
+        let number_to_region: HashMap<usize, (usize, usize, u64, [i32; 4])> = numbered_data
+            .iter()
+            .map(|(num, page_idx, region_id, source_hash, bbox, _)| {
+                (*num, (*page_idx, *region_id, *source_hash, *bbox))
+            })
+            .collect();
+
+        // Step 2: Split into chunks for API keys
+        let chunk_size = (numbered_data.len() + num_keys - 1) / num_keys;
+        let key_chunks: Vec<Vec<_>> = numbered_data
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        // Step 3: Further split by reuse_factor
+        let mut all_sub_chunks: Vec<(usize, Vec<(usize, Vec<u8>)>)> = Vec::new();
+
+        for (key_idx, key_chunk) in key_chunks.into_iter().enumerate() {
+            if key_chunk.is_empty() {
+                continue;
+            }
+
+            let sub_chunk_size = (key_chunk.len() + reuse_factor - 1) / reuse_factor;
+            let sub_chunks: Vec<Vec<_>> = key_chunk
+                .chunks(sub_chunk_size)
+                .map(|sub| sub.to_vec())
+                .collect();
+
+            debug!(
+                "  Key {}: {} regions → {} sub-chunks",
+                key_idx,
+                key_chunk.len(),
+                sub_chunks.len()
+            );
+
+            for sub_chunk in sub_chunks {
+                // Extract (display_number, numbered_bytes) for the sub-chunk
+                let sub_data: Vec<(usize, Vec<u8>)> = sub_chunk
+                    .into_iter()
+                    .map(|(num, _, _, _, _, bytes)| (num, bytes))
+                    .collect();
+                all_sub_chunks.push((key_idx, sub_data));
+            }
+        }
+
+        debug!(
+            "✓ Created {} total NUMBERED API calls",
+            all_sub_chunks.len()
+        );
+
+        // Step 4: Process all sub-chunks in parallel with NUMBERED API
+        let target_language_str = target_language.map(|s| s.to_string());
+        let tasks: Vec<_> = all_sub_chunks
+            .into_iter()
+            .map(|(key_idx, sub_data)| {
+                let api_client = Arc::clone(api_client);
+                let model_override = ocr_model_override.map(|s| s.to_string());
+                let target_language = target_language_str.clone();
+
+                tokio::spawn(async move {
+                    let image_bytes: Vec<Vec<u8>> = sub_data
+                        .iter()
+                        .map(|(_, bytes)| bytes.clone())
+                        .collect();
+
+                    // Use NUMBERED API call for accurate matching
+                    let numbered_translations = api_client
+                        .ocr_translate_numbered_batch_with_key(
+                            image_bytes,
+                            model_override.as_deref(),
+                            target_language.as_deref(),
+                            key_idx,
+                        )
+                        .await?;
+
+                    Ok::<_, anyhow::Error>(numbered_translations)
+                })
+            })
+            .collect();
+
+        // Wait for all parallel API calls
+        let results = try_join_all(tasks)
+            .await
+            .context("One or more numbered API tasks panicked")?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .context("One or more numbered API calls failed")?;
+
+        // Step 5: Match translations back to regions by bubble_number
+        let mut all_translations = Vec::new();
+        let mut matched_count = 0;
+        let mut unmatched_count = 0;
+
+        for numbered_translations in results {
+            for nt in numbered_translations {
+                if let Some(&(page_index, region_id, source_hash, bbox)) = number_to_region.get(&nt.bubble_number) {
+                    // Cache the translation (using original bbox, not numbered image)
+                    if cache_enabled {
+                        let cache_key = TranslationCache::generate_key_from_source(source_hash, &bbox);
+                        self.cache.put(cache_key, &nt.translation);
+                    }
+                    all_translations.push((page_index, region_id, nt.translation));
+                    matched_count += 1;
+                } else {
+                    warn!(
+                        "⚠️ Unmatched bubble_number {} from Gemini response",
+                        nt.bubble_number
+                    );
+                    unmatched_count += 1;
+                }
+            }
+        }
+
+        if unmatched_count > 0 {
+            warn!(
+                "⚠️ {} translations unmatched out of {} (matched: {})",
+                unmatched_count,
+                matched_count + unmatched_count,
+                matched_count
+            );
+        } else {
+            info!(
+                "✓ All {} translations matched by bubble number",
+                matched_count
+            );
+        }
+
+        Ok(all_translations)
+    }
+
+    /// Legacy processing without visual numbering (array-order matching)
+    ///
+    /// This is the original approach that relies on array order matching.
+    /// Less accurate when Gemini misinterprets bubble order.
+    async fn process_regions_legacy(
+        &self,
+        all_simple_regions: Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>,
+        api_client: &Arc<ApiClient>,
+        num_keys: usize,
+        reuse_factor: usize,
+        ocr_model_override: Option<&str>,
+        target_language: Option<&str>,
+        cache_enabled: bool,
+    ) -> Result<Vec<(usize, usize, OCRTranslation)>> {
+        // Step 1: Split regions into chunks for each API key
+        let chunk_size = (all_simple_regions.len() + num_keys - 1) / num_keys;
+        let key_chunks: Vec<Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>> = all_simple_regions
+            .chunks(chunk_size)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+
+        // Step 2: Further split each key's chunk by reuse_factor
+        let mut all_sub_chunks: Vec<(usize, Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>)> = Vec::new();
+
+        for (key_idx, key_chunk) in key_chunks.into_iter().enumerate() {
+            if key_chunk.is_empty() {
+                continue;
+            }
+
+            let sub_chunk_size = (key_chunk.len() + reuse_factor - 1) / reuse_factor;
+            let sub_chunks: Vec<Vec<(usize, usize, u64, [i32; 4], Vec<u8>)>> = key_chunk
+                .chunks(sub_chunk_size)
+                .map(|sub| sub.to_vec())
+                .collect();
+
+            debug!(
+                "  Key {}: {} regions → {} sub-chunks of ~{} regions each",
+                key_idx,
+                key_chunk.len(),
+                sub_chunks.len(),
+                sub_chunk_size
+            );
+
+            for sub_chunk in sub_chunks {
+                all_sub_chunks.push((key_idx, sub_chunk));
+            }
+        }
+
+        debug!(
+            "✓ Created {} total legacy API calls ({} keys × {} reuse_factor)",
+            all_sub_chunks.len(),
+            num_keys,
+            reuse_factor
+        );
+
+        // Step 3: Process all sub-chunks in parallel with pinned keys
+        let target_language_str = target_language.map(|s| s.to_string());
+        let tasks: Vec<_> = all_sub_chunks
+            .into_iter()
+            .map(|(key_idx, sub_chunk)| {
+                let api_client = Arc::clone(api_client);
+                let model_override = ocr_model_override.map(|s| s.to_string());
+                let target_language = target_language_str.clone();
+
+                tokio::spawn(async move {
+                    let image_bytes: Vec<Vec<u8>> = sub_chunk
+                        .iter()
+                        .map(|(_, _, _, _, bytes)| bytes.clone())
+                        .collect();
+
+                    // Use legacy array-order matching
+                    let translations = api_client
+                        .ocr_translate_batch_with_key(
+                            image_bytes,
+                            model_override.as_deref(),
+                            target_language.as_deref(),
+                            key_idx,
+                        )
+                        .await?;
+
+                    Ok::<_, anyhow::Error>((sub_chunk, translations))
+                })
+            })
+            .collect();
+
+        // Wait for all parallel API calls
+        let results = try_join_all(tasks)
+            .await
+            .context("One or more API tasks panicked")?
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .context("One or more API calls failed")?;
+
+        // Flatten results and cache (using array order)
+        let mut all_translations = Vec::new();
+        for (chunk, translations) in results {
+            for ((page_index, region_id, source_hash, bbox, _), translation) in
+                chunk.iter().zip(translations.iter())
+            {
+                if cache_enabled {
+                    let cache_key = TranslationCache::generate_key_from_source(*source_hash, bbox);
+                    self.cache.put(cache_key, translation);
+                }
+                all_translations.push((*page_index, *region_id, translation.clone()));
+            }
+        }
+
+        Ok(all_translations)
     }
 }

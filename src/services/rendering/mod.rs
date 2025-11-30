@@ -495,12 +495,10 @@ impl CosmicTextRenderer {
     }
 
     /// Find optimal font size to fit text in given dimensions
-    /// Includes post-verification to ensure text actually fits (handles long words that exceed max_width)
     ///
-    /// IMPROVED:
-    /// - Accounts for stroke width in safety margin
-    /// - Uses binary search for fallback (much faster than exponential backoff)
-    /// - Supports CJK text with appropriate size multipliers
+    /// Uses coarse-to-fine search to handle line-break discontinuities properly.
+    /// Binary search fails because font_size → text_dimensions isn't monotonic
+    /// (a slightly smaller font can cause different line breaks, changing dimensions non-linearly).
     pub async fn find_optimal_font_size(
         &self,
         text: &str,
@@ -509,93 +507,73 @@ impl CosmicTextRenderer {
         max_height: f32,
         min_size: f32,
         max_size: f32,
-        stroke_width: Option<f32>,  // NEW: Account for stroke in measurements
+        stroke_width: Option<f32>,
     ) -> Result<f32> {
-        // Calculate safety margin based on stroke width
-        // Stroke extends on both sides, so effective width = text_width + 2*stroke
-        let stroke_margin = if let Some(sw) = stroke_width {
-            // Stroke adds width on both sides
-            let stroke_total = sw * 2.0;
-            // Calculate what % of max_width the stroke would take at max font size
-            let stroke_ratio = stroke_total / max_width;
-            // Reduce available space by this ratio, plus base margin for glyph overhangs
-            1.0 - (stroke_ratio + 0.10)  // 10% base margin for overhangs
-        } else {
-            0.90  // 10% margin for glyph overhangs only
-        };
+        // Step 1: Apply stroke margin ONCE at the start
+        let stroke_extra = stroke_width.unwrap_or(0.0) * 2.0;
+        let effective_width = (max_width - stroke_extra).max(10.0);
+        let effective_height = (max_height - stroke_extra).max(10.0);
 
-        let safe_max_width = max_width * stroke_margin;
-        let safe_max_height = max_height * stroke_margin;
+        // Absolute minimum - 7px is the smallest readable size
+        // Below this, text becomes illegible - better to overflow slightly
+        let absolute_min = 7.0f32;
+        let search_min = min_size.max(absolute_min);
 
-        let mut low = min_size;
-        let mut high = max_size;
-        let mut best_size = min_size;
+        // Step 2: Coarse scan from max to min at 2px intervals
+        // Find the largest size that fits
+        let mut best_size = search_min;
+        let mut size = max_size;
 
-        // Binary search for optimal font size
-        for _ in 0..25 {
-            let mid = (low + high) / 2.0;
-            let (width, height) = self.measure_text(text, font_family, mid, Some(safe_max_width)).await?;
+        while size >= search_min {
+            let (w, h) = self.measure_text(text, font_family, size, Some(effective_width)).await?;
+            if w <= effective_width && h <= effective_height {
+                best_size = size;
+                break; // Found largest that fits
+            }
+            size -= 2.0;
+        }
 
-            if width <= safe_max_width && height <= safe_max_height {
-                best_size = mid;
-                low = mid; // Try larger
-            } else {
-                high = mid; // Try smaller
+        // Step 3: Fine-tune upward from best_size (try to maximize)
+        for delta in [1.5, 1.0, 0.5] {
+            let test = best_size + delta;
+            if test <= max_size {
+                let (w, h) = self.measure_text(text, font_family, test, Some(effective_width)).await?;
+                if w <= effective_width && h <= effective_height {
+                    best_size = test;
+                }
             }
         }
 
-        // Post-verification: Ensure the chosen size actually fits
-        // This handles edge cases where long words exceed max_width despite word wrapping
-        let (final_width, final_height) = self.measure_text(text, font_family, best_size, Some(safe_max_width)).await?;
-
-        if final_width > safe_max_width || final_height > safe_max_height {
-            // Text still doesn't fit! Use BINARY SEARCH in fallback too (much faster than exponential backoff)
-            tracing::warn!(
-                "Text overflow detected after binary search: text={:.50}..., size={:.1}px, actual=({:.1}x{:.1}), max=({:.1}x{:.1})",
-                text,
-                best_size,
-                final_width,
-                final_height,
-                safe_max_width,
-                safe_max_height
-            );
-
-            let absolute_min = min_size * 0.7; // Allow going below min_size as last resort
-            let mut low = absolute_min;
-            let mut high = best_size;
-            let mut fallback_size = absolute_min;
-
-            // Binary search for size that fits (max 15 iterations for precision)
-            for _ in 0..15 {
-                if (high - low) < 0.5 {
-                    break;  // Converged
+        // Step 4: If still nothing fits, go below min_size down to absolute_min
+        if best_size <= search_min {
+            let (w, h) = self.measure_text(text, font_family, best_size, Some(effective_width)).await?;
+            if w > effective_width || h > effective_height {
+                // Need to go smaller
+                let mut size = search_min - 1.0;
+                while size >= absolute_min {
+                    let (w, h) = self.measure_text(text, font_family, size, Some(effective_width)).await?;
+                    if w <= effective_width && h <= effective_height {
+                        best_size = size;
+                        break;
+                    }
+                    size -= 1.0;
                 }
 
-                let mid = (low + high) / 2.0;
-                let (test_width, test_height) = self.measure_text(text, font_family, mid, Some(safe_max_width)).await?;
-
-                if test_width <= safe_max_width && test_height <= safe_max_height {
-                    fallback_size = mid;
-                    low = mid;  // Try larger
-                } else {
-                    high = mid;  // Try smaller
+                if best_size > size {
+                    best_size = absolute_min;
+                    tracing::warn!(
+                        "Text doesn't fit even at {:.1}px: '{:.30}...'",
+                        absolute_min,
+                        text
+                    );
                 }
-            }
-
-            best_size = fallback_size;
-
-            if fallback_size <= absolute_min {
-                tracing::warn!(
-                    "Text still overflows even at minimum size {:.1}px - text will be clipped",
-                    best_size
-                );
-            } else {
-                tracing::debug!(
-                    "Overflow resolved by binary search fallback to {:.1}px",
-                    best_size
-                );
             }
         }
+
+        tracing::debug!(
+            "Font size: {:.1}px for {}x{} (text: '{:.20}...')",
+            best_size, effective_width as i32, effective_height as i32, text
+        );
 
         Ok(best_size)
     }

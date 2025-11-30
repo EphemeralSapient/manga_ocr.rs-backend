@@ -21,10 +21,14 @@ pub struct ApiClient {
     metrics: Option<Metrics>,
 }
 
-/// JSON schema for OCR/Translation response
+/// JSON schema for OCR/Translation response (with bubble number for accurate matching)
 #[derive(Debug, Serialize, Deserialize)]
 struct OCRTranslationResponse {
+    /// The visible bubble number shown in the image (1-indexed)
+    bubble_number: usize,
+    /// Original text extracted from the bubble
     original_text: String,
+    /// Translated text
     translated_text: String,
 }
 
@@ -32,6 +36,13 @@ struct OCRTranslationResponse {
 #[derive(Debug, Serialize, Deserialize)]
 struct BatchOCRResponse {
     translations: Vec<OCRTranslationResponse>,
+}
+
+/// Result type for numbered translation that includes the bubble number
+#[derive(Debug, Clone)]
+pub struct NumberedTranslation {
+    pub bubble_number: usize,
+    pub translation: OCRTranslation,
 }
 
 impl ApiClient {
@@ -108,7 +119,42 @@ impl ApiClient {
         model_override: Option<&str>,
         target_language: Option<&str>,
     ) -> Result<Vec<OCRTranslation>> {
-        self.ocr_translate_batch_internal(image_bytes_batch, model_override, target_language, None).await
+        self.ocr_translate_batch_internal(image_bytes_batch, model_override, target_language, None, false).await
+    }
+
+    /// Perform OCR and translation on NUMBERED images for accurate bubble matching
+    ///
+    /// This method expects images that have been pre-processed with `add_number_to_region()`
+    /// to include visible bubble numbers. The prompt instructs Gemini to identify each
+    /// bubble by its visible number, ensuring 100% accurate translation-to-bubble matching.
+    ///
+    /// # Arguments
+    /// * `image_bytes_batch` - Vector of numbered image bytes (processed with add_number_to_region)
+    /// * `model_override` - Optional model name to override the default from config
+    /// * `target_language` - Optional target language for translation (defaults to "English")
+    ///
+    /// # Returns
+    /// Vector of NumberedTranslation results with bubble numbers for matching
+    #[instrument(skip(self, image_bytes_batch), fields(batch_size = image_bytes_batch.len()))]
+    pub async fn ocr_translate_numbered_batch(
+        &self,
+        image_bytes_batch: Vec<Vec<u8>>,
+        model_override: Option<&str>,
+        target_language: Option<&str>,
+    ) -> Result<Vec<NumberedTranslation>> {
+        self.ocr_translate_numbered_batch_internal(image_bytes_batch, model_override, target_language, None).await
+    }
+
+    /// Perform OCR and translation on NUMBERED images with a specific API key
+    #[instrument(skip(self, image_bytes_batch), fields(batch_size = image_bytes_batch.len(), key_index = key_index))]
+    pub async fn ocr_translate_numbered_batch_with_key(
+        &self,
+        image_bytes_batch: Vec<Vec<u8>>,
+        model_override: Option<&str>,
+        target_language: Option<&str>,
+        key_index: usize,
+    ) -> Result<Vec<NumberedTranslation>> {
+        self.ocr_translate_numbered_batch_internal(image_bytes_batch, model_override, target_language, Some(key_index)).await
     }
 
     /// Perform OCR and translation with a specific API key (for reuse_factor parallelism)
@@ -129,7 +175,214 @@ impl ApiClient {
         target_language: Option<&str>,
         key_index: usize,
     ) -> Result<Vec<OCRTranslation>> {
-        self.ocr_translate_batch_internal(image_bytes_batch, model_override, target_language, Some(key_index)).await
+        self.ocr_translate_batch_internal(image_bytes_batch, model_override, target_language, Some(key_index), false).await
+    }
+
+    /// Internal implementation for NUMBERED OCR/translation batch
+    /// Uses modified prompt and schema for accurate bubble matching
+    async fn ocr_translate_numbered_batch_internal(
+        &self,
+        image_bytes_batch: Vec<Vec<u8>>,
+        model_override: Option<&str>,
+        target_language: Option<&str>,
+        pinned_key_index: Option<usize>,
+    ) -> Result<Vec<NumberedTranslation>> {
+        debug!("NUMBERED OCR/Translation batch of {} images", image_bytes_batch.len());
+
+        // Check circuit breaker
+        if !self.circuit_breaker.allow_request() {
+            warn!("Circuit breaker is open, failing fast");
+            anyhow::bail!("Circuit breaker is open, API is unavailable");
+        }
+
+        let start = Instant::now();
+        let max_key_attempts = self.api_key_pool.total_keys().await.max(1);
+        let mut last_error = None;
+
+        for attempt in 0..max_key_attempts {
+            let key_result = if attempt == 0 && pinned_key_index.is_some() {
+                self.api_key_pool
+                    .get_key_by_index(pinned_key_index.unwrap())
+                    .await
+            } else {
+                self.api_key_pool
+                    .get_healthy_key()
+                    .await
+            };
+
+            let (key_idx, api_key) = match key_result {
+                Some((idx, key)) => {
+                    if attempt > 0 {
+                        debug!("Retrying with API key {} (attempt {}/{})", idx, attempt + 1, max_key_attempts);
+                    }
+                    (idx, key)
+                },
+                None => {
+                    if attempt > 0 {
+                        debug!("No healthy keys available on attempt {}/{}, waiting 10s before retry", attempt + 1, max_key_attempts);
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        continue;
+                    } else {
+                        anyhow::bail!("No healthy API keys available");
+                    }
+                }
+            };
+
+            let model = model_override.unwrap_or_else(|| self.config.ocr_translation_model());
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                model, api_key
+            );
+
+            // Build content with all numbered images
+            let contents: Vec<_> = image_bytes_batch
+                .par_iter()
+                .map(|image_bytes| {
+                    let base64_image = general_purpose::STANDARD.encode(image_bytes);
+                    serde_json::json!({
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": base64_image
+                        }
+                    })
+                })
+                .collect();
+
+            let mut contents = contents;
+
+            // NUMBERED PROMPT: Explicitly tell Gemini to identify by visible number
+            let target_lang = target_language.unwrap_or("English");
+            let prompt = format!(
+                "Each image shows a text bubble with a VISIBLE NUMBER on the LEFT side. \
+                 For each image, identify the bubble by its visible number and extract the text. \
+                 Translate the text to {}. \
+                 Return a JSON array where each object has: \
+                 - 'bubble_number': the visible number shown on the left of the image (integer) \
+                 - 'original_text': the extracted text (ignore the number, extract only the bubble content) \
+                 - 'translated_text': the translation \
+                 If no text is found in a bubble, use empty strings for text fields but still include the bubble_number.",
+                target_lang
+            );
+            contents.push(serde_json::json!({"text": prompt}));
+
+            // NUMBERED SCHEMA: Include bubble_number field
+            let mut request_body = serde_json::json!({
+                "contents": [{
+                    "parts": contents
+                }],
+                "generationConfig": {
+                    "response_mime_type": "application/json",
+                    "response_schema": {
+                        "type": "object",
+                        "properties": {
+                            "translations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "bubble_number": {"type": "integer"},
+                                        "original_text": {"type": "string"},
+                                        "translated_text": {"type": "string"}
+                                    },
+                                    "required": ["bubble_number", "original_text", "translated_text"]
+                                }
+                            }
+                        },
+                        "required": ["translations"]
+                    }
+                }
+            });
+
+            let enable_thinking = std::env::var("GEMINI_ENABLE_THINKING")
+                .ok()
+                .and_then(|s| s.parse::<bool>().ok())
+                .unwrap_or(false);
+
+            if !enable_thinking {
+                request_body["generationConfig"]["thinkingConfig"] = serde_json::json!({
+                    "thinking_budget": 0
+                });
+            }
+
+            let result = self
+                .send_with_retries(&url, &request_body, key_idx)
+                .await;
+
+            let duration = start.elapsed();
+
+            match result {
+                Ok(response_text) => {
+                    self.circuit_breaker.record_success();
+                    self.api_key_pool.record_success(key_idx).await;
+
+                    let response: serde_json::Value = serde_json::from_str(&response_text)
+                        .context("Failed to parse API response")?;
+
+                    let (input_tokens, output_tokens) = extract_token_usage(&response);
+
+                    if let Some(ref m) = self.metrics {
+                        m.record_api_call(true, duration, input_tokens, output_tokens);
+                    }
+
+                    let translations_json = response["candidates"][0]["content"]["parts"][0]["text"]
+                        .as_str()
+                        .context("Missing text in API response")?;
+
+                    let batch_response: BatchOCRResponse = serde_json::from_str(translations_json)
+                        .context("Failed to parse batch OCR response")?;
+
+                    // Convert to NumberedTranslation with bubble numbers preserved
+                    let results = batch_response
+                        .translations
+                        .into_iter()
+                        .map(|t| NumberedTranslation {
+                            bubble_number: t.bubble_number,
+                            translation: OCRTranslation {
+                                original_text: Arc::from(t.original_text.as_str()),
+                                translated_text: Arc::from(t.translated_text.as_str()),
+                            },
+                        })
+                        .collect();
+
+                    return Ok(results);
+                }
+                Err(e) => {
+                    self.circuit_breaker.record_failure();
+                    self.api_key_pool.record_failure(key_idx).await;
+
+                    if let Some(ref m) = self.metrics {
+                        m.record_api_call(false, duration, 0, 0);
+                    }
+
+                    let error_string = e.to_string();
+                    let is_rate_limit = error_string.contains("429") || error_string.contains("quota");
+                    let is_overload = error_string.contains("503") || error_string.contains("overload");
+
+                    if is_rate_limit || is_overload {
+                        warn!(
+                            "Numbered API key {} failed with {} error (attempt {}/{}): {}",
+                            key_idx,
+                            if is_rate_limit { "rate limit" } else { "overload" },
+                            attempt + 1,
+                            max_key_attempts,
+                            e
+                        );
+
+                        last_error = Some(e);
+
+                        if attempt < max_key_attempts - 1 {
+                            debug!("Waiting 10 seconds before trying next key...");
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("All API keys exhausted for numbered batch")))
     }
 
     /// Internal implementation for OCR/translation batch
@@ -139,6 +392,7 @@ impl ApiClient {
         model_override: Option<&str>,
         target_language: Option<&str>,
         pinned_key_index: Option<usize>,
+        _use_numbered: bool, // Reserved for future use
     ) -> Result<Vec<OCRTranslation>> {
         debug!("OCR/Translation batch of {} images", image_bytes_batch.len());
 

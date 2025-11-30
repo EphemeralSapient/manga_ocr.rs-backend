@@ -86,10 +86,9 @@ pub struct ProcessingConfig {
     #[serde(rename = "useMask")]
     pub use_mask: Option<bool>,
 
-    /// Segmentation model mode: "fast" (YOLOv8-seg) or "accuracy" (SAM 2.1-tiny)
-    /// Fast: 104MB model, ~100ms per image, 640x640 processing
-    /// Accuracy: 149MB models, ~5s per bubble, 1024x1024 processing, better edge detection
-    /// If not provided, defaults to "fast"
+    /// Segmentation model mode (only "fast" is supported)
+    /// Uses YOLOv8-seg: 104MB model, ~100ms per image
+    /// This field is kept for backward compatibility but only "fast" mode is used
     #[serde(rename = "maskMode")]
     pub mask_mode: Option<String>,
 
@@ -135,6 +134,13 @@ pub struct ProcessingConfig {
     /// Valid range: 1-8
     #[serde(rename = "reuseFactor")]
     pub reuse_factor: Option<usize>,
+
+    /// Debug mode: Stop after Phase 1 and return image with label 0/1 bounding boxes drawn
+    /// When enabled, skips Phase 2-4 and returns debug visualization
+    /// Useful for debugging detection issues
+    /// If not provided, defaults to false
+    #[serde(rename = "l1Debug")]
+    pub l1_debug: Option<bool>,
 }
 
 /// Detection label for region classification
@@ -238,6 +244,11 @@ pub struct Phase1Output {
     pub segmentation_mask: Vec<u8>, // Flattened (h*w)
     pub mask_mode: String, // "fast" or "accurate" - determines Phase 3 mask logic
     pub validation_warnings: Vec<String>, // e.g., label 1 not in label 0
+    /// Pre-cleaned regions when use_mask=false (allows skipping Phase 3)
+    /// Contains (region_id, cleaned_png_bytes) for each region
+    /// When Some, Phase 3 can be skipped entirely
+    #[serde(skip)]
+    pub early_cleaned_regions: Option<Vec<(usize, Vec<u8>)>>,
 }
 
 /// OCR/Translation result for simple background

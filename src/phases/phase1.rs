@@ -1,15 +1,17 @@
 // Phase 1: Detection & Categorization Pipeline
+//
+// Simplified: Only uses YOLOv8-seg for segmentation (SAM removed for performance)
 
 use anyhow::{Context, Result};
-use image::DynamicImage;
+use image::{DynamicImage, Rgba};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::core::config::Config;
 use crate::services::detection::DetectionService;
-use crate::services::segmentation::{SegmentationService, MaskMode};
+use crate::services::segmentation::SegmentationService;
 use crate::core::types::{
     BackgroundType, CategorizedRegion, ImageData, Phase1Output, RegionDetection,
 };
@@ -60,39 +62,33 @@ impl Phase1Pipeline {
     ///
     /// # Steps:
     /// 1. Run detector for labels 0, 1, 2
-    /// 2. Run mask model for segmentation (if use_mask is true)
+    /// 2. Run YOLOv8-seg for segmentation (if use_mask is true)
     /// 3. Validate label 1 regions are within label 0
     /// 4. Categorize simple vs complex backgrounds
+    /// 5. If use_mask=false, also clean regions early (skips Phase 3)
     ///
     /// # Arguments
     /// * `use_mask` - Whether to use segmentation mask
-    /// * `mask_mode` - Segmentation mode ("fast" or "accuracy")
+    /// * `mask_mode` - Ignored (only "fast" mode is supported)
     /// * `target_size_override` - Optional target size override for detection model
     /// * `filter_orphan_regions` - If true, discard label 1 regions not within any label 0
-    ///
-    /// # Returns
-    /// Phase1Output with categorized regions
+    /// * `blur_free_text` - Whether to blur free text (label 2) backgrounds
     #[instrument(skip(self, image_data), fields(
         page_index = image_data.index,
-        filename = %image_data.filename,
-        mask_mode = ?mask_mode
+        filename = %image_data.filename
     ))]
     pub async fn execute(
         &self,
         image_data: &ImageData,
         use_mask: bool,
-        mask_mode: Option<&str>,
+        _mask_mode: Option<&str>, // Ignored - only fast mode is supported
         target_size_override: Option<u32>,
         filter_orphan_regions: bool,
+        blur_free_text: bool,
     ) -> Result<Phase1Output> {
-        debug!(
-            "Phase 1: Processing page {} ({})",
-            image_data.index, image_data.filename
-        );
+        debug!("Phase 1: Processing page {} ({})", image_data.index, image_data.filename);
 
-        // Use pre-decoded image if available, otherwise load from bytes
-        // OPTIMIZATION: Pre-decoded image eliminates redundant decoding across phases
-        // Use Arc reference instead of cloning the entire image (saves ~8MB per phase!)
+        // Use pre-decoded image if available
         let img_owned;
         let img: &DynamicImage = if let Some(ref decoded) = image_data.decoded_image {
             decoded.as_ref()
@@ -102,111 +98,58 @@ impl Phase1Pipeline {
             &img_owned
         };
 
-        // Determine mask mode
-        let mode_str = mask_mode.unwrap_or("fast");
-        let mode = MaskMode::from_str(mode_str)
-            .unwrap_or_else(|_| {
-                warn!("Invalid mask_mode '{}', defaulting to Fast", mode_str);
-                MaskMode::Fast
-            });
+        let start = std::time::Instant::now();
 
-        // Step 1 & 2: Run detection and segmentation (segmentation only if use_mask is true)
-        let parallel_start = std::time::Instant::now();
-
-        let (label_0_raw, label_1_raw, label_2_raw, segmentation_mask) = if !use_mask {
-            // Only run detection, return empty mask
-            debug!("Running detection (segmentation skipped)...");
-            let (l0, l1, l2) = self.detector.detect_all_labels(&img, image_data.index, target_size_override).await
-                .context("Failed to detect regions")?;
-            let empty_mask: Vec<u8> = vec![0u8; (img.width() * img.height()) as usize];
-            (l0, l1, l2, empty_mask)
-        } else if mode == MaskMode::Fast {
-            // Fast mode: Run detection and segmentation in parallel
-            debug!("Running detection and Fast segmentation in parallel...");
-            let (detection_result, segmentation_result) =
-                tokio::join!(
-                    self.detector.detect_all_labels(&img, image_data.index, target_size_override),
-                    self.segmenter.generate_mask(&img, mode, None)
-                );
+        // Run detection and segmentation in parallel (if mask enabled)
+        let (label_0_raw, label_1_raw, label_2_raw, segmentation_mask) = if use_mask {
+            debug!("Running detection + segmentation in parallel...");
+            let (detection_result, segmentation_result) = tokio::join!(
+                self.detector.detect_all_labels(img, image_data.index, target_size_override),
+                self.segmenter.generate_mask(img)
+            );
 
             let (l0, l1, l2) = detection_result.context("Failed to detect regions")?;
-            let mask = segmentation_result.context("Failed to generate Fast segmentation mask")?;
+            let mask = segmentation_result.context("Failed to generate segmentation mask")?;
             (l0, l1, l2, mask)
         } else {
-            // Accuracy mode (SAM): Run detection first, then segmentation with regions
-            debug!("Running detection first for Accuracy segmentation (SAM)...");
-            let (l0, l1, l2) = self.detector.detect_all_labels(&img, image_data.index, target_size_override).await
+            debug!("Running detection only (mask disabled)...");
+            let (l0, l1, l2) = self.detector.detect_all_labels(img, image_data.index, target_size_override).await
                 .context("Failed to detect regions")?;
-
-            // Convert to RegionDetection format for SAM
-            let regions: Vec<crate::services::segmentation::RegionDetection> = l0
-                .iter()
-                .map(|d| crate::services::segmentation::RegionDetection {
-                    x1: d.bbox[0] as f32,
-                    y1: d.bbox[1] as f32,
-                    x2: d.bbox[2] as f32,
-                    y2: d.bbox[3] as f32,
-                    label: 0,
-                    confidence: d.confidence,
-                })
-                .chain(l1.iter().map(|d| crate::services::segmentation::RegionDetection {
-                    x1: d.bbox[0] as f32,
-                    y1: d.bbox[1] as f32,
-                    x2: d.bbox[2] as f32,
-                    y2: d.bbox[3] as f32,
-                    label: 1,
-                    confidence: d.confidence,
-                }))
-                .collect();
-
-            debug!("Running SAM segmentation with {} detected regions...", regions.len());
-            let mask = self.segmenter.generate_mask(&img, mode, Some(&regions)).await
-                .context("Failed to generate Accuracy segmentation mask (SAM)")?;
-
-            (l0, l1, l2, mask)
+            let empty_mask = vec![0u8; (img.width() * img.height()) as usize];
+            (l0, l1, l2, empty_mask)
         };
 
-        // Convert BubbleDetection to RegionDetection
-        let label_0_detections: Vec<RegionDetection> = label_0_raw
-            .into_iter()
+        // Convert to RegionDetection
+        let label_0: Vec<RegionDetection> = label_0_raw.into_iter()
             .map(|d| RegionDetection { bbox: d.bbox, label: 0, confidence: d.confidence })
             .collect();
-        let label_1_detections: Vec<RegionDetection> = label_1_raw
-            .into_iter()
+        let label_1: Vec<RegionDetection> = label_1_raw.into_iter()
             .map(|d| RegionDetection { bbox: d.bbox, label: 1, confidence: d.confidence })
             .collect();
-        let label_2_detections: Vec<RegionDetection> = label_2_raw
-            .into_iter()
+        let label_2: Vec<RegionDetection> = label_2_raw.into_iter()
             .map(|d| RegionDetection { bbox: d.bbox, label: 2, confidence: d.confidence })
             .collect();
 
-        let mode_desc = if !use_mask {
-            "detection only"
-        } else {
-            match mode {
-                MaskMode::Fast => "Fast (parallel)",
-                MaskMode::Accuracy => "Accuracy (SAM, sequential)",
-            }
-        };
-
         debug!(
-            "✓ {} completed in {:.2}ms - Detected: {} label 0, {} label 1, {} label 2",
-            mode_desc,
-            parallel_start.elapsed().as_secs_f64() * 1000.0,
-            label_0_detections.len(),
-            label_1_detections.len(),
-            label_2_detections.len()
+            "✓ Detection completed in {:.0}ms - {} label 0, {} label 1, {} label 2",
+            start.elapsed().as_secs_f64() * 1000.0,
+            label_0.len(), label_1.len(), label_2.len()
         );
 
-        // Step 3 & 4: Validate and categorize
-        let (regions, validation_warnings) = self.categorize_regions(
-            &img,
-            &label_0_detections,
-            &label_1_detections,
-            &label_2_detections,
-            image_data.index,
-            filter_orphan_regions,
+        // Validate and categorize
+        let (regions, warnings) = self.categorize_regions(
+            img, &label_0, &label_1, &label_2, image_data.index, filter_orphan_regions,
         )?;
+
+        // When use_mask=false, clean regions early (skips Phase 3)
+        let early_cleaned_regions = if !use_mask && !regions.is_empty() {
+            let blur_radius = self.config.blur_radius();
+            info!("🧹 Early cleaning {} regions (mask disabled, skipping Phase 3)", regions.len());
+            let cleaned = Self::clean_regions_early(img, &regions, blur_free_text, blur_radius);
+            Some(cleaned)
+        } else {
+            None
+        };
 
         Ok(Phase1Output {
             page_index: image_data.index,
@@ -215,25 +158,31 @@ impl Phase1Pipeline {
             height: image_data.height,
             regions,
             segmentation_mask,
-            mask_mode: mode_str.to_string(),
-            validation_warnings,
+            mask_mode: "fast".to_string(), // Always fast mode
+            validation_warnings: warnings,
+            early_cleaned_regions,
         })
     }
 
     /// Execute Phase 1 detection only (without segmentation)
     /// Returns detection results + decoded images for later segmentation
     ///
-    /// This allows Phase 2 to start immediately while segmentation runs in background
+    /// This allows Phase 2 to start immediately while segmentation runs in background.
+    /// If use_mask=false, also performs early region cleaning (skips Phase 3).
     ///
     /// # Arguments
     /// * `target_size_override` - Optional target size override for detection model
     /// * `filter_orphan_regions` - If true, discard label 1 regions not within any label 0
+    /// * `use_mask` - Whether segmentation mask will be used (if false, early cleaning is done)
+    /// * `blur_free_text` - Whether to blur free text backgrounds (for early cleaning)
     pub async fn execute_detection_only(
         &self,
         images: &[ImageData],
         merge_img: bool,
         target_size_override: Option<u32>,
         filter_orphan_regions: bool,
+        use_mask: bool,
+        blur_free_text: bool,
     ) -> Result<(Vec<Phase1Output>, Vec<DynamicImage>)> {
         if images.is_empty() {
             return Ok((Vec::new(), Vec::new()));
@@ -294,7 +243,10 @@ impl Phase1Pipeline {
                detection_start.elapsed().as_secs_f64() * 1000.0,
                if merge_img { "BATCH" } else { "PARALLEL" });
 
-        // Create Phase1Output with empty segmentation masks (will be filled later)
+        // Get blur radius for early cleaning
+        let blur_radius = self.config.blur_radius();
+
+        // Create Phase1Output with empty segmentation masks (will be filled later if use_mask=true)
         let mut outputs = Vec::with_capacity(images.len());
 
         for (i, (label_0_raw, label_1_raw, label_2_raw)) in batch_detections.into_iter().enumerate() {
@@ -328,6 +280,13 @@ impl Phase1Pipeline {
             // Empty segmentation mask placeholder
             let empty_mask = vec![0u8; (image_data.width * image_data.height) as usize];
 
+            // When use_mask=false, clean regions early (skips Phase 3)
+            let early_cleaned_regions = if !use_mask && !regions.is_empty() {
+                Some(Self::clean_regions_early(img, &regions, blur_free_text, blur_radius))
+            } else {
+                None
+            };
+
             outputs.push(Phase1Output {
                 page_index: image_data.index,
                 filename: image_data.filename.clone(),
@@ -337,7 +296,17 @@ impl Phase1Pipeline {
                 segmentation_mask: empty_mask,
                 mask_mode: "fast".to_string(), // Placeholder, will be updated by complete_segmentation
                 validation_warnings,
+                early_cleaned_regions,
             });
+        }
+
+        // Log early cleaning if performed
+        if !use_mask {
+            let total_regions: usize = outputs.iter().map(|o| o.regions.len()).sum();
+            if total_regions > 0 {
+                info!("🧹 Early cleaned {} regions across {} images (mask disabled, skipping Phase 3)",
+                      total_regions, outputs.len());
+            }
         }
 
         Ok((outputs, decoded_images))
@@ -350,120 +319,43 @@ impl Phase1Pipeline {
         outputs: &mut [Phase1Output],
         decoded_images: &[DynamicImage],
         use_mask: bool,
-        mask_mode: Option<&str>,
+        _mask_mode: Option<&str>, // Ignored - only fast mode supported
     ) -> Result<()> {
         if !use_mask {
             debug!("Segmentation skipped (mask disabled)");
             return Ok(());
         }
 
-        // Determine mask mode
-        let mode_str = mask_mode.unwrap_or("fast");
-        let mode = MaskMode::from_str(mode_str)
-            .unwrap_or_else(|_| {
-                warn!("Invalid mask_mode '{}', defaulting to Fast", mode_str);
-                MaskMode::Fast
-            });
-
         let seg_start = std::time::Instant::now();
-        let is_directml = self.segmenter.is_directml();
 
-        if is_directml {
-            // DirectML: Sequential processing through single session (no parallelism)
-            debug!("Running {} segmentation for {} images sequentially (DirectML)...",
-                if mode == MaskMode::Fast { "Fast" } else { "Accuracy (SAM)" },
-                decoded_images.len());
+        if self.segmenter.is_directml() {
+            // DirectML: Sequential processing
+            debug!("Running segmentation for {} images sequentially (DirectML)...", decoded_images.len());
 
-            let mut segmentation_results = Vec::with_capacity(decoded_images.len());
             for (i, img) in decoded_images.iter().enumerate() {
-                // For Accuracy mode, extract regions from Phase1Output
-                let regions = if mode == MaskMode::Accuracy {
-                    let output = &outputs[i];
-                    let converted_regions: Vec<crate::services::segmentation::RegionDetection> = output
-                        .regions
-                        .iter()
-                        .filter(|r| r.label == 0 || r.label == 1)  // Only label 0 and 1
-                        .map(|r| crate::services::segmentation::RegionDetection {
-                            x1: r.bbox[0] as f32,
-                            y1: r.bbox[1] as f32,
-                            x2: r.bbox[2] as f32,
-                            y2: r.bbox[3] as f32,
-                            label: r.label,
-                            confidence: 1.0,  // CategorizedRegion doesn't have confidence
-                        })
-                        .collect();
-                    Some(converted_regions)
-                } else {
-                    None
-                };
-
-                let mask = if let Some(ref region_vec) = regions {
-                    self.segmenter.generate_mask(img, mode, Some(region_vec)).await
-                        .context("Failed to generate Accuracy segmentation mask (SAM)")?
-                } else {
-                    self.segmenter.generate_mask(img, mode, None).await
-                        .context("Failed to generate Fast segmentation mask")?
-                };
-
-                segmentation_results.push(mask);
-            }
-
-            // Update outputs with segmentation masks and mask_mode
-            for (i, mask) in segmentation_results.into_iter().enumerate() {
+                let mask = self.segmenter.generate_mask(img).await
+                    .context("Failed to generate segmentation mask")?;
                 outputs[i].segmentation_mask = mask;
-                outputs[i].mask_mode = mode_str.to_string();
+                outputs[i].mask_mode = "fast".to_string();
             }
         } else {
-            // Non-DirectML: Parallel processing
-            debug!("Running {} segmentation for {} images in parallel...",
-                if mode == MaskMode::Fast { "Fast" } else { "Accuracy (SAM)" },
-                decoded_images.len());
+            // Parallel processing
+            debug!("Running segmentation for {} images in parallel...", decoded_images.len());
 
-            let segmentation_tasks: Vec<_> = decoded_images.iter().enumerate().map(|(i, img)| {
-                // For Accuracy mode, extract regions from Phase1Output
-                let regions = if mode == MaskMode::Accuracy {
-                    let output = &outputs[i];
-                    let converted_regions: Vec<crate::services::segmentation::RegionDetection> = output
-                        .regions
-                        .iter()
-                        .filter(|r| r.label == 0 || r.label == 1)  // Only label 0 and 1
-                        .map(|r| crate::services::segmentation::RegionDetection {
-                            x1: r.bbox[0] as f32,
-                            y1: r.bbox[1] as f32,
-                            x2: r.bbox[2] as f32,
-                            y2: r.bbox[3] as f32,
-                            label: r.label,
-                            confidence: 1.0,  // CategorizedRegion doesn't have confidence
-                        })
-                        .collect();
-                    Some(converted_regions)
-                } else {
-                    None
-                };
+            let tasks: Vec<_> = decoded_images.iter()
+                .map(|img| self.segmenter.generate_mask(img))
+                .collect();
 
-                async move {
-                    if let Some(region_vec) = regions {
-                        self.segmenter.generate_mask(img, mode, Some(&region_vec)).await
-                    } else {
-                        self.segmenter.generate_mask(img, mode, None).await
-                    }
-                }
-            }).collect();
+            let results = futures::future::join_all(tasks).await;
 
-            let segmentation_results = futures::future::join_all(segmentation_tasks).await;
-
-            // Update outputs with segmentation masks and mask_mode
-            for (i, seg_result) in segmentation_results.into_iter().enumerate() {
-                let mask = seg_result.context("Failed to generate segmentation mask")?;
+            for (i, result) in results.into_iter().enumerate() {
+                let mask = result.context("Failed to generate segmentation mask")?;
                 outputs[i].segmentation_mask = mask;
-                outputs[i].mask_mode = mode_str.to_string();
+                outputs[i].mask_mode = "fast".to_string();
             }
         }
 
-        debug!("✓ {} segmentation completed in {:.2}ms",
-            if mode == MaskMode::Fast { "Fast" } else { "Accuracy (SAM)" },
-            seg_start.elapsed().as_secs_f64() * 1000.0);
-
+        debug!("✓ Segmentation completed in {:.0}ms", seg_start.elapsed().as_secs_f64() * 1000.0);
         Ok(())
     }
 
@@ -474,11 +366,13 @@ impl Phase1Pipeline {
     /// - merge_img=true: Single batched ONNX inference (faster for multiple images)
     /// - merge_img=false: Individual ONNX inferences in parallel (uses multiple sessions)
     /// - use_mask: Enable/disable segmentation mask generation
+    /// - blur_free_text: Whether to blur free text backgrounds (for early cleaning when use_mask=false)
     ///
     /// # Arguments
     /// * `target_size_override` - Optional target size override for detection model
     /// * `filter_orphan_regions` - If true, discard label 1 regions not within any label 0
-    pub async fn execute_batch(&self, images: &[ImageData], use_mask: bool, merge_img: bool, target_size_override: Option<u32>, filter_orphan_regions: bool) -> Result<Vec<Phase1Output>> {
+    /// * `blur_free_text` - Whether to blur free text backgrounds
+    pub async fn execute_batch(&self, images: &[ImageData], use_mask: bool, merge_img: bool, target_size_override: Option<u32>, filter_orphan_regions: bool, blur_free_text: bool) -> Result<Vec<Phase1Output>> {
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -547,23 +441,21 @@ impl Phase1Pipeline {
             let is_directml = self.segmenter.is_directml();
 
             let results = if is_directml {
-                // DirectML: Sequential processing through single session (no parallelism)
+                // DirectML: Sequential processing
                 debug!("Running segmentation for {} images sequentially (DirectML)...", images.len());
 
                 let mut masks = Vec::with_capacity(decoded_images.len());
                 for img in decoded_images.iter() {
-                    // Use Fast mode (default) for batch execution
-                    masks.push(self.segmenter.generate_mask(img, MaskMode::Fast, None).await);
+                    masks.push(self.segmenter.generate_mask(img).await);
                 }
                 masks
             } else {
-                // Non-DirectML: Parallel processing
+                // Parallel processing
                 debug!("Running segmentation for {} images in parallel...", images.len());
 
-                let segmentation_tasks: Vec<_> = decoded_images.iter().map(|img| {
-                    // Use Fast mode (default) for batch execution
-                    self.segmenter.generate_mask(img, MaskMode::Fast, None)
-                }).collect();
+                let segmentation_tasks: Vec<_> = decoded_images.iter()
+                    .map(|img| self.segmenter.generate_mask(img))
+                    .collect();
 
                 futures::future::join_all(segmentation_tasks).await
             };
@@ -577,6 +469,9 @@ impl Phase1Pipeline {
                 Ok(vec![0u8; (img.width() * img.height()) as usize])
             }).collect()
         };
+
+        // Get blur radius for early cleaning
+        let blur_radius = self.config.blur_radius();
 
         // Process results for each image
         let mut outputs = Vec::with_capacity(images.len());
@@ -612,6 +507,13 @@ impl Phase1Pipeline {
                 filter_orphan_regions,
             )?;
 
+            // When use_mask=false, clean regions early (skips Phase 3)
+            let early_cleaned_regions = if !use_mask && !regions.is_empty() {
+                Some(Self::clean_regions_early(img, &regions, blur_free_text, blur_radius))
+            } else {
+                None
+            };
+
             outputs.push(Phase1Output {
                 page_index: image_data.index,
                 filename: image_data.filename.clone(),
@@ -621,7 +523,17 @@ impl Phase1Pipeline {
                 segmentation_mask,
                 mask_mode: "fast".to_string(), // execute_batch always uses Fast mode
                 validation_warnings,
+                early_cleaned_regions,
             });
+        }
+
+        // Log early cleaning if performed
+        if !use_mask {
+            let total_regions: usize = outputs.iter().map(|o| o.regions.len()).sum();
+            if total_regions > 0 {
+                info!("🧹 Early cleaned {} regions across {} images (mask disabled, skipping Phase 3)",
+                      total_regions, outputs.len());
+            }
         }
 
         debug!(
@@ -867,5 +779,82 @@ impl Phase1Pipeline {
         } else {
             BackgroundType::Complex
         }
+    }
+
+    /// Clean regions by white-filling label1 areas (for use_mask=false mode)
+    /// This allows skipping Phase 3 entirely when mask mode is disabled.
+    ///
+    /// Runs in parallel using rayon for performance.
+    fn clean_regions_early(
+        img: &DynamicImage,
+        regions: &[CategorizedRegion],
+        blur_free_text: bool,
+        blur_radius: f32,
+    ) -> Vec<(usize, Vec<u8>)> {
+        regions.par_iter()
+            .filter_map(|region| {
+                match Self::clean_single_region(img, region, blur_free_text, blur_radius) {
+                    Ok(bytes) => Some((region.region_id, bytes)),
+                    Err(e) => {
+                        debug!("Failed to clean region {}: {:?}", region.region_id, e);
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Clean a single region by white-filling label1 areas
+    fn clean_single_region(
+        img: &DynamicImage,
+        region: &CategorizedRegion,
+        blur_free_text: bool,
+        blur_radius: f32,
+    ) -> Result<Vec<u8>> {
+        let [x1, y1, x2, y2] = region.bbox;
+        let width = (x2 - x1).max(1) as u32;
+        let height = (y2 - y1).max(1) as u32;
+
+        // Crop region from original
+        let mut cropped = img.crop_imm(x1 as u32, y1 as u32, width, height).to_rgba8();
+
+        // Label 2 (free text): blur or fill entirely with white
+        if region.label == 2 {
+            let cleaned = if blur_free_text {
+                image::imageops::blur(&cropped, blur_radius)
+            } else {
+                image::ImageBuffer::from_pixel(width, height, Rgba([255, 255, 255, 255]))
+            };
+            return Self::encode_png_rgba(cleaned);
+        }
+
+        // Label 0/1: Fill all label1 regions with white
+        for l1_bbox in &region.label_1_regions {
+            let [l1_x1, l1_y1, l1_x2, l1_y2] = *l1_bbox;
+            // Convert to local coordinates
+            let local_x1 = ((l1_x1 - x1).max(0)) as u32;
+            let local_y1 = ((l1_y1 - y1).max(0)) as u32;
+            let local_x2 = ((l1_x2 - x1).min(width as i32)) as u32;
+            let local_y2 = ((l1_y2 - y1).min(height as i32)) as u32;
+
+            for y in local_y1..local_y2 {
+                for x in local_x1..local_x2 {
+                    if x < width && y < height {
+                        cropped.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+                    }
+                }
+            }
+        }
+
+        Self::encode_png_rgba(cropped)
+    }
+
+    /// Encode RGBA image to PNG bytes
+    fn encode_png_rgba(img: image::RgbaImage) -> Result<Vec<u8>> {
+        let mut png_bytes = Vec::new();
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .context("Failed to encode PNG")?;
+        Ok(png_bytes)
     }
 }

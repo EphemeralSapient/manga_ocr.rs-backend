@@ -22,6 +22,7 @@ use crate::core::types::{
     BatchAnalytics, BatchResult, ImageBatch, ImageData, PageResult, PerformanceMetrics,
     ProcessingConfig,
 };
+use crate::utils::image_ops::draw_debug_bboxes;
 
 /// Main batch orchestrator
 pub struct BatchOrchestrator {
@@ -161,8 +162,11 @@ impl BatchOrchestrator {
         let use_mask = config.use_mask.unwrap_or(true);
         let include_free_text = config.include_free_text.unwrap_or(false);
         let filter_orphan_regions = config.filter_orphan_regions.unwrap_or(false);
+        let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
 
-        info!("Processing {} batches phase-by-phase: Phase 1 → Phase 2 (global) → Phase 3 → Phase 4", batches.len());
+        info!("Processing {} batches phase-by-phase: Phase 1 → Phase 2 (global) → Phase 3{} → Phase 4",
+              batches.len(),
+              if use_mask { "" } else { " (skipped - early cleaned)" });
 
         // ===== PHASE 1: DETECTION ONLY (Segmentation runs in background) =====
         info!("Starting Phase 1 detection for all {} batches", batches.len());
@@ -180,7 +184,7 @@ impl BatchOrchestrator {
             info!("🔄 DirectML detected: Processing {} batches sequentially (detection only)", batches.len());
 
             for batch in batches.into_iter() {
-                match self.phase1.execute_detection_only(&batch.images, merge_img, config.target_size, filter_orphan_regions).await {
+                match self.phase1.execute_detection_only(&batch.images, merge_img, config.target_size, filter_orphan_regions, use_mask, blur_free_text).await {
                     Ok((mut outputs, decoded_images)) => {
                         for (i, output) in outputs.iter_mut().enumerate() {
                             // Filter out label 2 if not included
@@ -227,7 +231,7 @@ impl BatchOrchestrator {
                 let target_size = config.target_size;
 
                 let task = tokio::spawn(async move {
-                    let (outputs, decoded_images) = phase1.execute_detection_only(&images, merge_img, target_size, filter_orphan_regions).await?;
+                    let (outputs, decoded_images) = phase1.execute_detection_only(&images, merge_img, target_size, filter_orphan_regions, use_mask, blur_free_text).await?;
                     Ok::<_, anyhow::Error>((images, outputs, decoded_images))
                 });
 
@@ -280,6 +284,156 @@ impl BatchOrchestrator {
             all_phase1_data.len(),
             phase1_metrics.phase1_time.as_secs_f64() * 1000.0
         );
+
+        // ===== L1_DEBUG MODE: Early return with bbox visualization =====
+        if config.l1_debug.unwrap_or(false) {
+            info!("🔍 L1_DEBUG mode enabled - returning bbox visualization (use_mask={})", use_mask);
+
+            let mut debug_results = Vec::new();
+
+            for (i, (image_data, phase1_output)) in all_phase1_data.iter().enumerate() {
+                // Get the decoded image
+                let mut decoded_img: image::DynamicImage = if let Some(img) = all_decoded_images.get(i) {
+                    img.clone()
+                } else if let Some(ref img) = image_data.decoded_image {
+                    (**img).clone()
+                } else {
+                    match image::load_from_memory(&image_data.image_bytes) {
+                        Ok(img) => img,
+                        Err(e) => {
+                            tracing::error!("Failed to decode image for debug: {:?}", e);
+                            continue;
+                        }
+                    }
+                };
+
+                // Collect label 0 and label 1 bboxes
+                let mut label_0_bboxes: Vec<[i32; 4]> = Vec::new();
+                let mut label_1_bboxes: Vec<[i32; 4]> = Vec::new();
+
+                for region in &phase1_output.regions {
+                    match region.label {
+                        0 => {
+                            label_0_bboxes.push(region.bbox);
+                            // Also add all label_1_regions contained in this label 0
+                            for l1_bbox in &region.label_1_regions {
+                                label_1_bboxes.push(*l1_bbox);
+                            }
+                        }
+                        1 => {
+                            label_1_bboxes.push(region.bbox);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // For non-mask mode: Apply label 1 white-fill cleaning before drawing bboxes
+                // This shows what the cleaning would look like
+                if !use_mask {
+                    let mut rgba_img = decoded_img.to_rgba8();
+                    let (img_width, img_height) = rgba_img.dimensions();
+
+                    // Fill all label 1 regions with white
+                    for l1_bbox in &label_1_bboxes {
+                        let [x1, y1, x2, y2] = *l1_bbox;
+                        let x1 = x1.max(0).min(img_width as i32 - 1) as u32;
+                        let y1 = y1.max(0).min(img_height as i32 - 1) as u32;
+                        let x2 = x2.max(0).min(img_width as i32) as u32;
+                        let y2 = y2.max(0).min(img_height as i32) as u32;
+
+                        for y in y1..y2 {
+                            for x in x1..x2 {
+                                rgba_img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+                            }
+                        }
+                    }
+
+                    decoded_img = image::DynamicImage::ImageRgba8(rgba_img);
+                    info!("🔍 Applied label 1 white-fill cleaning for debug visualization");
+                }
+
+                // Draw bboxes on the image (cleaned for non-mask, original for mask mode)
+                match draw_debug_bboxes(&decoded_img, &label_0_bboxes, &label_1_bboxes) {
+                    Ok(debug_bytes) => {
+                        let base64_image = general_purpose::STANDARD.encode(&debug_bytes);
+                        let data_url = format!("data:image/png;base64,{}", base64_image);
+
+                        debug_results.push(PageResult {
+                            index: image_data.index,
+                            filename: image_data.filename.clone(),
+                            success: true,
+                            processing_time_ms: phase1_metrics.phase1_time.as_secs_f64() * 1000.0,
+                            error: None,
+                            data_url: Some(data_url),
+                        });
+
+                        info!(
+                            "🔍 Page {}: {} label0 boxes (BLUE), {} label1 boxes (RED)",
+                            image_data.index,
+                            label_0_bboxes.len(),
+                            label_1_bboxes.len()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to draw debug bboxes: {:?}", e);
+                        debug_results.push(PageResult {
+                            index: image_data.index,
+                            filename: image_data.filename.clone(),
+                            success: false,
+                            processing_time_ms: 0.0,
+                            error: Some(format!("Debug bbox drawing failed: {}", e)),
+                            data_url: None,
+                        });
+                    }
+                }
+            }
+
+            // Cleanup ONNX sessions
+            self.phase1.cleanup_detection_sessions();
+
+            let total_time = start_time.elapsed();
+            let successful = debug_results.iter().filter(|r| r.success).count();
+            let failed = debug_results.len() - successful;
+
+            info!(
+                "🔍 L1_DEBUG complete: {} pages visualized in {:.2}s",
+                successful,
+                total_time.as_secs_f64()
+            );
+
+            return Ok(BatchResult {
+                total: total_images,
+                successful,
+                failed,
+                processing_time_ms: total_time.as_secs_f64() * 1000.0,
+                average_time_per_page_ms: total_time.as_secs_f64() * 1000.0 / total_images.max(1) as f64,
+                analytics: BatchAnalytics {
+                    total_images,
+                    total_regions: phase1_metrics.total_regions,
+                    simple_bg_count: phase1_metrics.simple_bg_count,
+                    complex_bg_count: phase1_metrics.complex_bg_count,
+                    label_0_count: phase1_metrics.label_0_count,
+                    label_1_count: phase1_metrics.label_1_count,
+                    label_2_count: phase1_metrics.label_2_count,
+                    validation_warnings: 0,
+                    api_calls_simple: 0,
+                    api_calls_complex: 0,
+                    api_calls_banana: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_hits: 0,
+                    cache_misses: 0,
+                    phase1_time_ms: phase1_metrics.phase1_time.as_secs_f64() * 1000.0,
+                    phase2_time_ms: 0.0,
+                    phase3_time_ms: 0.0,
+                    phase4_time_ms: 0.0,
+                    total_time_ms: total_time.as_secs_f64() * 1000.0,
+                    inference_time_ms: 0.0,
+                    api_wait_time_ms: 0.0,
+                },
+                results: debug_results,
+            });
+        }
 
         // ===== SEGMENTATION: Run in background and await completion before Phase 2 =====
         info!("🔄 Starting segmentation...");
@@ -377,54 +531,71 @@ impl BatchOrchestrator {
             }
         }
 
-        // ===== PHASE 3: ALL PAGES =====
-        info!("Starting Phase 3 for all {} pages", all_phase2_data.len());
+        // ===== PHASE 3: ALL PAGES (SKIPPED IF EARLY CLEANED) =====
         let phase3_start = Instant::now();
-
-        let mut phase3_tasks = Vec::new();
-        for (image_data, phase1_output, phase2_output) in all_phase2_data.iter() {
-            let phase3 = Arc::clone(&self.phase3);
-            let config = Arc::clone(&config);
-            let app_config = Arc::clone(&app_config);
-            let image_data = image_data.clone();
-            let phase1_output = phase1_output.clone();
-            let phase2_output = phase2_output.clone();
-
-            let task = tokio::spawn(async move {
-                let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
-                let use_mask = config.use_mask.unwrap_or(true);
-                let tighter_bounds = config.tighter_bounds.unwrap_or(true);
-
-                let banana_region_ids: Vec<usize> = phase2_output
-                    .complex_bg_bananas
-                    .iter()
-                    .map(|b| b.region_id)
-                    .collect();
-
-                let phase3_output = phase3
-                    .execute(&image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask, tighter_bounds)
-                    .await?;
-
-                Ok::<_, anyhow::Error>((image_data, phase1_output, phase2_output, phase3_output))
-            });
-
-            phase3_tasks.push(task);
-        }
-
         let mut all_phase3_data = Vec::new();
-        for task in phase3_tasks {
-            match task.await {
-                Ok(Ok(data)) => all_phase3_data.push(data),
-                Ok(Err(e)) => tracing::error!("Phase 3 error: {:?}", e),
-                Err(e) => tracing::error!("Phase 3 task error: {:?}", e),
+
+        // Check if we can skip Phase 3 (early cleaning was done in Phase 1)
+        let skip_phase3 = !use_mask && all_phase2_data.iter().all(|(_, p1, _)| p1.early_cleaned_regions.is_some());
+
+        if skip_phase3 {
+            info!("⚡ Skipping Phase 3 for all {} pages (early cleaned in Phase 1)", all_phase2_data.len());
+
+            // Create Phase3Output from early_cleaned_regions
+            for (image_data, phase1_output, phase2_output) in all_phase2_data.into_iter() {
+                let phase3_output = crate::core::types::Phase3Output {
+                    page_index: phase1_output.page_index,
+                    cleaned_regions: phase1_output.early_cleaned_regions.clone().unwrap_or_default(),
+                };
+                all_phase3_data.push((image_data, phase1_output, phase2_output, phase3_output));
+            }
+        } else {
+            info!("Starting Phase 3 for all {} pages", all_phase2_data.len());
+
+            let mut phase3_tasks = Vec::new();
+            for (image_data, phase1_output, phase2_output) in all_phase2_data.iter() {
+                let phase3 = Arc::clone(&self.phase3);
+                let config = Arc::clone(&config);
+                let app_config = Arc::clone(&app_config);
+                let image_data = image_data.clone();
+                let phase1_output = phase1_output.clone();
+                let phase2_output = phase2_output.clone();
+
+                let task = tokio::spawn(async move {
+                    let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
+                    let use_mask = config.use_mask.unwrap_or(true);
+
+                    let banana_region_ids: Vec<usize> = phase2_output
+                        .complex_bg_bananas
+                        .iter()
+                        .map(|b| b.region_id)
+                        .collect();
+
+                    let phase3_output = phase3
+                        .execute(&image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask)
+                        .await?;
+
+                    Ok::<_, anyhow::Error>((image_data, phase1_output, phase2_output, phase3_output))
+                });
+
+                phase3_tasks.push(task);
+            }
+
+            for task in phase3_tasks {
+                match task.await {
+                    Ok(Ok(data)) => all_phase3_data.push(data),
+                    Ok(Err(e)) => tracing::error!("Phase 3 error: {:?}", e),
+                    Err(e) => tracing::error!("Phase 3 task error: {:?}", e),
+                }
             }
         }
 
         phase1_metrics.phase3_time = phase3_start.elapsed();
         info!(
-            "Phase 3 complete for all {} pages in {:.2}ms",
+            "Phase 3 complete for all {} pages in {:.2}ms{}",
             all_phase3_data.len(),
-            phase1_metrics.phase3_time.as_secs_f64() * 1000.0
+            phase1_metrics.phase3_time.as_secs_f64() * 1000.0,
+            if skip_phase3 { " (skipped)" } else { "" }
         );
 
         // ===== PHASE 4: ALL PAGES =====
@@ -567,6 +738,7 @@ async fn process_single_batch(
     let include_free_text = config.include_free_text.unwrap_or(false);
     let use_mask = config.use_mask.unwrap_or(true);
     let filter_orphan_regions = config.filter_orphan_regions.unwrap_or(false);
+    let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
 
     // ===== PHASE 1: Detection & Categorization =====
     let phase1_start = Instant::now();
@@ -575,7 +747,7 @@ async fn process_single_batch(
     let phase1_results: Vec<Result<Result<(ImageData, crate::core::types::Phase1Output), anyhow::Error>, tokio::task::JoinError>> = if merge_img {
         // BATCH MODE: Run detection for all images in single ONNX inference
         // Execute batch Phase 1
-        let batch_outputs = phase1.execute_batch(&batch.images, use_mask, merge_img, config.target_size, filter_orphan_regions).await;
+        let batch_outputs = phase1.execute_batch(&batch.images, use_mask, merge_img, config.target_size, filter_orphan_regions, blur_free_text).await;
 
         match batch_outputs {
             Ok(outputs) => {
@@ -601,11 +773,13 @@ async fn process_single_batch(
         let phase1_tasks: Vec<_> = batch.images.iter().map(|image_data| {
             let phase1 = Arc::clone(&phase1);
             let config = Arc::clone(&config);
+            let app_config = Arc::clone(&app_config);
             let image_data = image_data.clone();
 
             tokio::spawn(async move {
                 let include_free_text = config.include_free_text.unwrap_or(false);
                 let use_mask = config.use_mask.unwrap_or(true);
+                let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
 
                 // Load decoded image
                 let decoded_image = if let Some(ref img) = image_data.decoded_image {
@@ -617,7 +791,7 @@ async fn process_single_batch(
                 let mut optimized_image_data = image_data.clone();
                 optimized_image_data.decoded_image = Some(decoded_image);
 
-                let mut phase1_output = phase1.execute(&optimized_image_data, use_mask, config.mask_mode.as_deref(), config.target_size, filter_orphan_regions).await?;
+                let mut phase1_output = phase1.execute(&optimized_image_data, use_mask, config.mask_mode.as_deref(), config.target_size, filter_orphan_regions, blur_free_text).await?;
 
                 // Filter out label 2 if not included
                 if !include_free_text {
@@ -750,48 +924,63 @@ async fn process_single_batch(
         }
     }
 
-    // ===== PHASE 3: All pages in parallel =====
+    // ===== PHASE 3: All pages in parallel (SKIPPED IF EARLY CLEANED) =====
     let phase3_start = Instant::now();
-    let phase3_tasks: Vec<_> = phase2_data.iter().map(|(image_data, phase1_output, phase2_output)| {
-        let phase3 = Arc::clone(&phase3);
-        let config = Arc::clone(&config);
-        let app_config = Arc::clone(&app_config);
-        let image_data = image_data.clone();
-        let phase1_output = phase1_output.clone();
-        let phase2_output = phase2_output.clone();
 
-        tokio::spawn(async move {
-            let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
-            let use_mask = config.use_mask.unwrap_or(true);
-            let tighter_bounds = config.tighter_bounds.unwrap_or(true);
+    // Check if we can skip Phase 3 (early cleaning was done in Phase 1)
+    let skip_phase3 = !use_mask && phase2_data.iter().all(|(_, p1, _)| p1.early_cleaned_regions.is_some());
 
-            let banana_region_ids: Vec<usize> = phase2_output
-                .complex_bg_bananas
-                .iter()
-                .map(|b| b.region_id)
-                .collect();
+    let phase3_data: Vec<(ImageData, crate::core::types::Phase1Output, crate::core::types::Phase2Output, crate::core::types::Phase3Output)> = if skip_phase3 {
+        // Create Phase3Output from early_cleaned_regions
+        phase2_data.into_iter().map(|(image_data, phase1_output, phase2_output)| {
+            let phase3_output = crate::core::types::Phase3Output {
+                page_index: phase1_output.page_index,
+                cleaned_regions: phase1_output.early_cleaned_regions.clone().unwrap_or_default(),
+            };
+            (image_data, phase1_output, phase2_output, phase3_output)
+        }).collect()
+    } else {
+        let phase3_tasks: Vec<_> = phase2_data.iter().map(|(image_data, phase1_output, phase2_output)| {
+            let phase3 = Arc::clone(&phase3);
+            let config = Arc::clone(&config);
+            let app_config = Arc::clone(&app_config);
+            let image_data = image_data.clone();
+            let phase1_output = phase1_output.clone();
+            let phase2_output = phase2_output.clone();
 
-            let phase3_output = phase3
-                .execute(&image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask, tighter_bounds)
-                .await?;
+            tokio::spawn(async move {
+                let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
+                let use_mask = config.use_mask.unwrap_or(true);
 
-            Ok::<_, anyhow::Error>((image_data, phase1_output, phase2_output, phase3_output))
-        })
-    }).collect();
+                let banana_region_ids: Vec<usize> = phase2_output
+                    .complex_bg_bananas
+                    .iter()
+                    .map(|b| b.region_id)
+                    .collect();
 
-    let phase3_results = join_all(phase3_tasks).await;
-    batch_metrics.phase3_time = phase3_start.elapsed();
+                let phase3_output = phase3
+                    .execute(&image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask)
+                    .await?;
 
-    // Collect Phase 3 outputs
-    let mut phase3_data: Vec<(ImageData, crate::core::types::Phase1Output, crate::core::types::Phase2Output, crate::core::types::Phase3Output)> = Vec::new();
+                Ok::<_, anyhow::Error>((image_data, phase1_output, phase2_output, phase3_output))
+            })
+        }).collect();
 
-    for result in phase3_results {
-        match result {
-            Ok(Ok(data)) => phase3_data.push(data),
-            Ok(Err(e)) => tracing::error!("Phase 3 error: {:?}", e),
-            Err(e) => tracing::error!("Phase 3 task error: {:?}", e),
+        let phase3_results = join_all(phase3_tasks).await;
+
+        // Collect Phase 3 outputs
+        let mut data = Vec::new();
+        for result in phase3_results {
+            match result {
+                Ok(Ok(d)) => data.push(d),
+                Ok(Err(e)) => tracing::error!("Phase 3 error: {:?}", e),
+                Err(e) => tracing::error!("Phase 3 task error: {:?}", e),
+            }
         }
-    }
+        data
+    };
+
+    batch_metrics.phase3_time = phase3_start.elapsed();
 
     // ===== PHASE 4: All pages in parallel =====
     let phase4_start = Instant::now();
@@ -907,7 +1096,7 @@ async fn process_single_page(
     // Phase 1: Detection & Categorization
     let p1_start = Instant::now();
     let mut phase1_output = phase1
-        .execute(&optimized_image_data, use_mask, config.mask_mode.as_deref(), config.target_size, filter_orphan_regions)
+        .execute(&optimized_image_data, use_mask, config.mask_mode.as_deref(), config.target_size, filter_orphan_regions, blur_free_text)
         .await
         .context("Phase 1 failed")?;
 
@@ -953,12 +1142,20 @@ async fn process_single_page(
         .map(|b| b.region_id)
         .collect();
 
-    // Phase 3: Text Removal
+    // Phase 3: Text Removal (skip if early cleaned)
     let p3_start = Instant::now();
-    let phase3_output = phase3
-        .execute(&optimized_image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask, tighter_bounds)
-        .await
-        .context("Phase 3 failed")?;
+    let phase3_output = if !use_mask && phase1_output.early_cleaned_regions.is_some() {
+        // Skip Phase 3 - use early cleaned regions from Phase 1
+        crate::core::types::Phase3Output {
+            page_index: phase1_output.page_index,
+            cleaned_regions: phase1_output.early_cleaned_regions.clone().unwrap_or_default(),
+        }
+    } else {
+        phase3
+            .execute(&optimized_image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask)
+            .await
+            .context("Phase 3 failed")?
+    };
     metrics.phase3_time = p3_start.elapsed();
 
     // Handle Google Fonts if needed
