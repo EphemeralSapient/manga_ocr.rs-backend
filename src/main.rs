@@ -80,6 +80,19 @@ async fn main() -> Result<()> {
     // Initialize batch orchestrator
     info!("Initializing batch orchestrator...");
     let orchestrator = Arc::new(BatchOrchestrator::new(config.clone()).await?);
+
+    // Warm up OCR service (lazy initialization - loads model on first use)
+    info!("Warming up OCR service...");
+    let models_dir = std::path::Path::new("models");
+    if manga_workflow::services::is_ocr_available(models_dir) {
+        match manga_workflow::services::warmup_ocr_service(models_dir) {
+            Ok(_) => info!("OCR service warmed up successfully"),
+            Err(e) => info!("OCR service warm-up skipped: {}", e),
+        }
+    } else {
+        info!("OCR models not available, skipping warm-up");
+    }
+
     let initial_session_limit = config.onnx_pool_size();
     let state = AppState {
         config: config.clone(),

@@ -1,12 +1,19 @@
 use std::env;
 
 fn main() {
+    // Allow custom cfg for OCR model embedding
+    println!("cargo::rustc-check-cfg=cfg(ocr_model_embedded)");
+
     let detector_path = "models/detector.onnx";
     let mask_path = "models/mask.onnx";
+    let ocr_model_path = "models/ocr/ocr.onnx";
+    let ocr_vocab_path = "models/ocr/cjk_vocab.txt";
 
     // Trigger rebuild if models change
     println!("cargo:rerun-if-changed={}", detector_path);
     println!("cargo:rerun-if-changed={}", mask_path);
+    println!("cargo:rerun-if-changed={}", ocr_model_path);
+    println!("cargo:rerun-if-changed={}", ocr_vocab_path);
 
     // Check if models exist and are real (not LFS stubs)
     let detector_exists = std::path::Path::new(detector_path).exists();
@@ -135,5 +142,73 @@ fn main() {
     if target.contains("windows-gnu") && gpu_features.contains(&"CUDA") {
         println!("cargo:warning=WARNING: CUDA binaries may not be available for Windows GNU target");
         println!("cargo:warning=Consider using DirectML instead: cargo build --features directml");
+    }
+
+    // OCR model handling:
+    // - Local builds: Embed OCR model into binary for self-contained executable
+    // - CI builds (GitHub Actions): Don't embed, just copy to output directory
+    let ocr_model_exists = std::path::Path::new(ocr_model_path).exists();
+    let ocr_vocab_exists = std::path::Path::new(ocr_vocab_path).exists();
+
+    // Detect CI environment (GitHub Actions, GitLab CI, Jenkins, etc.)
+    let is_ci = env::var("CI").is_ok()
+        || env::var("GITHUB_ACTIONS").is_ok()
+        || env::var("GITLAB_CI").is_ok()
+        || env::var("JENKINS_URL").is_ok();
+
+    if ocr_model_exists && ocr_vocab_exists {
+        let ocr_model_size = std::fs::metadata(ocr_model_path).map(|m| m.len()).unwrap_or(0);
+        let ocr_vocab_size = std::fs::metadata(ocr_vocab_path).map(|m| m.len()).unwrap_or(0);
+
+        // Only process if they are real files (not LFS stubs)
+        if ocr_model_size > 10_000 && ocr_vocab_size > 1_000 {
+            let out_dir = env::var("OUT_DIR").unwrap();
+            let profile = env::var("PROFILE").unwrap();
+
+            // Calculate target directory (e.g., target/release)
+            let target_dir = std::path::Path::new(&out_dir)
+                .ancestors()
+                .nth(3)
+                .unwrap()
+                .join(&profile);
+
+            // Create ocr models directory in target
+            let ocr_target_dir = target_dir.join("models").join("ocr");
+            if let Err(e) = std::fs::create_dir_all(&ocr_target_dir) {
+                println!("cargo:warning=Failed to create OCR models directory: {}", e);
+            } else {
+                // Copy OCR model to output
+                let ocr_model_target = ocr_target_dir.join("ocr.onnx");
+                match std::fs::copy(ocr_model_path, &ocr_model_target) {
+                    Ok(_) => println!("cargo:warning=Copied OCR model to output: {:.1} MB", ocr_model_size as f64 / 1_048_576.0),
+                    Err(e) => println!("cargo:warning=Failed to copy OCR model: {}", e),
+                }
+
+                // Copy vocab file
+                let ocr_vocab_target = ocr_target_dir.join("cjk_vocab.txt");
+                match std::fs::copy(ocr_vocab_path, &ocr_vocab_target) {
+                    Ok(_) => println!("cargo:warning=Copied OCR vocab to output: {:.1} KB", ocr_vocab_size as f64 / 1024.0),
+                    Err(e) => println!("cargo:warning=Failed to copy OCR vocab: {}", e),
+                }
+            }
+
+            // For local builds (not CI), also embed into binary
+            if !is_ci {
+                println!("cargo:warning=LOCAL BUILD: Embedding OCR model into binary ({:.1} MB)", ocr_model_size as f64 / 1_048_576.0);
+                println!("cargo:rustc-cfg=ocr_model_embedded");
+            } else {
+                println!("cargo:warning=CI BUILD: OCR model NOT embedded (will load from disk)");
+            }
+        } else {
+            println!("cargo:warning=OCR models are LFS stubs - will load from runtime path");
+        }
+    } else {
+        println!("cargo:warning=OCR models not found - local OCR feature will be unavailable");
+        if !ocr_model_exists {
+            println!("cargo:warning=  Missing: {}", ocr_model_path);
+        }
+        if !ocr_vocab_exists {
+            println!("cargo:warning=  Missing: {}", ocr_vocab_path);
+        }
     }
 }

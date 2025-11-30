@@ -864,6 +864,98 @@ impl ApiClient {
 
         anyhow::bail!("Failed after {} retries", max_retries)
     }
+
+    /// Translate text using Gemini (text-only, no images)
+    /// Used when local OCR extracts text and we only need translation
+    pub async fn translate_text(
+        &self,
+        text: &str,
+        target_language: Option<&str>,
+    ) -> Result<String> {
+        debug!("Text translation for: {}", text.chars().take(50).collect::<String>());
+
+        // Check circuit breaker
+        if !self.circuit_breaker.allow_request() {
+            warn!("Circuit breaker is open, failing fast");
+            anyhow::bail!("Circuit breaker is open, API is unavailable");
+        }
+
+        let start = Instant::now();
+
+        // Get healthy API key
+        let (key_idx, api_key) = self
+            .api_key_pool
+            .get_healthy_key()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No healthy API keys available"))?;
+
+        let model = self.config.ocr_translation_model();
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            model, api_key
+        );
+
+        let target_lang = target_language.unwrap_or("English");
+        let prompt = format!(
+            "Translate the following Japanese text to {}. \
+             Only output the translation, nothing else. \
+             If the text is unclear, translate your best interpretation.\n\n{}",
+            target_lang, text
+        );
+
+        let request_body = serde_json::json!({
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "temperature": 0.7,
+                "topP": 0.95,
+                "maxOutputTokens": 1024
+            }
+        });
+
+        // Send request
+        let result = self
+            .send_with_retries(&url, &request_body, key_idx)
+            .await;
+
+        let duration = start.elapsed();
+
+        match result {
+            Ok(response_text) => {
+                self.circuit_breaker.record_success();
+                self.api_key_pool.record_success(key_idx).await;
+
+                let response: serde_json::Value = serde_json::from_str(&response_text)
+                    .context("Failed to parse text translation response")?;
+
+                let (input_tokens, output_tokens) = extract_token_usage(&response);
+
+                if let Some(ref m) = self.metrics {
+                    m.record_api_call(true, duration, input_tokens, output_tokens);
+                }
+
+                // Extract translated text
+                let translated = response["candidates"][0]["content"]["parts"][0]["text"]
+                    .as_str()
+                    .unwrap_or(text)
+                    .trim()
+                    .to_string();
+
+                Ok(translated)
+            }
+            Err(e) => {
+                self.circuit_breaker.record_failure();
+                self.api_key_pool.record_failure(key_idx).await;
+
+                if let Some(ref m) = self.metrics {
+                    m.record_api_call(false, duration, 0, 0);
+                }
+
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Extract token usage from Gemini API response

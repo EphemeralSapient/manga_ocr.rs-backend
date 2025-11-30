@@ -141,6 +141,25 @@ pub struct ProcessingConfig {
     /// If not provided, defaults to false
     #[serde(rename = "l1Debug")]
     pub l1_debug: Option<bool>,
+
+    /// Enable local OCR instead of using Gemini for text extraction
+    /// When enabled, uses local OCR model for Japanese text recognition
+    /// Label 1,2 regions are processed immediately in parallel with detection
+    /// If not provided, defaults to false
+    #[serde(rename = "ocr")]
+    pub ocr_enabled: Option<bool>,
+
+    /// Use Cerebras API instead of Gemini for translation (only when ocr_enabled=true)
+    /// Cerebras provides ~3000 tokens/sec for fast translation
+    /// All extracted text is batched into a single API call
+    /// If not provided, defaults to false (use Gemini)
+    #[serde(rename = "useCerebras")]
+    pub use_cerebras: Option<bool>,
+
+    /// Cerebras API key for translation (only used when use_cerebras=true)
+    /// If not provided, tries CEREBRAS_API_KEY environment variable
+    #[serde(rename = "cerebrasApiKey")]
+    pub cerebras_api_key: Option<String>,
 }
 
 /// Detection label for region classification

@@ -92,7 +92,7 @@ impl BatchOrchestrator {
     /// Format ProcessingConfig for logging without exposing sensitive data
     fn format_config_for_logging(config: &ProcessingConfig) -> String {
         format!(
-            "model={}, banana_mode={}, cache={}, mask={}, mask_mode={}, merge_img={}, sessions={}, include_free_text={}, text_stroke={}, blur_bg={}, tighter_bounds={}, target_size={}, filter_orphans={}, api_keys={}",
+            "model={}, banana_mode={}, cache={}, mask={}, mask_mode={}, merge_img={}, sessions={}, include_free_text={}, text_stroke={}, blur_bg={}, tighter_bounds={}, target_size={}, filter_orphans={}, api_keys={}, local_ocr={}, use_cerebras={}",
             config.ocr_translation_model.as_deref().unwrap_or("default"),
             config.banana_mode.unwrap_or(false),
             config.cache_enabled.unwrap_or(true),
@@ -106,7 +106,9 @@ impl BatchOrchestrator {
             config.tighter_bounds.unwrap_or(true),
             config.target_size.map(|s| if s == 0 { "source".to_string() } else { s.to_string() }).unwrap_or_else(|| "default".to_string()),
             config.filter_orphan_regions.unwrap_or(false),
-            config.api_keys.as_ref().map(|keys| format!("[{} keys]", keys.len())).unwrap_or_else(|| "[default]".to_string())
+            config.api_keys.as_ref().map(|keys| format!("[{} keys]", keys.len())).unwrap_or_else(|| "[default]".to_string()),
+            config.ocr_enabled.unwrap_or(false),
+            config.use_cerebras.unwrap_or(false)
         )
     }
 
@@ -489,9 +491,32 @@ impl BatchOrchestrator {
         let target_language = config.target_language.as_deref();
         let reuse_factor = config.reuse_factor.unwrap_or(4).clamp(1, 8);
 
-        let phase2_outputs = self.phase2
-            .execute_batch(&all_phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys, target_language, reuse_factor)
-            .await;
+        // Check if local OCR mode is enabled
+        let ocr_enabled = config.ocr_enabled.unwrap_or(false);
+        let use_cerebras = config.use_cerebras.unwrap_or(false);
+        let cerebras_api_key = config.cerebras_api_key.as_deref();
+
+        let phase2_outputs = if ocr_enabled {
+            // LOCAL OCR MODE: Use local OCR for text extraction + Cerebras/Gemini for translation
+            info!("Phase 2 using LOCAL OCR mode (use_cerebras={})", use_cerebras);
+            let models_dir = std::path::Path::new("models");
+            self.phase2
+                .execute_batch_with_local_ocr(
+                    &all_phase1_data,
+                    models_dir,
+                    use_cerebras,
+                    cerebras_api_key,
+                    target_language,
+                    cache_enabled,
+                    custom_api_keys,
+                )
+                .await
+        } else {
+            // STANDARD MODE: Use Gemini for OCR + translation
+            self.phase2
+                .execute_batch(&all_phase1_data, ocr_model_override, banana_model_override, banana_mode, cache_enabled, custom_api_keys, target_language, reuse_factor)
+                .await
+        };
 
         phase1_metrics.phase2_time = phase2_start.elapsed();
         info!(

@@ -852,4 +852,269 @@ impl Phase2Pipeline {
 
         Ok(all_translations)
     }
+
+    // =========================================================================
+    // LOCAL OCR PROCESSING (ALTERNATIVE TO GEMINI OCR)
+    // =========================================================================
+
+    /// Execute Phase 2 with local OCR instead of Gemini
+    ///
+    /// This method:
+    /// 1. Uses local OCR model to extract Japanese text from regions
+    /// 2. Translates extracted text using Cerebras (fast) or Gemini
+    /// 3. Returns translations in the same format as execute_batch
+    ///
+    /// # Arguments
+    /// * `pages` - Vector of (ImageData, Phase1Output) pairs
+    /// * `models_dir` - Path to models directory containing OCR model
+    /// * `use_cerebras` - Whether to use Cerebras API for translation
+    /// * `cerebras_api_key` - Optional Cerebras API key
+    /// * `target_language` - Optional target language for translation
+    /// * `cache_enabled` - Whether to use translation cache
+    /// * `custom_api_keys` - Optional custom Gemini API keys (used if not using Cerebras)
+    ///
+    /// # Returns
+    /// Vector of Phase2Output for each page
+    pub async fn execute_batch_with_local_ocr(
+        &self,
+        pages: &[(ImageData, Phase1Output)],
+        models_dir: &std::path::Path,
+        use_cerebras: bool,
+        cerebras_api_key: Option<&str>,
+        target_language: Option<&str>,
+        cache_enabled: bool,
+        custom_api_keys: Option<&[String]>,
+    ) -> Result<Vec<Phase2Output>> {
+        use crate::services::ocr::{get_ocr_service, is_ocr_available};
+        use crate::services::translation::CerebrasClient;
+
+        if pages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        info!("Phase 2 OCR MODE: Processing {} pages with local OCR", pages.len());
+
+        // Check OCR availability
+        if !is_ocr_available(models_dir) {
+            anyhow::bail!("OCR models not found at {:?}. Local OCR feature is unavailable.", models_dir);
+        }
+
+        // Get or initialize OCR service
+        let ocr_service = get_ocr_service(models_dir)?;
+
+        // Collect all regions and run OCR
+        let mut ocr_results: Vec<(usize, usize, u64, [i32; 4], String)> = Vec::new();
+        let mut cached_results: Vec<(usize, usize, OCRTranslation)> = Vec::new();
+
+        for (image_data, phase1_output) in pages {
+            // Load image
+            let img_owned;
+            let img: &DynamicImage = if let Some(ref decoded) = image_data.decoded_image {
+                decoded.as_ref()
+            } else {
+                img_owned = image::load_from_memory(&image_data.image_bytes)
+                    .context("Failed to load image")?;
+                &img_owned
+            };
+
+            let source_image_hash = xxh3_64(&image_data.image_bytes);
+            let page_index = phase1_output.page_index;
+
+            for region in &phase1_output.regions {
+                // Check cache first
+                if cache_enabled {
+                    let cache_key = TranslationCache::generate_key_from_source(
+                        source_image_hash,
+                        &region.bbox,
+                    );
+                    if let Some(cached_translation) = self.cache.get(cache_key) {
+                        cached_results.push((page_index, region.region_id, cached_translation));
+                        continue;
+                    }
+                }
+
+                // Crop the region
+                let [x1, y1, x2, y2] = region.bbox;
+                let width = (x2 - x1).max(1) as u32;
+                let height = (y2 - y1).max(1) as u32;
+
+                // Clamp to image boundaries
+                let img_width = img.width();
+                let img_height = img.height();
+                let x1_clamped = (x1.max(0) as u32).min(img_width.saturating_sub(1));
+                let y1_clamped = (y1.max(0) as u32).min(img_height.saturating_sub(1));
+                let width_clamped = width.min(img_width.saturating_sub(x1_clamped));
+                let height_clamped = height.min(img_height.saturating_sub(y1_clamped));
+
+                if width_clamped == 0 || height_clamped == 0 {
+                    warn!("Region {} has zero size, skipping", region.region_id);
+                    continue;
+                }
+
+                let cropped = img.crop_imm(x1_clamped, y1_clamped, width_clamped, height_clamped);
+
+                // Run local OCR
+                match ocr_service.recognize(&cropped) {
+                    Ok((text, _confidence)) => {
+                        if !text.trim().is_empty() {
+                            ocr_results.push((
+                                page_index,
+                                region.region_id,
+                                source_image_hash,
+                                region.bbox,
+                                text,
+                            ));
+                        } else {
+                            debug!("OCR returned empty text for region {}", region.region_id);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("OCR failed for region {}: {:?}", region.region_id, e);
+                    }
+                }
+            }
+        }
+
+        info!(
+            "OCR extracted text from {} regions ({} cache hits)",
+            ocr_results.len(),
+            cached_results.len()
+        );
+
+        // Translate the extracted text
+        let translations = if !ocr_results.is_empty() {
+            if use_cerebras {
+                // Use Cerebras for translation
+                let cerebras_key = cerebras_api_key
+                    .map(|s| s.to_string())
+                    .or_else(|| std::env::var("CEREBRAS_API_KEY").ok())
+                    .ok_or_else(|| anyhow::anyhow!("Cerebras API key not provided"))?;
+
+                let cerebras = CerebrasClient::new(cerebras_key)?;
+
+                // Prepare batch for Cerebras
+                let texts: Vec<(usize, String)> = ocr_results
+                    .iter()
+                    .map(|(_, region_id, _, _, text)| (*region_id, text.clone()))
+                    .collect();
+
+                let translated = cerebras
+                    .translate_batch(texts, target_language)
+                    .await
+                    .context("Cerebras translation failed")?;
+
+                // Build translation map
+                let translation_map: std::collections::HashMap<usize, String> =
+                    translated.into_iter().collect();
+
+                // Match back to regions
+                let mut result = Vec::new();
+                for (page_index, region_id, source_hash, bbox, original_text) in &ocr_results {
+                    let translated_text = translation_map
+                        .get(region_id)
+                        .cloned()
+                        .unwrap_or_else(|| original_text.clone());
+
+                    let translation = OCRTranslation {
+                        original_text: Arc::from(original_text.as_str()),
+                        translated_text: Arc::from(translated_text.as_str()),
+                    };
+
+                    // Cache the translation
+                    if cache_enabled {
+                        let cache_key = TranslationCache::generate_key_from_source(*source_hash, bbox);
+                        self.cache.put(cache_key, &translation);
+                    }
+
+                    result.push((*page_index, *region_id, translation));
+                }
+
+                result
+            } else {
+                // Use Gemini for translation (text-only, no images)
+                let api_client: Arc<ApiClient> = if let Some(custom_keys) = custom_api_keys {
+                    if !custom_keys.is_empty() {
+                        self.api_client.with_custom_keys(custom_keys.to_vec())
+                    } else {
+                        Arc::clone(&self.api_client)
+                    }
+                } else {
+                    Arc::clone(&self.api_client)
+                };
+
+                // Translate each text using Gemini text API
+                let mut result = Vec::new();
+                for (page_index, region_id, source_hash, bbox, original_text) in &ocr_results {
+                    match api_client
+                        .translate_text(original_text, target_language)
+                        .await
+                    {
+                        Ok(translated_text) => {
+                            let translation = OCRTranslation {
+                                original_text: Arc::from(original_text.as_str()),
+                                translated_text: Arc::from(translated_text.as_str()),
+                            };
+
+                            // Cache the translation
+                            if cache_enabled {
+                                let cache_key = TranslationCache::generate_key_from_source(*source_hash, bbox);
+                                self.cache.put(cache_key, &translation);
+                            }
+
+                            result.push((*page_index, *region_id, translation));
+                        }
+                        Err(e) => {
+                            warn!("Gemini translation failed for region {}: {:?}", region_id, e);
+                            // Use original text as fallback
+                            let translation = OCRTranslation {
+                                original_text: Arc::from(original_text.as_str()),
+                                translated_text: Arc::from(original_text.as_str()),
+                            };
+                            result.push((*page_index, *region_id, translation));
+                        }
+                    }
+                }
+
+                result
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Assemble Phase2Output for each page
+        let mut outputs: Vec<Phase2Output> = pages
+            .iter()
+            .map(|(_, phase1_output)| Phase2Output {
+                page_index: phase1_output.page_index,
+                simple_bg_translations: Vec::new(),
+                complex_bg_bananas: Vec::new(),
+                complex_bg_translations: Vec::new(),
+            })
+            .collect();
+
+        // Create a map from page_index to output index
+        let page_to_idx: std::collections::HashMap<usize, usize> = pages
+            .iter()
+            .enumerate()
+            .map(|(i, (_, p))| (p.page_index, i))
+            .collect();
+
+        // Distribute cached results
+        for (page_index, region_id, translation) in cached_results {
+            if let Some(&idx) = page_to_idx.get(&page_index) {
+                outputs[idx].simple_bg_translations.push((region_id, translation));
+            }
+        }
+
+        // Distribute OCR translations
+        for (page_index, region_id, translation) in translations {
+            if let Some(&idx) = page_to_idx.get(&page_index) {
+                outputs[idx].simple_bg_translations.push((region_id, translation));
+            }
+        }
+
+        info!("Phase 2 OCR MODE: Completed processing {} pages", pages.len());
+
+        Ok(outputs)
+    }
 }
