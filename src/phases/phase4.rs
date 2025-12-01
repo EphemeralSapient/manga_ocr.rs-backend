@@ -54,17 +54,8 @@ impl Phase4Pipeline {
     ) -> Result<Phase4Output> {
         let start = std::time::Instant::now();
 
-        // Determine if we're in simple mode (Phase 3 skipped) or mask mode
-        let use_simple_mode = phase1_output.early_cleaned_regions.is_some();
-
-        // STEP 1: Get the cleaned base image
-        let mut final_image = if use_simple_mode {
-            // Simple mode: Apply label_1 white-fill to original image
-            self.create_cleaned_base_simple(image_data, phase1_output)?
-        } else {
-            // Mask mode: Reconstruct cleaned image from Phase 3 regions
-            self.create_cleaned_base_mask(image_data, phase1_output, phase3_output)?
-        };
+        // STEP 1: Reconstruct cleaned image from Phase 3 regions (always using segmentation mask)
+        let mut final_image = self.create_cleaned_base_mask(image_data, phase1_output, phase3_output)?;
 
         let (img_width, img_height) = final_image.dimensions();
 
@@ -72,9 +63,8 @@ impl Phase4Pipeline {
         let translations_map = build_translations_map(phase2_output);
         let banana_map = build_banana_map(phase2_output);
 
-        debug!("Phase 4: {} regions, mode={}, translations_map has {} entries",
+        debug!("Phase 4: {} regions, translations_map has {} entries",
             phase1_output.regions.len(),
-            if use_simple_mode { "SIMPLE" } else { "MASK" },
             translations_map.len()
         );
 
@@ -184,45 +174,7 @@ impl Phase4Pipeline {
         })
     }
 
-    /// Create cleaned base image for SIMPLE mode (non-mask)
-    /// Applies label_1 white-fill directly to original image
-    fn create_cleaned_base_simple(
-        &self,
-        image_data: &ImageData,
-        phase1_output: &Phase1Output,
-    ) -> Result<RgbaImage> {
-        let img: DynamicImage = if let Some(ref decoded) = image_data.decoded_image {
-            (**decoded).clone()
-        } else {
-            image::load_from_memory(&image_data.image_bytes)
-                .context("Failed to load image")?
-        };
-
-        let mut final_image = img.to_rgba8();
-        let (img_width, img_height) = final_image.dimensions();
-
-        // Fill all label_1 regions with white
-        for region in &phase1_output.regions {
-            for l1_bbox in &region.label_1_regions {
-                let [l1_x1, l1_y1, l1_x2, l1_y2] = *l1_bbox;
-                let x1 = l1_x1.max(0).min(img_width as i32) as u32;
-                let y1 = l1_y1.max(0).min(img_height as i32) as u32;
-                let x2 = l1_x2.max(0).min(img_width as i32) as u32;
-                let y2 = l1_y2.max(0).min(img_height as i32) as u32;
-
-                for y in y1..y2 {
-                    for x in x1..x2 {
-                        final_image.put_pixel(x, y, Rgba([255, 255, 255, 255]));
-                    }
-                }
-            }
-        }
-
-        debug!("Phase 4: Created cleaned base (SIMPLE mode - white-fill)");
-        Ok(final_image)
-    }
-
-    /// Create cleaned base image for MASK mode
+    /// Create cleaned base image using segmentation mask
     /// Composites Phase 3 cleaned regions onto original image
     fn create_cleaned_base_mask(
         &self,

@@ -248,7 +248,7 @@ All configuration options are documented in `.env.example`. Copy it to `.env` an
 ## Model Credits
 
 - **Text/Bubble Detector**: [ogkalu/comic-text-and-bubble-detector](https://huggingface.co/ogkalu/comic-text-and-bubble-detector)
-- **Segmentation Mask**: [kitsumed/yolov8m_seg-speech-bubble](https://huggingface.co/kitsumed/yolov8m_seg-speech-bubble)
+- **Text Segmentation**: FPN-based text detector (CPU-only, embedded)
 
 ## Disclaimer
 

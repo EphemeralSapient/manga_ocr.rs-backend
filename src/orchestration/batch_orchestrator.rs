@@ -92,18 +92,15 @@ impl BatchOrchestrator {
     /// Format ProcessingConfig for logging without exposing sensitive data
     fn format_config_for_logging(config: &ProcessingConfig) -> String {
         format!(
-            "model={}, banana_mode={}, cache={}, mask={}, mask_mode={}, merge_img={}, sessions={}, include_free_text={}, text_stroke={}, blur_bg={}, tighter_bounds={}, target_size={}, filter_orphans={}, api_keys={}, local_ocr={}, use_cerebras={}",
+            "model={}, banana_mode={}, cache={}, merge_img={}, sessions={}, include_free_text={}, text_stroke={}, blur_bg={}, target_size={}, filter_orphans={}, api_keys={}, local_ocr={}, use_cerebras={}",
             config.ocr_translation_model.as_deref().unwrap_or("default"),
             config.banana_mode.unwrap_or(false),
             config.cache_enabled.unwrap_or(true),
-            config.use_mask.unwrap_or(true),
-            config.mask_mode.as_deref().unwrap_or("fast"),
             config.merge_img.unwrap_or(false),
             config.session_limit.map(|s| s.to_string()).unwrap_or_else(|| "default".to_string()),
             config.include_free_text.unwrap_or(false),
             config.text_stroke.unwrap_or(false),
             config.blur_free_text_bg.unwrap_or(false),
-            config.tighter_bounds.unwrap_or(true),
             config.target_size.map(|s| if s == 0 { "source".to_string() } else { s.to_string() }).unwrap_or_else(|| "default".to_string()),
             config.filter_orphan_regions.unwrap_or(false),
             config.api_keys.as_ref().map(|keys| format!("[{} keys]", keys.len())).unwrap_or_else(|| "[default]".to_string()),
@@ -556,26 +553,12 @@ impl BatchOrchestrator {
             }
         }
 
-        // ===== PHASE 3: ALL PAGES (SKIPPED IF EARLY CLEANED) =====
+        // ===== PHASE 3: ALL PAGES =====
         let phase3_start = Instant::now();
         let mut all_phase3_data = Vec::new();
 
-        // Check if we can skip Phase 3 (early cleaning was done in Phase 1)
-        let skip_phase3 = !use_mask && all_phase2_data.iter().all(|(_, p1, _)| p1.early_cleaned_regions.is_some());
-
-        if skip_phase3 {
-            info!("⚡ Skipping Phase 3 for all {} pages (early cleaned in Phase 1)", all_phase2_data.len());
-
-            // Create Phase3Output from early_cleaned_regions
-            for (image_data, phase1_output, phase2_output) in all_phase2_data.into_iter() {
-                let phase3_output = crate::core::types::Phase3Output {
-                    page_index: phase1_output.page_index,
-                    cleaned_regions: phase1_output.early_cleaned_regions.clone().unwrap_or_default(),
-                };
-                all_phase3_data.push((image_data, phase1_output, phase2_output, phase3_output));
-            }
-        } else {
-            info!("Starting Phase 3 for all {} pages", all_phase2_data.len());
+        info!("Starting Phase 3 for all {} pages", all_phase2_data.len());
+        {
 
             let mut phase3_tasks = Vec::new();
             for (image_data, phase1_output, phase2_output) in all_phase2_data.iter() {
@@ -617,10 +600,9 @@ impl BatchOrchestrator {
 
         phase1_metrics.phase3_time = phase3_start.elapsed();
         info!(
-            "Phase 3 complete for all {} pages in {:.2}ms{}",
+            "Phase 3 complete for all {} pages in {:.2}ms",
             all_phase3_data.len(),
-            phase1_metrics.phase3_time.as_secs_f64() * 1000.0,
-            if skip_phase3 { " (skipped)" } else { "" }
+            phase1_metrics.phase3_time.as_secs_f64() * 1000.0
         );
 
         // ===== PHASE 4: ALL PAGES =====
@@ -949,22 +931,10 @@ async fn process_single_batch(
         }
     }
 
-    // ===== PHASE 3: All pages in parallel (SKIPPED IF EARLY CLEANED) =====
+    // ===== PHASE 3: All pages in parallel =====
     let phase3_start = Instant::now();
 
-    // Check if we can skip Phase 3 (early cleaning was done in Phase 1)
-    let skip_phase3 = !use_mask && phase2_data.iter().all(|(_, p1, _)| p1.early_cleaned_regions.is_some());
-
-    let phase3_data: Vec<(ImageData, crate::core::types::Phase1Output, crate::core::types::Phase2Output, crate::core::types::Phase3Output)> = if skip_phase3 {
-        // Create Phase3Output from early_cleaned_regions
-        phase2_data.into_iter().map(|(image_data, phase1_output, phase2_output)| {
-            let phase3_output = crate::core::types::Phase3Output {
-                page_index: phase1_output.page_index,
-                cleaned_regions: phase1_output.early_cleaned_regions.clone().unwrap_or_default(),
-            };
-            (image_data, phase1_output, phase2_output, phase3_output)
-        }).collect()
-    } else {
+    let phase3_data: Vec<(ImageData, crate::core::types::Phase1Output, crate::core::types::Phase2Output, crate::core::types::Phase3Output)> = {
         let phase3_tasks: Vec<_> = phase2_data.iter().map(|(image_data, phase1_output, phase2_output)| {
             let phase3 = Arc::clone(&phase3);
             let config = Arc::clone(&config);
@@ -1099,7 +1069,6 @@ async fn process_single_page(
     let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
     let cache_enabled = config.cache_enabled.unwrap_or(true);
     let use_mask = config.use_mask.unwrap_or(true);
-    let tighter_bounds = config.tighter_bounds.unwrap_or(true);
     let filter_orphan_regions = config.filter_orphan_regions.unwrap_or(false);
 
     // OPTIMIZATION: Load image once for all phases to avoid redundant decoding
@@ -1167,20 +1136,12 @@ async fn process_single_page(
         .map(|b| b.region_id)
         .collect();
 
-    // Phase 3: Text Removal (skip if early cleaned)
+    // Phase 3: Text Removal
     let p3_start = Instant::now();
-    let phase3_output = if !use_mask && phase1_output.early_cleaned_regions.is_some() {
-        // Skip Phase 3 - use early cleaned regions from Phase 1
-        crate::core::types::Phase3Output {
-            page_index: phase1_output.page_index,
-            cleaned_regions: phase1_output.early_cleaned_regions.clone().unwrap_or_default(),
-        }
-    } else {
-        phase3
-            .execute(&optimized_image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask)
-            .await
-            .context("Phase 3 failed")?
-    };
+    let phase3_output = phase3
+        .execute(&optimized_image_data, &phase1_output, &banana_region_ids, blur_free_text, use_mask)
+        .await
+        .context("Phase 3 failed")?;
     metrics.phase3_time = p3_start.elapsed();
 
     // Handle Google Fonts if needed

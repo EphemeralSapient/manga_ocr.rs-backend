@@ -5,30 +5,30 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(ocr_model_embedded)");
 
     let detector_path = "models/detector.onnx";
-    let mask_path = "models/mask.onnx";
+    let text_cleaner_path = "models/text_cleaner.onnx";
     let ocr_model_path = "models/ocr/ocr.onnx";
     let ocr_vocab_path = "models/ocr/cjk_vocab.txt";
 
     // Trigger rebuild if models change
     println!("cargo:rerun-if-changed={}", detector_path);
-    println!("cargo:rerun-if-changed={}", mask_path);
+    println!("cargo:rerun-if-changed={}", text_cleaner_path);
     println!("cargo:rerun-if-changed={}", ocr_model_path);
     println!("cargo:rerun-if-changed={}", ocr_vocab_path);
 
     // Check if models exist and are real (not LFS stubs)
     let detector_exists = std::path::Path::new(detector_path).exists();
-    let mask_exists = std::path::Path::new(mask_path).exists();
+    let text_cleaner_exists = std::path::Path::new(text_cleaner_path).exists();
 
-    if detector_exists && mask_exists {
+    if detector_exists && text_cleaner_exists {
         let detector_size = std::fs::metadata(detector_path).map(|m| m.len()).unwrap_or(0);
-        let mask_size = std::fs::metadata(mask_path).map(|m| m.len()).unwrap_or(0);
+        let text_cleaner_size = std::fs::metadata(text_cleaner_path).map(|m| m.len()).unwrap_or(0);
 
-        // LFS stub files are tiny (~130 bytes), real models are 100MB+
-        if detector_size > 10_000 && mask_size > 10_000 {
-            let total_size = detector_size + mask_size;
+        // LFS stub files are tiny (~130 bytes), real models are larger
+        if detector_size > 10_000 && text_cleaner_size > 10_000 {
+            let total_size = detector_size + text_cleaner_size;
             println!("cargo:warning=Embedding models into binary:");
             println!("cargo:warning=  - detector.onnx: {:.1} MB", detector_size as f64 / 1_048_576.0);
-            println!("cargo:warning=  - mask.onnx: {:.1} MB", mask_size as f64 / 1_048_576.0);
+            println!("cargo:warning=  - text_cleaner.onnx: {:.1} MB", text_cleaner_size as f64 / 1_048_576.0);
             println!("cargo:warning=  Total: {:.1} MB", total_size as f64 / 1_048_576.0);
         } else {
             println!("cargo:warning=Models are LFS stubs - binary will load from runtime path");

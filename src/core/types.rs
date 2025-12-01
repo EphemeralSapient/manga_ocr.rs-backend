@@ -87,7 +87,7 @@ pub struct ProcessingConfig {
     pub use_mask: Option<bool>,
 
     /// Segmentation model mode (only "fast" is supported)
-    /// Uses YOLOv8-seg: 104MB model, ~100ms per image
+    /// Uses FPN text detector: ~11MB model, CPU-only
     /// This field is kept for backward compatibility but only "fast" mode is used
     #[serde(rename = "maskMode")]
     pub mask_mode: Option<String>,
@@ -104,12 +104,6 @@ pub struct ProcessingConfig {
     /// Range: 1-32, each session uses ~82MB (42MB detection + 40MB segmentation)
     #[serde(rename = "sessionLimit")]
     pub session_limit: Option<usize>,
-
-    /// Apply tighter bounds (erosion) to label 1 mask for more precise text removal
-    /// When enabled, erodes the mask by 7x7 kernel for 4 iterations
-    /// If not provided, defaults to true (enabled)
-    #[serde(rename = "tighterBounds")]
-    pub tighter_bounds: Option<bool>,
 
     /// Target size for model input (pixels)
     /// If not provided, uses TARGET_SIZE from .env (default: 640)
@@ -261,13 +255,8 @@ pub struct Phase1Output {
     pub height: u32,
     pub regions: Vec<CategorizedRegion>,
     pub segmentation_mask: Vec<u8>, // Flattened (h*w)
-    pub mask_mode: String, // "fast" or "accurate" - determines Phase 3 mask logic
+    pub mask_mode: String, // Always "fast" - FPN text detector
     pub validation_warnings: Vec<String>, // e.g., label 1 not in label 0
-    /// Pre-cleaned regions when use_mask=false (allows skipping Phase 3)
-    /// Contains (region_id, cleaned_png_bytes) for each region
-    /// When Some, Phase 3 can be skipped entirely
-    #[serde(skip)]
-    pub early_cleaned_regions: Option<Vec<(usize, Vec<u8>)>>,
 }
 
 /// OCR/Translation result for simple background
