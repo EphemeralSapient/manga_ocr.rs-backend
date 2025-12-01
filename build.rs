@@ -1,8 +1,9 @@
 use std::env;
 
 fn main() {
-    // Allow custom cfg for OCR model embedding
+    // Allow custom cfg for model embedding
     println!("cargo::rustc-check-cfg=cfg(ocr_model_embedded)");
+    println!("cargo::rustc-check-cfg=cfg(text_cleaner_model_embedded)");
 
     let detector_path = "models/detector.onnx";
     let text_cleaner_path = "models/text_cleaner.onnx";
@@ -15,28 +16,70 @@ fn main() {
     println!("cargo:rerun-if-changed={}", ocr_model_path);
     println!("cargo:rerun-if-changed={}", ocr_vocab_path);
 
+    // Detect CI environment (GitHub Actions, GitLab CI, Jenkins, etc.)
+    let is_ci = env::var("CI").is_ok()
+        || env::var("GITHUB_ACTIONS").is_ok()
+        || env::var("GITLAB_CI").is_ok()
+        || env::var("JENKINS_URL").is_ok();
+
     // Check if models exist and are real (not LFS stubs)
     let detector_exists = std::path::Path::new(detector_path).exists();
     let text_cleaner_exists = std::path::Path::new(text_cleaner_path).exists();
 
-    if detector_exists && text_cleaner_exists {
-        let detector_size = std::fs::metadata(detector_path).map(|m| m.len()).unwrap_or(0);
-        let text_cleaner_size = std::fs::metadata(text_cleaner_path).map(|m| m.len()).unwrap_or(0);
+    let detector_size = if detector_exists {
+        std::fs::metadata(detector_path).map(|m| m.len()).unwrap_or(0)
+    } else { 0 };
 
-        // LFS stub files are tiny (~130 bytes), real models are larger
-        if detector_size > 10_000 && text_cleaner_size > 10_000 {
-            let total_size = detector_size + text_cleaner_size;
-            println!("cargo:warning=Embedding models into binary:");
-            println!("cargo:warning=  - detector.onnx: {:.1} MB", detector_size as f64 / 1_048_576.0);
-            println!("cargo:warning=  - text_cleaner.onnx: {:.1} MB", text_cleaner_size as f64 / 1_048_576.0);
-            println!("cargo:warning=  Total: {:.1} MB", total_size as f64 / 1_048_576.0);
+    let text_cleaner_size = if text_cleaner_exists {
+        std::fs::metadata(text_cleaner_path).map(|m| m.len()).unwrap_or(0)
+    } else { 0 };
+
+    // Report embedding status
+    if detector_size > 10_000 && text_cleaner_size > 10_000 {
+        let total_size = detector_size + text_cleaner_size;
+        println!("cargo:warning=Models found:");
+        println!("cargo:warning=  - detector.onnx: {:.1} MB", detector_size as f64 / 1_048_576.0);
+        println!("cargo:warning=  - text_cleaner.onnx: {:.1} MB", text_cleaner_size as f64 / 1_048_576.0);
+        println!("cargo:warning=  Total: {:.1} MB", total_size as f64 / 1_048_576.0);
+
+        if !is_ci {
+            // Local builds: Embed text_cleaner into binary
+            println!("cargo:warning=LOCAL BUILD: Embedding text_cleaner.onnx into binary");
+            println!("cargo:rustc-cfg=text_cleaner_model_embedded");
         } else {
-            println!("cargo:warning=Models are LFS stubs - binary will load from runtime path");
-            println!("cargo:warning=Binary will be small (~25MB). Models must be provided at runtime.");
+            println!("cargo:warning=CI BUILD: text_cleaner.onnx will load from disk");
         }
     } else {
-        println!("cargo:warning=Models not found - binary will load from runtime path");
-        println!("cargo:warning=Binary will be small (~25MB). Models must be provided at runtime.");
+        println!("cargo:warning=Models are LFS stubs or missing - will load from runtime path");
+        if detector_size <= 10_000 {
+            println!("cargo:warning=  detector.onnx: {} bytes (stub)", detector_size);
+        }
+        if text_cleaner_size <= 10_000 {
+            println!("cargo:warning=  text_cleaner.onnx: {} bytes (stub)", text_cleaner_size);
+        }
+    }
+
+    // Copy text_cleaner.onnx to output directory (for CI builds to distribute)
+    if text_cleaner_size > 10_000 {
+        let out_dir = env::var("OUT_DIR").unwrap();
+        let profile = env::var("PROFILE").unwrap();
+
+        let target_dir = std::path::Path::new(&out_dir)
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .join(&profile);
+
+        let models_target_dir = target_dir.join("models");
+        if let Err(e) = std::fs::create_dir_all(&models_target_dir) {
+            println!("cargo:warning=Failed to create models directory: {}", e);
+        } else {
+            let text_cleaner_target = models_target_dir.join("text_cleaner.onnx");
+            match std::fs::copy(text_cleaner_path, &text_cleaner_target) {
+                Ok(_) => println!("cargo:warning=Copied text_cleaner.onnx to output: {:.1} MB", text_cleaner_size as f64 / 1_048_576.0),
+                Err(e) => println!("cargo:warning=Failed to copy text_cleaner.onnx: {}", e),
+            }
+        }
     }
 
     // Get target platform early (needed for DirectML DLL copying)
@@ -149,12 +192,6 @@ fn main() {
     // - CI builds (GitHub Actions): Don't embed, just copy to output directory
     let ocr_model_exists = std::path::Path::new(ocr_model_path).exists();
     let ocr_vocab_exists = std::path::Path::new(ocr_vocab_path).exists();
-
-    // Detect CI environment (GitHub Actions, GitLab CI, Jenkins, etc.)
-    let is_ci = env::var("CI").is_ok()
-        || env::var("GITHUB_ACTIONS").is_ok()
-        || env::var("GITLAB_CI").is_ok()
-        || env::var("JENKINS_URL").is_ok();
 
     if ocr_model_exists && ocr_vocab_exists {
         let ocr_model_size = std::fs::metadata(ocr_model_path).map(|m| m.len()).unwrap_or(0);

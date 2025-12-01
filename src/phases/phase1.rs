@@ -97,22 +97,13 @@ impl Phase1Pipeline {
             &img_owned
         };
 
-        // Run detection and segmentation in parallel
-        debug!("Running detection + segmentation in parallel...");
-
+        // Step 1: Run detection first
         let detection_start = std::time::Instant::now();
-        let segmentation_start = std::time::Instant::now();
-
-        let (detection_result, segmentation_result) = tokio::join!(
-            self.detector.detect_all_labels(img, image_data.index, target_size_override),
-            self.segmenter.generate_mask(img)
-        );
-
-        let (label_0_raw, label_1_raw, label_2_raw) = detection_result.context("Failed to detect regions")?;
+        let (label_0_raw, label_1_raw, label_2_raw) = self.detector
+            .detect_all_labels(img, image_data.index, target_size_override)
+            .await
+            .context("Failed to detect regions")?;
         let detection_ms = detection_start.elapsed().as_secs_f64() * 1000.0;
-
-        let segmentation_mask = segmentation_result.context("Failed to generate segmentation mask")?;
-        let segmentation_ms = segmentation_start.elapsed().as_secs_f64() * 1000.0;
 
         // Convert to RegionDetection
         let label_0: Vec<RegionDetection> = label_0_raw.into_iter()
@@ -125,9 +116,21 @@ impl Phase1Pipeline {
             .map(|d| RegionDetection { bbox: d.bbox, label: 2, confidence: d.confidence })
             .collect();
 
+        // Step 2: Collect bboxes for segmentation (label 1 + label 2)
+        let mut seg_bboxes: Vec<[i32; 4]> = label_1.iter().map(|r| r.bbox).collect();
+        seg_bboxes.extend(label_2.iter().map(|r| r.bbox));
+
+        // Step 3: Run segmentation only on detected regions
+        let segmentation_start = std::time::Instant::now();
+        let segmentation_mask = self.segmenter
+            .generate_mask_for_regions(img, &seg_bboxes)
+            .await
+            .context("Failed to generate segmentation mask")?;
+        let segmentation_ms = segmentation_start.elapsed().as_secs_f64() * 1000.0;
+
         info!(
-            "⏱️  Detection: {:.0}ms | Segmentation: {:.0}ms | Regions: {} L0, {} L1, {} L2",
-            detection_ms, segmentation_ms,
+            "⏱️  Detection: {:.0}ms | Segmentation: {:.0}ms ({} regions) | L0={}, L1={}, L2={}",
+            detection_ms, segmentation_ms, seg_bboxes.len(),
             label_0.len(), label_1.len(), label_2.len()
         );
 
@@ -273,6 +276,7 @@ impl Phase1Pipeline {
 
     /// Run segmentation and update Phase1Output with masks
     /// This is called after Phase 2 starts, to fill in the segmentation masks before Phase 3
+    /// Uses region-based segmentation - only processes label 1 and label 2 bboxes
     pub async fn complete_segmentation(
         &self,
         outputs: &mut [Phase1Output],
@@ -281,37 +285,35 @@ impl Phase1Pipeline {
         _mask_mode: Option<&str>,
     ) -> Result<()> {
         let seg_start = std::time::Instant::now();
+        let mut total_regions = 0usize;
 
-        if self.segmenter.is_directml() {
-            // DirectML: Sequential processing
-            debug!("Running segmentation for {} images sequentially (DirectML)...", decoded_images.len());
-
-            for (i, img) in decoded_images.iter().enumerate() {
-                let mask = self.segmenter.generate_mask(img).await
-                    .context("Failed to generate segmentation mask")?;
-                outputs[i].segmentation_mask = mask;
-                outputs[i].mask_mode = "fast".to_string();
+        // Process each image - extract bboxes from regions and run region-based segmentation
+        for (i, img) in decoded_images.iter().enumerate() {
+            // Collect label 1 bboxes from all regions + standalone label 2 regions
+            let mut seg_bboxes: Vec<[i32; 4]> = Vec::new();
+            for region in &outputs[i].regions {
+                // Add all label_1_regions (text areas)
+                seg_bboxes.extend(&region.label_1_regions);
+                // For label 2 (free text), add the bbox itself
+                if region.label == 2 {
+                    seg_bboxes.push(region.bbox);
+                }
             }
-        } else {
-            // Parallel processing
-            debug!("Running segmentation for {} images in parallel...", decoded_images.len());
 
-            let tasks: Vec<_> = decoded_images.iter()
-                .map(|img| self.segmenter.generate_mask(img))
-                .collect();
+            total_regions += seg_bboxes.len();
 
-            let results = futures::future::join_all(tasks).await;
+            let mask = self.segmenter
+                .generate_mask_for_regions(img, &seg_bboxes)
+                .await
+                .context("Failed to generate segmentation mask")?;
 
-            for (i, result) in results.into_iter().enumerate() {
-                let mask = result.context("Failed to generate segmentation mask")?;
-                outputs[i].segmentation_mask = mask;
-                outputs[i].mask_mode = "fast".to_string();
-            }
+            outputs[i].segmentation_mask = mask;
+            outputs[i].mask_mode = "fast".to_string();
         }
 
         let seg_ms = seg_start.elapsed().as_secs_f64() * 1000.0;
-        info!("⏱️  Segmentation: {:.0}ms for {} images ({:.1}ms/img)",
-              seg_ms, decoded_images.len(), seg_ms / decoded_images.len().max(1) as f64);
+        info!("⏱️  Segmentation: {:.0}ms for {} images ({} regions, {:.1}ms/img)",
+              seg_ms, decoded_images.len(), total_regions, seg_ms / decoded_images.len().max(1) as f64);
 
         Ok(())
     }
@@ -389,40 +391,13 @@ impl Phase1Pipeline {
         };
         let detection_ms = detection_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Run segmentation
-        let seg_start = std::time::Instant::now();
-        let is_directml = self.segmenter.is_directml();
-
-        let segmentation_results: Vec<Result<Vec<u8>, anyhow::Error>> = if is_directml {
-            // DirectML: Sequential processing
-            let mut masks = Vec::with_capacity(decoded_images.len());
-            for img in decoded_images.iter() {
-                masks.push(self.segmenter.generate_mask(img).await);
-            }
-            masks
-        } else {
-            // Parallel processing
-            let segmentation_tasks: Vec<_> = decoded_images.iter()
-                .map(|img| self.segmenter.generate_mask(img))
-                .collect();
-
-            futures::future::join_all(segmentation_tasks).await
-        };
-        let segmentation_ms = seg_start.elapsed().as_secs_f64() * 1000.0;
-
-        info!("⏱️  Detection ({}): {:.0}ms | Segmentation: {:.0}ms | Total: {:.0}ms for {} images",
-              mode_str, detection_ms, segmentation_ms,
-              batch_start.elapsed().as_secs_f64() * 1000.0, images.len());
-
-        // Process results for each image
+        // Process detections and categorize regions first (need bboxes for segmentation)
         let mut outputs = Vec::with_capacity(images.len());
+        let mut all_seg_bboxes: Vec<Vec<[i32; 4]>> = Vec::with_capacity(images.len());
 
-        for (i, ((label_0_raw, label_1_raw, label_2_raw), seg_result)) in
-            batch_detections.into_iter().zip(segmentation_results.into_iter()).enumerate()
-        {
+        for (i, (label_0_raw, label_1_raw, label_2_raw)) in batch_detections.into_iter().enumerate() {
             let image_data = &images[i];
             let img = &decoded_images[i];
-            let segmentation_mask = seg_result.context("Failed to generate segmentation mask")?;
 
             // Convert BubbleDetection to RegionDetection
             let label_0_detections: Vec<RegionDetection> = label_0_raw
@@ -438,6 +413,11 @@ impl Phase1Pipeline {
                 .map(|d| RegionDetection { bbox: d.bbox, label: 2, confidence: d.confidence })
                 .collect();
 
+            // Collect bboxes for segmentation (label 1 + label 2)
+            let mut seg_bboxes: Vec<[i32; 4]> = label_1_detections.iter().map(|r| r.bbox).collect();
+            seg_bboxes.extend(label_2_detections.iter().map(|r| r.bbox));
+            all_seg_bboxes.push(seg_bboxes);
+
             // Categorize regions
             let (regions, validation_warnings) = self.categorize_regions(
                 img,
@@ -448,17 +428,36 @@ impl Phase1Pipeline {
                 filter_orphan_regions,
             )?;
 
+            // Create output with empty mask (filled next)
             outputs.push(Phase1Output {
                 page_index: image_data.index,
                 filename: image_data.filename.clone(),
                 width: image_data.width,
                 height: image_data.height,
                 regions,
-                segmentation_mask,
+                segmentation_mask: vec![],  // Will be filled below
                 mask_mode: "fast".to_string(),
                 validation_warnings,
             });
         }
+
+        // Run region-based segmentation for each image
+        let seg_start = std::time::Instant::now();
+        let mut total_regions = 0usize;
+
+        for (i, img) in decoded_images.iter().enumerate() {
+            total_regions += all_seg_bboxes[i].len();
+            let mask = self.segmenter
+                .generate_mask_for_regions(img, &all_seg_bboxes[i])
+                .await
+                .context("Failed to generate segmentation mask")?;
+            outputs[i].segmentation_mask = mask;
+        }
+        let segmentation_ms = seg_start.elapsed().as_secs_f64() * 1000.0;
+
+        info!("⏱️  Detection ({}): {:.0}ms | Segmentation: {:.0}ms ({} regions) | Total: {:.0}ms for {} images",
+              mode_str, detection_ms, segmentation_ms, total_regions,
+              batch_start.elapsed().as_secs_f64() * 1000.0, images.len());
 
         debug!(
             "✓ Phase 1 completed in {:.0}ms for {} images ({:.1}ms/image)",

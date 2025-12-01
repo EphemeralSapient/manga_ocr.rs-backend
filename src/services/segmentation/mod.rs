@@ -8,13 +8,19 @@ use image::{DynamicImage, GrayImage};
 use ndarray::{Array1, Array2, Array4};
 use ort::{session::{Session, SessionOutputs}, value::Value};
 use parking_lot::Mutex;
+use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info, instrument};
 
 use crate::core::config::Config;
 
-// Embed the text cleaner model at compile time (CPU-only, ~11MB)
-static TEXT_CLEANER_MODEL_BYTES: &[u8] = include_bytes!("../../../models/text_cleaner.onnx");
+/// Embedded text cleaner model bytes (only for local builds, not CI)
+#[cfg(text_cleaner_model_embedded)]
+const TEXT_CLEANER_MODEL_BYTES: &[u8] = include_bytes!("../../../models/text_cleaner.onnx");
+
+/// Placeholder for CI builds (model loaded from disk)
+#[cfg(not(text_cleaner_model_embedded))]
+const TEXT_CLEANER_MODEL_BYTES: &[u8] = &[];
 
 /// FPN output levels for text detection
 const FPN_LEVELS: [&str; 3] = ["fpn2", "fpn3", "fpn4"];
@@ -38,28 +44,56 @@ pub struct SegmentationService {
 
 impl SegmentationService {
     /// Create new segmentation service
+    /// First tries embedded model (local builds), then falls back to disk (CI builds)
     #[instrument(skip(config))]
     pub async fn new(config: Arc<Config>) -> Result<Self> {
+        Self::new_with_models_dir(config, Path::new("models")).await
+    }
+
+    /// Create new segmentation service with custom models directory
+    pub async fn new_with_models_dir(config: Arc<Config>, models_dir: &Path) -> Result<Self> {
         info!("🚀 Initializing text segmentation service (FPN text detector, CPU-only)");
         let init_start = std::time::Instant::now();
 
-        // Verify model is properly embedded
-        if TEXT_CLEANER_MODEL_BYTES.len() < 100_000 {
-            anyhow::bail!(
-                "Text cleaner model too small ({} bytes) - check Git LFS or model embedding",
-                TEXT_CLEANER_MODEL_BYTES.len()
-            );
-        }
+        let model_path = models_dir.join("text_cleaner.onnx");
 
-        let model_size_mb = TEXT_CLEANER_MODEL_BYTES.len() as f64 / 1_048_576.0;
-        info!("Loading embedded text cleaner model ({:.1} MB)", model_size_mb);
+        // Try embedded model first (for local builds)
+        let session = if TEXT_CLEANER_MODEL_BYTES.len() > 100_000 {
+            let model_size_mb = TEXT_CLEANER_MODEL_BYTES.len() as f64 / 1_048_576.0;
+            info!("Loading text cleaner model from embedded bytes ({:.1} MB)", model_size_mb);
 
-        // Create CPU-only session (no GPU acceleration)
-        let session = Session::builder()?
-            .with_intra_threads(num_cpus::get().min(8))?
-            .with_inter_threads(1)?
-            .commit_from_memory(TEXT_CLEANER_MODEL_BYTES)
-            .context("Failed to load text cleaner ONNX model")?;
+            Session::builder()?
+                .with_intra_threads(num_cpus::get().min(8))?
+                .with_inter_threads(1)?
+                .commit_from_memory(TEXT_CLEANER_MODEL_BYTES)
+                .context("Failed to load embedded text cleaner ONNX model")?
+        } else {
+            // Fall back to disk loading (CI builds or embedded not available)
+            if !model_path.exists() {
+                anyhow::bail!(
+                    "Text cleaner model not found at: {}. Segmentation feature is unavailable.",
+                    model_path.display()
+                );
+            }
+
+            let model_size = std::fs::metadata(&model_path).map(|m| m.len()).unwrap_or(0);
+            if model_size < 100_000 {
+                anyhow::bail!(
+                    "Text cleaner model too small ({} bytes) at {} - check Git LFS",
+                    model_size,
+                    model_path.display()
+                );
+            }
+
+            let model_size_mb = model_size as f64 / 1_048_576.0;
+            info!("Loading text cleaner model from disk: {} ({:.1} MB)", model_path.display(), model_size_mb);
+
+            Session::builder()?
+                .with_intra_threads(num_cpus::get().min(8))?
+                .with_inter_threads(1)?
+                .commit_from_file(&model_path)
+                .context("Failed to load text cleaner ONNX model from disk")?
+        };
 
         info!(
             "✓ Text segmentation ready: CPU ({:.0}ms)",
@@ -327,12 +361,92 @@ impl SegmentationService {
         current
     }
 
-    /// Generate segmentation mask for an image
+    /// Generate segmentation mask only for specified bounding boxes
     ///
-    /// Returns Vec<u8> where 255 = text region, 0 = background
+    /// This is more efficient than full-image segmentation when you only need
+    /// masks for detected text regions (label 1 and optionally label 2).
+    ///
+    /// # Arguments
+    /// * `img` - Full image
+    /// * `bboxes` - List of [x1, y1, x2, y2] bounding boxes to process
+    ///
+    /// Returns Vec<u8> where 255 = text region, 0 = background (full image size)
+    #[instrument(skip(self, img, bboxes), fields(w = img.width(), h = img.height(), regions = bboxes.len()))]
+    pub async fn generate_mask_for_regions(
+        &self,
+        img: &DynamicImage,
+        bboxes: &[[i32; 4]],
+    ) -> Result<Vec<u8>> {
+        let start = std::time::Instant::now();
+        let (img_w, img_h) = (img.width(), img.height());
+
+        // Create empty full-image mask
+        let mut full_mask = vec![0u8; (img_w * img_h) as usize];
+
+        if bboxes.is_empty() {
+            return Ok(full_mask);
+        }
+
+        // Process each region
+        for bbox in bboxes {
+            let [x1, y1, x2, y2] = *bbox;
+
+            // Clamp to image bounds
+            let x1 = x1.max(0).min(img_w as i32) as u32;
+            let y1 = y1.max(0).min(img_h as i32) as u32;
+            let x2 = x2.max(0).min(img_w as i32) as u32;
+            let y2 = y2.max(0).min(img_h as i32) as u32;
+
+            if x2 <= x1 || y2 <= y1 {
+                continue;
+            }
+
+            let crop_w = x2 - x1;
+            let crop_h = y2 - y1;
+
+            // Skip tiny regions
+            if crop_w < 16 || crop_h < 16 {
+                continue;
+            }
+
+            // Crop region from image
+            let cropped = img.crop_imm(x1, y1, crop_w, crop_h);
+
+            // Generate mask for this crop
+            let crop_mask = self.generate_mask_internal(&cropped).await?;
+
+            // Copy mask back to full image mask
+            for cy in 0..crop_h {
+                for cx in 0..crop_w {
+                    let crop_idx = (cy * crop_w + cx) as usize;
+                    let full_idx = ((y1 + cy) * img_w + (x1 + cx)) as usize;
+                    if crop_idx < crop_mask.len() && full_idx < full_mask.len() {
+                        // Use max to combine overlapping regions
+                        full_mask[full_idx] = full_mask[full_idx].max(crop_mask[crop_idx]);
+                    }
+                }
+            }
+        }
+
+        debug!(
+            "Region-based segmentation done in {:.0}ms ({} regions, {}x{})",
+            start.elapsed().as_secs_f64() * 1000.0,
+            bboxes.len(),
+            img_w,
+            img_h
+        );
+
+        Ok(full_mask)
+    }
+
+    /// Generate segmentation mask for full image (legacy method)
     #[instrument(skip(self, img), fields(w = img.width(), h = img.height()))]
     pub async fn generate_mask(&self, img: &DynamicImage) -> Result<Vec<u8>> {
-        let start = std::time::Instant::now();
+        self.generate_mask_internal(img).await
+    }
+
+    /// Internal mask generation
+    async fn generate_mask_internal(&self, img: &DynamicImage) -> Result<Vec<u8>> {
         let target_size = self.config.target_size();
 
         // Preprocess
@@ -355,16 +469,7 @@ impl SegmentationService {
         };
 
         // Create mask from extracted outputs
-        let mask = self.create_text_mask(&fpn_outputs, prep.orig_size, prep.new_size)?;
-
-        debug!(
-            "Text segmentation done in {:.0}ms ({}x{})",
-            start.elapsed().as_secs_f64() * 1000.0,
-            img.width(),
-            img.height()
-        );
-
-        Ok(mask)
+        self.create_text_mask(&fpn_outputs, prep.orig_size, prep.new_size)
     }
 }
 

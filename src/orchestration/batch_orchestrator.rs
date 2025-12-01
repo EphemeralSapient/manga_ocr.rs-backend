@@ -6,7 +6,7 @@ use futures::future::join_all;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::services::translation::api_client::ApiClient;
 use crate::core::config::Config;
@@ -492,6 +492,11 @@ impl BatchOrchestrator {
         let ocr_enabled = config.ocr_enabled.unwrap_or(false);
         let use_cerebras = config.use_cerebras.unwrap_or(false);
         let cerebras_api_key = config.cerebras_api_key.as_deref();
+
+        // Warn if Cerebras is requested but local OCR is not enabled
+        if use_cerebras && !ocr_enabled {
+            warn!("⚠️  use_cerebras=true requires ocr_enabled=true. Falling back to Gemini for OCR+translation.");
+        }
 
         let phase2_outputs = if ocr_enabled {
             // LOCAL OCR MODE: Use local OCR for text extraction + Cerebras/Gemini for translation
