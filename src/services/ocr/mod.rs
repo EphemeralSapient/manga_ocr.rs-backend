@@ -7,6 +7,7 @@ use ndarray::Array4;
 use once_cell::sync::OnceCell;
 use ort::{session::Session, value::Value};
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -113,52 +114,59 @@ fn is_vertical_text(image: &DynamicImage) -> bool {
 
 /// Detect vertical text columns using projection profile
 /// Returns columns from RIGHT to LEFT (Japanese reading order)
+/// OPTIMIZED: Uses flat Vec<u8> instead of Vec<Vec<u8>> for better cache locality
 fn detect_vertical_columns(image: &DynamicImage) -> Vec<TextLine> {
     let gray = image.to_luma8();
     let (w, h) = gray.dimensions();
+    let w = w as usize;
+    let h = h as usize;
 
     if w < 10 || h < 10 {
-        return vec![TextLine { x: 0, y: 0, width: w, height: h }];
+        return vec![TextLine { x: 0, y: 0, width: w as u32, height: h as u32 }];
     }
 
-    // Binarize with threshold
-    let mut binary = vec![vec![0u8; w as usize]; h as usize];
+    // Binarize with threshold - use FLAT array for better cache locality
+    let mut binary = vec![0u8; w * h];
     let mut total: u64 = 0;
+
+    // First pass: compute mean
     for y in 0..h {
         for x in 0..w {
-            total += gray.get_pixel(x, y).0[0] as u64;
+            total += gray.get_pixel(x as u32, y as u32).0[0] as u64;
         }
     }
-    let mean = (total / (w as u64 * h as u64)) as u8;
-    let threshold = mean.saturating_sub(20); // Slightly below mean for dark text
+    let mean = (total / (w * h) as u64) as u8;
+    let threshold = mean.saturating_sub(20);
 
+    // Second pass: binarize
     for y in 0..h {
+        let row_offset = y * w;
         for x in 0..w {
-            let pixel = gray.get_pixel(x, y).0[0];
-            binary[y as usize][x as usize] = if pixel < threshold { 255 } else { 0 };
+            let pixel = gray.get_pixel(x as u32, y as u32).0[0];
+            binary[row_offset + x] = if pixel < threshold { 255 } else { 0 };
         }
     }
 
     // Compute vertical projection (sum per column)
-    let mut v_proj = vec![0u64; w as usize];
-    for x in 0..w as usize {
-        for y in 0..h as usize {
-            v_proj[x] += binary[y][x] as u64;
+    let mut v_proj = vec![0u64; w];
+    for x in 0..w {
+        for y in 0..h {
+            v_proj[x] += binary[y * w + x] as u64;
         }
     }
 
     // Find column boundaries
     let v_mean: f64 = v_proj.iter().sum::<u64>() as f64 / v_proj.len().max(1) as f64;
-    let v_thresh = v_mean * 0.2; // Higher threshold to avoid noise
+    let v_thresh = v_mean * 0.2;
 
     let mut columns = Vec::new();
     let mut in_col = false;
     let mut col_start = 0;
 
     // Minimum column width based on image size (at least 15px or 5% of width)
-    let min_col_width = (w as usize / 20).max(15);
+    let min_col_width = (w / 20).max(15);
 
-    for x in 0..w as usize {
+    for x in 0..w {
         if v_proj[x] as f64 > v_thresh {
             if !in_col {
                 col_start = x;
@@ -167,12 +175,11 @@ fn detect_vertical_columns(image: &DynamicImage) -> Vec<TextLine> {
         } else if in_col {
             let col_width = x - col_start;
             if col_width >= min_col_width {
-                // Find vertical extent for this column
-                let (y1, y2) = find_vertical_extent(&binary, col_start, x, h as usize);
+                let (y1, y2) = find_vertical_extent_flat(&binary, w, col_start, x, h);
                 columns.push(TextLine {
                     x: col_start.saturating_sub(2) as u32,
                     y: y1 as u32,
-                    width: (col_width + 4).min(w as usize - col_start) as u32,
+                    width: (col_width + 4).min(w - col_start) as u32,
                     height: (y2 - y1) as u32,
                 });
             }
@@ -182,13 +189,13 @@ fn detect_vertical_columns(image: &DynamicImage) -> Vec<TextLine> {
 
     // Handle last column
     if in_col {
-        let col_width = w as usize - col_start;
+        let col_width = w - col_start;
         if col_width >= min_col_width {
-            let (y1, y2) = find_vertical_extent(&binary, col_start, w as usize, h as usize);
+            let (y1, y2) = find_vertical_extent_flat(&binary, w, col_start, w, h);
             columns.push(TextLine {
                 x: col_start.saturating_sub(2) as u32,
                 y: y1 as u32,
-                width: (col_width + 4).min(w as usize - col_start) as u32,
+                width: (col_width + 4).min(w - col_start) as u32,
                 height: (y2 - y1) as u32,
             });
         }
@@ -198,18 +205,20 @@ fn detect_vertical_columns(image: &DynamicImage) -> Vec<TextLine> {
     columns.reverse();
 
     if columns.is_empty() {
-        vec![TextLine { x: 0, y: 0, width: w, height: h }]
+        vec![TextLine { x: 0, y: 0, width: w as u32, height: h as u32 }]
     } else {
         columns
     }
 }
 
-/// Find vertical extent of text in a column range
-fn find_vertical_extent(binary: &[Vec<u8>], x1: usize, x2: usize, h: usize) -> (usize, usize) {
+/// Find vertical extent of text in a column range (flat array version)
+#[inline]
+fn find_vertical_extent_flat(binary: &[u8], stride: usize, x1: usize, x2: usize, h: usize) -> (usize, usize) {
     let mut h_proj = vec![0u64; h];
     for y in 0..h {
+        let row_offset = y * stride;
         for x in x1..x2 {
-            h_proj[y] += binary[y][x] as u64;
+            h_proj[y] += binary[row_offset + x] as u64;
         }
     }
 
@@ -311,49 +320,12 @@ impl OcrService {
         })
     }
 
-    /// Load vocabulary from file (format: index\tchar)
+    /// Load vocabulary from file path
     /// Returns (vocab_map, blank_index)
     fn load_vocabulary(vocab_path: &Path) -> Result<(HashMap<usize, String>, usize)> {
         let content = std::fs::read_to_string(vocab_path)
             .context("Failed to read vocabulary file")?;
-
-        let mut vocab = HashMap::new();
-        let mut blank_index = 0usize;
-
-        // Build default ASCII mapping (indices 0-96)
-        for i in 0..97 {
-            if (32..127).contains(&i) {
-                vocab.insert(i, (i as u8 as char).to_string());
-            } else if i == 0 {
-                vocab.insert(i, " ".to_string());
-            }
-        }
-
-        // Parse vocab file
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            if let Some((idx_str, char_str)) = line.split_once('\t') {
-                if let Ok(idx) = idx_str.parse::<usize>() {
-                    if char_str == "<blank>" {
-                        blank_index = idx; // Store blank index
-                        continue; // Don't add to vocab map
-                    }
-                    let ch = if char_str == "<space>" {
-                        " ".to_string()
-                    } else {
-                        char_str.to_string()
-                    };
-                    vocab.insert(idx, ch);
-                }
-            }
-        }
-
-        debug!("Loaded {} vocabulary entries from file, blank_index={}", vocab.len(), blank_index);
-        Ok((vocab, blank_index))
+        Self::parse_vocabulary(&content, "file")
     }
 
     /// Load vocabulary from bytes (for embedded vocab)
@@ -361,8 +333,13 @@ impl OcrService {
     fn load_vocabulary_from_bytes(vocab_bytes: &[u8]) -> Result<(HashMap<usize, String>, usize)> {
         let content = std::str::from_utf8(vocab_bytes)
             .context("Failed to parse vocabulary bytes as UTF-8")?;
+        Self::parse_vocabulary(content, "embedded bytes")
+    }
 
-        let mut vocab = HashMap::new();
+    /// Parse vocabulary content (unified implementation)
+    /// Returns (vocab_map, blank_index)
+    fn parse_vocabulary(content: &str, source: &str) -> Result<(HashMap<usize, String>, usize)> {
+        let mut vocab = HashMap::with_capacity(8000); // Pre-allocate for CJK vocab
         let mut blank_index = 0usize;
 
         // Build default ASCII mapping (indices 0-96)
@@ -384,8 +361,8 @@ impl OcrService {
             if let Some((idx_str, char_str)) = line.split_once('\t') {
                 if let Ok(idx) = idx_str.parse::<usize>() {
                     if char_str == "<blank>" {
-                        blank_index = idx; // Store blank index
-                        continue; // Don't add to vocab map
+                        blank_index = idx;
+                        continue;
                     }
                     let ch = if char_str == "<space>" {
                         " ".to_string()
@@ -397,7 +374,7 @@ impl OcrService {
             }
         }
 
-        debug!("Loaded {} vocabulary entries from embedded bytes, blank_index={}", vocab.len(), blank_index);
+        debug!("Loaded {} vocabulary entries from {}, blank_index={}", vocab.len(), source, blank_index);
         Ok((vocab, blank_index))
     }
 
@@ -452,13 +429,18 @@ impl OcrService {
         Ok((tensor, seq_length, is_vertical))
     }
 
-    /// CTC greedy decode
+    /// CTC greedy decode - OPTIMIZED with pre-allocated string
     /// - Collapse repeated characters
     /// - Remove blank tokens
     fn ctc_decode(&self, logits: &[f32], seq_len: usize, vocab_size: usize) -> (String, f32) {
-        let mut decoded = Vec::new();
-        let mut confidences = Vec::new();
+        // Pre-allocate with estimated capacity (most chars are 1-3 bytes)
+        let mut text = String::with_capacity(seq_len * 3);
+        let mut confidence_sum = 0.0f32;
+        let mut char_count = 0usize;
         let mut prev_idx: Option<usize> = None;
+
+        #[cfg(debug_assertions)]
+        let mut first_indices = Vec::with_capacity(5);
 
         for t in 0..seq_len {
             // Find best class at this timestep
@@ -476,39 +458,37 @@ impl OcrService {
 
             // Collapse repeats and remove blanks
             if best_idx != self.blank_index && Some(best_idx) != prev_idx {
-                decoded.push(best_idx);
-                // Convert log prob to confidence
+                // Convert log prob to confidence and accumulate
                 let confidence = best_val.exp().min(1.0);
-                confidences.push(confidence);
+                confidence_sum += confidence;
+                char_count += 1;
+
+                // Append character directly to string (avoid intermediate allocation)
+                if let Some(s) = self.vocab.get(&best_idx) {
+                    text.push_str(s);
+                } else {
+                    debug!("CTC decode: index {} not in vocab (vocab size: {})", best_idx, self.vocab.len());
+                    text.push('?');
+                }
+
+                #[cfg(debug_assertions)]
+                if first_indices.len() < 5 {
+                    first_indices.push(best_idx);
+                }
             }
 
             prev_idx = Some(best_idx);
         }
 
-        // Convert indices to characters with debug logging for missing mappings
-        let text: String = decoded
-            .iter()
-            .map(|&idx| {
-                match self.vocab.get(&idx) {
-                    Some(s) => s.as_str().to_string(),
-                    None => {
-                        debug!("CTC decode: index {} not in vocab (vocab size: {})", idx, self.vocab.len());
-                        "?".to_string()
-                    }
-                }
-            })
-            .collect();
-
-        let avg_confidence = if confidences.is_empty() {
+        let avg_confidence = if char_count == 0 {
             0.0
         } else {
-            confidences.iter().sum::<f32>() / confidences.len() as f32
+            confidence_sum / char_count as f32
         };
 
-        // Log first few decoded indices for debugging
-        if !decoded.is_empty() {
-            let first_5: Vec<_> = decoded.iter().take(5).collect();
-            debug!("CTC decode: first indices {:?}, blank_idx={}", first_5, self.blank_index);
+        #[cfg(debug_assertions)]
+        if !first_indices.is_empty() {
+            debug!("CTC decode: first indices {:?}, blank_idx={}", first_indices, self.blank_index);
         }
 
         (text, avg_confidence)
@@ -762,14 +742,106 @@ impl OcrService {
         Ok((String::new(), 0.0))
     }
 
-    /// Run OCR on multiple image regions in parallel
+    /// Run OCR on multiple image regions
+    /// OPTIMIZED: Parallelizes preprocessing while keeping inference sequential
+    /// (inference must be sequential due to single session mutex)
     pub fn recognize_batch(&self, images: &[DynamicImage]) -> Vec<Result<(String, f32)>> {
-        // Process sequentially since we have a single session
-        // Could be parallelized with session pool if needed
-        images
-            .iter()
-            .map(|img| self.recognize(img))
+        if images.is_empty() {
+            return Vec::new();
+        }
+
+        // For small batches, sequential is faster due to overhead
+        if images.len() <= 2 {
+            return images.iter().map(|img| self.recognize(img)).collect();
+        }
+
+        // Parallel preprocessing: detect columns, rotate images, prepare tensors
+        // This is CPU-bound and benefits from parallelism
+        let preprocessed: Vec<_> = images
+            .par_iter()
+            .map(|img| {
+                // Detect columns for this image
+                let columns = detect_vertical_columns(img);
+                (img, columns)
+            })
+            .collect();
+
+        // Sequential inference (due to mutex on session)
+        // But preprocessing work is already done in parallel above
+        preprocessed
+            .into_iter()
+            .map(|(img, columns)| self.recognize_with_columns(img, columns))
             .collect()
+    }
+
+    /// Internal: recognize with pre-detected columns
+    fn recognize_with_columns(&self, image: &DynamicImage, columns: Vec<TextLine>) -> Result<(String, f32)> {
+        if columns.len() > 1 {
+            debug!("OCR: Detected {} columns, processing individually", columns.len());
+
+            let mut results = Vec::new();
+            let mut total_confidence = 0.0f32;
+
+            for (i, col) in columns.iter().enumerate() {
+                let col_img = image.crop_imm(
+                    col.x.min(image.width() - 1),
+                    col.y.min(image.height() - 1),
+                    col.width.min(image.width() - col.x),
+                    col.height.min(image.height() - col.y),
+                );
+
+                let rotated = col_img.rotate270();
+                let (tensor, seq_length) = self.preprocess_column(&rotated)?;
+                let (text, confidence) = self.run_inference(tensor, seq_length)?;
+
+                if Self::is_quality_result(&text, confidence) {
+                    debug!("OCR column {}: '{}' (conf: {:.2})", i + 1, text, confidence);
+                    results.push(text);
+                    total_confidence += confidence;
+                }
+            }
+
+            if !results.is_empty() {
+                let combined_text = results.join("\n");
+                let avg_confidence = total_confidence / results.len() as f32;
+                return Ok((combined_text, avg_confidence));
+            }
+        }
+
+        // Fall back to standard recognition
+        let rotated = image.rotate270();
+        let (tensor_rot, seq_len_rot) = self.preprocess_column(&rotated)?;
+        let (text_rot, conf_rot) = self.run_inference(tensor_rot, seq_len_rot)?;
+
+        let (tensor_orig, seq_len_orig) = self.preprocess_column(image)?;
+        let (text_orig, conf_orig) = self.run_inference(tensor_orig, seq_len_orig)?;
+
+        let rot_quality = Self::is_quality_result(&text_rot, conf_rot);
+        let orig_quality = Self::is_quality_result(&text_orig, conf_orig);
+        let rot_cjk = text_rot.chars().filter(|&c| c as u32 > 0x3000).count();
+        let orig_cjk = text_orig.chars().filter(|&c| c as u32 > 0x3000).count();
+
+        if rot_quality && orig_quality {
+            if rot_cjk > orig_cjk || (rot_cjk == orig_cjk && conf_rot >= conf_orig) {
+                return Ok((text_rot, conf_rot));
+            } else {
+                return Ok((text_orig, conf_orig));
+            }
+        } else if rot_quality {
+            return Ok((text_rot, conf_rot));
+        } else if orig_quality {
+            return Ok((text_orig, conf_orig));
+        }
+
+        if rot_cjk > 0 || orig_cjk > 0 {
+            if rot_cjk >= orig_cjk && !text_rot.is_empty() {
+                return Ok((text_rot, conf_rot));
+            } else if !text_orig.is_empty() {
+                return Ok((text_orig, conf_orig));
+            }
+        }
+
+        Ok((String::new(), 0.0))
     }
 }
 
@@ -815,8 +887,17 @@ mod tests {
     #[test]
     fn test_vocab_loading_from_bytes() {
         let content = b"0\t<space>\n32\t \n33\t!\n97\ta\n12345\t\xe6\xbc\xa2";
-        let vocab = OcrService::load_vocabulary_from_bytes(content).unwrap();
+        let (vocab, _blank_idx) = OcrService::load_vocabulary_from_bytes(content).unwrap();
         assert!(vocab.contains_key(&32));
+        assert!(vocab.contains_key(&12345));
+    }
+
+    #[test]
+    fn test_parse_vocabulary() {
+        let content = "0\t<blank>\n1\t<space>\n65\tA\n12345\t漢";
+        let (vocab, blank_idx) = OcrService::parse_vocabulary(content, "test").unwrap();
+        assert_eq!(blank_idx, 0);
+        assert_eq!(vocab.get(&1), Some(&" ".to_string()));
         assert!(vocab.contains_key(&12345));
     }
 }

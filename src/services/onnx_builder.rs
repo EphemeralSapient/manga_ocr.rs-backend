@@ -1,6 +1,7 @@
 // Shared ONNX Runtime session builder with automatic hardware acceleration detection
 //
-// This module eliminates ~280 lines of code duplication between detection and segmentation services
+// This module is the SINGLE SOURCE OF TRUTH for ONNX session creation.
+// All services (detection, segmentation, OCR) should use these builders.
 
 use anyhow::{Context, Result};
 use crossbeam::channel::{bounded, Receiver, Sender};
@@ -8,7 +9,7 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::execution_providers::CPUExecutionProvider;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use tracing::{info, warn, debug};
 
 /// Calculate optimal thread count for ONNX Runtime CPU inference.
@@ -18,7 +19,7 @@ use tracing::{info, warn, debug};
 /// in benchmarks on 8-core Windows systems.
 ///
 /// Reference: https://github.com/microsoft/onnxruntime/issues/3713
-fn optimal_intra_op_threads() -> usize {
+pub fn optimal_intra_op_threads() -> usize {
     let total_cores = num_cpus::get();
 
     // Platform-specific optimization:
@@ -33,6 +34,9 @@ fn optimal_intra_op_threads() -> usize {
     debug!("CPU threads: {} total cores, using {} for inference", total_cores, optimal);
     optimal
 }
+
+/// Track if platform info has been logged (avoid spam)
+static LOGGED_PLATFORM: AtomicBool = AtomicBool::new(false);
 
 // Import acceleration providers based on features
 #[cfg(feature = "tensorrt")]
@@ -206,9 +210,23 @@ pub fn build_session_with_acceleration(
     model_name: &str,
     model_size_mb: f32,
 ) -> Result<(String, Session)> {
+    // Log platform info once
+    if !LOGGED_PLATFORM.swap(true, Ordering::Relaxed) {
+        info!("Platform: {}/{}", std::env::consts::OS, std::env::consts::ARCH);
+    }
+
+    // Validate model bytes
+    if model_bytes.len() < 100 {
+        anyhow::bail!(
+            "Model file is too small ({} bytes). This might be a Git LFS stub. \
+            Please ensure Git LFS is installed and the model is properly checked out.",
+            model_bytes.len()
+        );
+    }
+
     // Check for forced backend via environment variable
     if let Ok(forced_backend) = std::env::var("INFERENCE_BACKEND") {
-        if !forced_backend.is_empty() && forced_backend.to_lowercase() != "auto" {
+        if !forced_backend.is_empty() && forced_backend.to_uppercase() != "AUTO" {
             info!("INFERENCE_BACKEND={}, forcing specific backend for {}", forced_backend, model_name);
             return try_forced_backend(&forced_backend, model_bytes, model_name, model_size_mb);
         }
@@ -348,35 +366,24 @@ pub fn build_session_with_acceleration(
 }
 
 /// Try to force a specific backend (for testing/debugging)
-fn try_forced_backend(
+///
+/// # Arguments
+/// * `backend` - Backend name (case-insensitive): "cuda", "tensorrt", "openvino", "directml", "coreml", "xnnpack", "cpu"
+/// * `model_bytes` - ONNX model bytes
+/// * `model_name` - Name for logging
+/// * `model_size_mb` - Model size for error messages
+pub fn try_forced_backend(
     backend: &str,
     model_bytes: &[u8],
     model_name: &str,
     model_size_mb: f32,
 ) -> Result<(String, Session)> {
-    let backend_lower = backend.to_lowercase();
+    let backend_upper = backend.to_uppercase();
 
-    match backend_lower.as_str() {
-        #[cfg(feature = "cuda")]
-        "cuda" => {
-            let session = Session::builder()
-                .context("Failed to create session builder")?
-                .with_execution_providers([CUDAExecutionProvider::default().build()])
-                .context("Failed to configure CUDA provider")?
-                .with_optimization_level(GraphOptimizationLevel::Level3)
-                .context("Failed to set optimization level")?
-                .with_intra_threads(optimal_intra_op_threads())
-                .context("Failed to configure intra-op threads")?
-                .with_inter_threads(1)
-                .context("Failed to configure inter-op threads")?
-                .commit_from_memory(model_bytes)
-                .context("Failed to load model with CUDA")?;
-            info!("✓ Forced CUDA backend for {}", model_name);
-            Ok(("CUDA".to_string(), session))
-        }
-
+    match backend_upper.as_str() {
         #[cfg(feature = "tensorrt")]
-        "tensorrt" => {
+        "TENSORRT" => {
+            info!("Forcing TensorRT backend for {}...", model_name);
             let session = Session::builder()
                 .context("Failed to create session builder")?
                 .with_execution_providers([TensorRTExecutionProvider::default().build()])
@@ -390,11 +397,39 @@ fn try_forced_backend(
                 .commit_from_memory(model_bytes)
                 .context("Failed to load model with TensorRT")?;
             info!("✓ Forced TensorRT backend for {}", model_name);
-            Ok(("TensorRT".to_string(), session))
+            Ok(("TensorRT (forced)".to_string(), session))
+        }
+        #[cfg(not(feature = "tensorrt"))]
+        "TENSORRT" => {
+            anyhow::bail!("TensorRT backend not available. Rebuild with: cargo build --features tensorrt")
+        }
+
+        #[cfg(feature = "cuda")]
+        "CUDA" => {
+            info!("Forcing CUDA backend for {}...", model_name);
+            let session = Session::builder()
+                .context("Failed to create session builder")?
+                .with_execution_providers([CUDAExecutionProvider::default().build()])
+                .context("Failed to configure CUDA provider")?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .context("Failed to set optimization level")?
+                .with_intra_threads(optimal_intra_op_threads())
+                .context("Failed to configure intra-op threads")?
+                .with_inter_threads(1)
+                .context("Failed to configure inter-op threads")?
+                .commit_from_memory(model_bytes)
+                .context("Failed to load model with CUDA")?;
+            info!("✓ Forced CUDA backend for {}", model_name);
+            Ok(("CUDA (forced)".to_string(), session))
+        }
+        #[cfg(not(feature = "cuda"))]
+        "CUDA" => {
+            anyhow::bail!("CUDA backend not available. Rebuild with: cargo build --features cuda")
         }
 
         #[cfg(feature = "openvino")]
-        "openvino" => {
+        "OPENVINO" => {
+            info!("Forcing OpenVINO backend for {}...", model_name);
             let session = Session::builder()
                 .context("Failed to create session builder")?
                 .with_execution_providers([
@@ -412,11 +447,64 @@ fn try_forced_backend(
                 .commit_from_memory(model_bytes)
                 .context("Failed to load model with OpenVINO")?;
             info!("✓ Forced OpenVINO backend for {}", model_name);
-            Ok(("OpenVINO-CPU".to_string(), session))
+            Ok(("OpenVINO-CPU (forced)".to_string(), session))
+        }
+        #[cfg(not(feature = "openvino"))]
+        "OPENVINO" => {
+            anyhow::bail!("OpenVINO backend not available. Rebuild with: cargo build --features openvino")
+        }
+
+        #[cfg(all(target_os = "windows", feature = "directml"))]
+        "DIRECTML" => {
+            info!("Forcing DirectML backend for {}...", model_name);
+            let session = Session::builder()
+                .context("Failed to create session builder")?
+                .with_execution_providers([DirectMLExecutionProvider::default().build()])
+                .context("Failed to configure DirectML provider")?
+                .with_parallel_execution(false)?
+                .with_memory_pattern(false)?
+                .with_optimization_level(GraphOptimizationLevel::Level2)
+                .context("Failed to set optimization level")?
+                .with_intra_threads(optimal_intra_op_threads())
+                .context("Failed to configure intra-op threads")?
+                .with_inter_threads(1)
+                .context("Failed to configure inter-op threads")?
+                .commit_from_memory(model_bytes)
+                .context("Failed to load model with DirectML")?;
+            info!("✓ Forced DirectML backend for {} (GPU-only)", model_name);
+            Ok(("DirectML (forced)".to_string(), session))
+        }
+        #[cfg(not(all(target_os = "windows", feature = "directml")))]
+        "DIRECTML" => {
+            anyhow::bail!("DirectML backend not available. Rebuild with: cargo build --features directml (Windows only)")
+        }
+
+        #[cfg(all(target_os = "macos", feature = "coreml"))]
+        "COREML" => {
+            info!("Forcing CoreML backend for {}...", model_name);
+            let session = Session::builder()
+                .context("Failed to create session builder")?
+                .with_execution_providers([CoreMLExecutionProvider::default().build()])
+                .context("Failed to configure CoreML provider")?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .context("Failed to set optimization level")?
+                .with_intra_threads(optimal_intra_op_threads())
+                .context("Failed to configure intra-op threads")?
+                .with_inter_threads(1)
+                .context("Failed to configure inter-op threads")?
+                .commit_from_memory(model_bytes)
+                .context("Failed to load model with CoreML")?;
+            info!("✓ Forced CoreML backend for {}", model_name);
+            Ok(("CoreML (forced)".to_string(), session))
+        }
+        #[cfg(not(all(target_os = "macos", feature = "coreml")))]
+        "COREML" => {
+            anyhow::bail!("CoreML backend not available. Rebuild with: cargo build --features coreml (macOS only)")
         }
 
         #[cfg(feature = "xnnpack")]
-        "xnnpack" => {
+        "XNNPACK" => {
+            info!("Forcing XNNPACK backend for {}...", model_name);
             let session = Session::builder()
                 .context("Failed to create session builder")?
                 .with_execution_providers([XNNPACKExecutionProvider::default().build()])
@@ -430,10 +518,15 @@ fn try_forced_backend(
                 .commit_from_memory(model_bytes)
                 .context("Failed to load model with XNNPACK")?;
             info!("✓ Forced XNNPACK backend for {}", model_name);
-            Ok(("XNNPACK".to_string(), session))
+            Ok(("XNNPACK (forced)".to_string(), session))
+        }
+        #[cfg(not(feature = "xnnpack"))]
+        "XNNPACK" => {
+            anyhow::bail!("XNNPACK backend not available. Rebuild with: cargo build --features xnnpack")
         }
 
-        "cpu" => {
+        "CPU" => {
+            info!("Forcing CPU backend for {}...", model_name);
             let session = Session::builder()
                 .context("Failed to create session builder")?
                 .with_execution_providers([CPUExecutionProvider::default().build()])
@@ -447,12 +540,38 @@ fn try_forced_backend(
                 .commit_from_memory(model_bytes)
                 .context("Failed to load model with CPU")?;
             info!("✓ Forced CPU backend for {}", model_name);
-            Ok(("CPU".to_string(), session))
+            Ok(("CPU (forced)".to_string(), session))
+        }
+
+        "AUTO" => {
+            // Explicit AUTO means use auto-detection
+            build_session_with_acceleration(model_bytes, model_name, model_size_mb)
         }
 
         _ => {
-            warn!("Unknown backend '{}', falling back to auto-detection for {}", backend, model_name);
-            build_session_with_acceleration(model_bytes, model_name, model_size_mb)
+            anyhow::bail!(
+                "Unknown inference backend '{}'. \
+                Valid options: TENSORRT, CUDA, OPENVINO, DIRECTML, COREML, XNNPACK, CPU, AUTO",
+                backend
+            )
         }
     }
+}
+
+/// Build a CPU-only session (for lightweight models like text_cleaner, OCR)
+///
+/// Uses minimal threads for small models where parallelism overhead isn't worth it.
+pub fn build_cpu_session(model_bytes: &[u8], model_name: &str) -> Result<Session> {
+    Session::builder()
+        .context(format!("Failed to create session builder for {}", model_name))?
+        .with_execution_providers([CPUExecutionProvider::default().build()])
+        .context(format!("Failed to configure CPU provider for {}", model_name))?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .context(format!("Failed to set optimization level for {}", model_name))?
+        .with_intra_threads(1)
+        .context(format!("Failed to configure intra-op threads for {}", model_name))?
+        .with_inter_threads(1)
+        .context(format!("Failed to configure inter-op threads for {}", model_name))?
+        .commit_from_memory(model_bytes)
+        .context(format!("Failed to load {} ONNX model", model_name))
 }

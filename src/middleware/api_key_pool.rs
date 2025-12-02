@@ -67,7 +67,6 @@ impl ApiKey {
         self.total_failures as f64 / self.total_requests as f64
     }
 
-    #[allow(dead_code)]
     fn record_success(&mut self) {
         self.consecutive_successes += 1;
         self.consecutive_failures = 0;
@@ -86,7 +85,6 @@ impl ApiKey {
         }
     }
 
-    #[allow(dead_code)]
     fn record_failure(&mut self) {
         self.consecutive_failures += 1;
         self.consecutive_successes = 0;
@@ -184,7 +182,6 @@ impl ApiKeyPool {
     }
 
     /// Record successful use of a key
-    #[allow(dead_code)]
     pub async fn record_success(&self, key_index: usize) {
         let mut keys = self.keys.write().await;
         if let Some(key) = keys.get_mut(key_index) {
@@ -193,7 +190,6 @@ impl ApiKeyPool {
     }
 
     /// Record failed use of a key
-    #[allow(dead_code)]
     pub async fn record_failure(&self, key_index: usize) {
         let mut keys = self.keys.write().await;
         if let Some(key) = keys.get_mut(key_index) {
@@ -238,7 +234,6 @@ impl ApiKeyPool {
     }
 
     /// Get total number of keys
-    #[allow(dead_code)]
     pub async fn total_keys(&self) -> usize {
         let keys = self.keys.read().await;
         keys.len()

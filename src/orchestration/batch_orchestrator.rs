@@ -848,8 +848,8 @@ impl BatchOrchestrator {
         // Collect all results
         let mut all_results = Vec::new();
         let total_regions = 0;
-        let mut simple_bg_count = 0;
-        let mut complex_bg_count = 0;
+        let simple_bg_count = 0;
+        let complex_bg_count = 0;
 
         for task in tasks {
             match task.await {

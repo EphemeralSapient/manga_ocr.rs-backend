@@ -216,18 +216,6 @@ pub struct BubbleDetection {
     pub text_regions: Vec<[i32; 4]>, // Text regions inside this bubble (label 1)
 }
 
-/// Legacy translation response (used by detection.rs)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
-pub struct TextTranslation {
-    pub original_text: String,
-    pub english_translation: String,
-    pub font_family: String,
-    pub font_color: String,
-    pub redraw_bg_required: bool,
-    pub background_color: Option<String>,
-}
-
 /// Classification of a region background
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BackgroundType {

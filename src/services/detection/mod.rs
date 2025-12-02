@@ -1,24 +1,12 @@
 use crate::core::config::Config;
 use crate::core::types::BubbleDetection;
-use crate::services::onnx_builder::DynamicSessionPool;
-use anyhow::{Result, Context};
+use crate::services::onnx_builder::{DynamicSessionPool, build_session_with_acceleration, try_forced_backend};
+use anyhow::Result;
 use image::DynamicImage;
 use ndarray::{Array2, Array4};
-use ort::execution_providers::CPUExecutionProvider;
-#[cfg(feature = "cuda")]
-use ort::execution_providers::CUDAExecutionProvider;
-#[cfg(feature = "tensorrt")]
-use ort::execution_providers::TensorRTExecutionProvider;
-#[cfg(all(target_os = "windows", feature = "directml"))]
-use ort::execution_providers::DirectMLExecutionProvider;
-#[cfg(all(target_os = "macos", feature = "coreml"))]
-use ort::execution_providers::CoreMLExecutionProvider;
-#[cfg(feature = "openvino")]
-use ort::execution_providers::OpenVINOExecutionProvider;
-#[cfg(feature = "xnnpack")]
-use ort::execution_providers::XNNPACKExecutionProvider;
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::Session;
 use ort::value::Value;
+use rayon::prelude::*;
 use std::sync::Arc;
 use tracing::{info, debug, trace};
 
@@ -129,281 +117,20 @@ impl DetectionService {
         // Intentionally disabled - detector.onnx is 160MB, we use single session only
     }
 
-    fn try_forced_backend(backend: &str, model_bytes: &[u8]) -> Result<(String, Session)> {
-        match backend {
-            #[cfg(feature = "tensorrt")]
-            "TENSORRT" => {
-                info!("Forcing TensorRT backend...");
-                let session = Session::builder()?
-                    .with_execution_providers([TensorRTExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized TensorRT backend");
-                Ok(("TensorRT (forced)".to_string(), session))
-            }
-            #[cfg(not(feature = "tensorrt"))]
-            "TENSORRT" => {
-                anyhow::bail!("TensorRT backend not available. Rebuild with: cargo build --features tensorrt")
-            }
-
-            #[cfg(feature = "cuda")]
-            "CUDA" => {
-                info!("Forcing CUDA backend...");
-                let session = Session::builder()?
-                    .with_execution_providers([CUDAExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized CUDA backend");
-                Ok(("CUDA (forced)".to_string(), session))
-            }
-            #[cfg(not(feature = "cuda"))]
-            "CUDA" => {
-                anyhow::bail!("CUDA backend not available. Rebuild with: cargo build --features cuda")
-            }
-
-            #[cfg(feature = "openvino")]
-            "OPENVINO" => {
-                info!("Forcing OpenVINO backend...");
-                let session = Session::builder()?
-                    .with_execution_providers([
-                        OpenVINOExecutionProvider::default()
-                            .with_device_type("CPU")
-                            .build()
-                    ])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized OpenVINO backend");
-                Ok(("OpenVINO-CPU (forced)".to_string(), session))
-            }
-            #[cfg(not(feature = "openvino"))]
-            "OPENVINO" => {
-                anyhow::bail!("OpenVINO backend not available. Rebuild with: cargo build --features openvino")
-            }
-
-            #[cfg(all(target_os = "windows", feature = "directml"))]
-            "DIRECTML" => {
-                info!("Forcing DirectML backend...");
-                // DirectML-only (NO CPU fallback)
-                let session = Session::builder()?
-                    .with_execution_providers([
-                        DirectMLExecutionProvider::default().build()
-                    ])?
-                    .with_parallel_execution(false)?   // REQUIRED: Sequential execution
-                    .with_memory_pattern(false)?       // Disable memory pattern for stability
-                    .with_optimization_level(GraphOptimizationLevel::Level2)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized DirectML backend (GPU-only, no CPU fallback)");
-                Ok(("DirectML (forced)".to_string(), session))
-            }
-            #[cfg(not(all(target_os = "windows", feature = "directml")))]
-            "DIRECTML" => {
-                anyhow::bail!("DirectML backend not available. Rebuild with: cargo build --features directml (Windows only)")
-            }
-
-            #[cfg(all(target_os = "macos", feature = "coreml"))]
-            "COREML" => {
-                info!("Forcing CoreML backend...");
-                let session = Session::builder()?
-                    .with_execution_providers([CoreMLExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized CoreML backend");
-                Ok(("CoreML (forced)".to_string(), session))
-            }
-            #[cfg(not(all(target_os = "macos", feature = "coreml")))]
-            "COREML" => {
-                anyhow::bail!("CoreML backend not available. Rebuild with: cargo build --features coreml (macOS only)")
-            }
-
-            #[cfg(feature = "xnnpack")]
-            "XNNPACK" => {
-                info!("Forcing XNNPACK backend...");
-                let session = Session::builder()?
-                    .with_execution_providers([XNNPACKExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized XNNPACK backend");
-                Ok(("XNNPACK (forced)".to_string(), session))
-            }
-            #[cfg(not(feature = "xnnpack"))]
-            "XNNPACK" => {
-                anyhow::bail!("XNNPACK backend not available. Rebuild with: cargo build --features xnnpack")
-            }
-
-            "CPU" => {
-                info!("Forcing CPU backend...");
-                let session = Session::builder()?
-                    .with_execution_providers([CPUExecutionProvider::default().build()])?
-                    .with_optimization_level(GraphOptimizationLevel::Level3)?
-                    .with_intra_threads(num_cpus::get())?
-                    .commit_from_memory(model_bytes)?;
-                info!("✓ Successfully initialized CPU backend");
-                Ok(("CPU (forced)".to_string(), session))
-            }
-            _ => {
-                anyhow::bail!(
-                    "Unknown inference backend '{}'. \
-                    Valid options: TENSORRT, CUDA, OPENVINO, DIRECTML, COREML, XNNPACK, CPU, AUTO",
-                    backend
-                )
-            }
-        }
-    }
-
     /// Create a session with hardware acceleration using pre-loaded model bytes
-    /// This avoids reloading the 160MB model file for each session
+    /// Delegates to the unified onnx_builder module
     fn create_session_with_acceleration(config: &Config, model_bytes: &[u8]) -> Result<(String, Session)> {
-        // Validate ONNX model header
-        if model_bytes.len() < 100 {
-            anyhow::bail!(
-                "Model file is too small ({} bytes). This might be a Git LFS stub. \
-                Please ensure Git LFS is installed and the model is properly checked out.",
-                model_bytes.len()
-            );
-        }
-
-        // Check for valid ONNX protobuf header (should start with model version info)
-        if model_bytes.len() >= 4 {
-            debug!("Model header bytes: {:02x} {:02x} {:02x} {:02x}",
-                model_bytes[0], model_bytes[1], model_bytes[2], model_bytes[3]);
-        }
-
-        // Log environment info (only first time)
-        static LOGGED_PLATFORM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED_PLATFORM.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            info!("Platform: {}/{}", std::env::consts::OS, std::env::consts::ARCH);
-        }
+        let model_size_mb = model_bytes.len() as f32 / 1_048_576.0;
 
         // Check if a specific backend is forced via config
         if let Some(ref backend) = config.detection.inference_backend {
-            match backend.as_str() {
-                "AUTO" => {
-                    info!("INFERENCE_BACKEND=AUTO, using automatic detection");
-                }
-                forced_backend => {
-                    info!("INFERENCE_BACKEND={}, forcing specific backend", forced_backend);
-                    return Self::try_forced_backend(forced_backend, &model_bytes);
-                }
+            if backend.to_uppercase() != "AUTO" {
+                return try_forced_backend(backend, model_bytes, "detector", model_size_mb);
             }
         }
 
-        // Try hardware acceleration in order of preference
-        // Only attempt providers that are compiled in via Cargo features
-
-        // Try TensorRT (if feature enabled)
-        #[cfg(feature = "tensorrt")]
-        {
-            if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([TensorRTExecutionProvider::default().build()]))
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-                .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(&model_bytes))
-            {
-                info!("✓ Using TensorRT acceleration");
-                return Ok(("TensorRT".to_string(), session));
-            }
-        }
-
-        // Try CUDA (if feature enabled)
-        #[cfg(feature = "cuda")]
-        {
-            if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([CUDAExecutionProvider::default().build()]))
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-                .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(&model_bytes))
-            {
-                info!("✓ Using CUDA acceleration");
-                return Ok(("CUDA".to_string(), session));
-            }
-        }
-
-        // Try CoreML (Apple Silicon, if feature enabled)
-        #[cfg(all(target_os = "macos", feature = "coreml"))]
-        {
-            if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([CoreMLExecutionProvider::default().build()]))
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-                .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(&model_bytes))
-            {
-                info!("✓ Using CoreML acceleration (Apple Neural Engine)");
-                return Ok(("CoreML".to_string(), session));
-            }
-        }
-
-        // Try DirectML (Windows, if feature enabled)
-        #[cfg(all(target_os = "windows", feature = "directml"))]
-        {
-            // DirectML-only (NO CPU fallback)
-            if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([
-                    DirectMLExecutionProvider::default().build()
-                ]))
-                .and_then(|b| b.with_parallel_execution(false))  // REQUIRED: Sequential execution
-                .and_then(|b| b.with_memory_pattern(false))      // Disable memory pattern for stability
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level2))
-                .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(&model_bytes))
-            {
-                info!("✓ Using DirectML acceleration (GPU-only, no CPU fallback)");
-                return Ok(("DirectML".to_string(), session));
-            }
-        }
-
-        // Try OpenVINO (Intel CPU optimization, if feature enabled)
-        #[cfg(feature = "openvino")]
-        {
-            if let Ok(session) = Session::builder()
-                .and_then(|b| b.with_execution_providers([
-                    OpenVINOExecutionProvider::default()
-                        .with_device_type("CPU")
-                        .build()
-                ]))
-                .and_then(|b| b.with_optimization_level(GraphOptimizationLevel::Level3))
-                .and_then(|b| b.with_intra_threads(num_cpus::get()))
-                .and_then(|b| b.commit_from_memory(&model_bytes))
-            {
-                info!("✓ Using OpenVINO acceleration (Intel CPU optimizations)");
-                return Ok(("OpenVINO-CPU".to_string(), session));
-            }
-        }
-
-        // Final fallback: Pure CPU (no acceleration)
-        let session = Session::builder()
-            .context("Failed to create ONNX session builder")?
-            .with_execution_providers([CPUExecutionProvider::default().build()])
-            .context("Failed to configure CPU execution provider")?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .context("Failed to set graph optimization level")?
-            .with_intra_threads(num_cpus::get())
-            .context("Failed to configure intra-op threads")?
-            .commit_from_memory(&model_bytes)
-            .context(format!(
-                "Failed to load ONNX model from memory ({:.1} MB). \
-                This usually indicates:\n  \
-                1. Model file corruption during transfer (verify with: ./verify_models.sh or verify_models.ps1)\n  \
-                2. ONNX Runtime version/platform mismatch\n  \
-                3. Model created with incompatible ONNX opset version\n  \
-                4. Platform-specific binary incompatibility ({}/{})\n  \
-                Solutions:\n  \
-                - Run checksum verification: ./verify_models.sh (Linux/Mac) or .\\verify_models.ps1 (Windows)\n  \
-                - Re-download/re-transfer the models if checksums fail\n  \
-                - Ensure the model was created with ONNX opset <= 18\n  \
-                - Check that the binary matches your platform",
-                model_bytes.len() as f64 / 1_048_576.0,
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            ))?;
-
-        info!("✓ Using CPU (no hardware acceleration)");
-        Ok(("CPU".to_string(), session))
+        // Use automatic detection from unified builder
+        build_session_with_acceleration(model_bytes, "detector", model_size_mb)
     }
 
     #[allow(dead_code)]
@@ -689,32 +416,51 @@ impl DetectionService {
         };
         let target = target_size as usize;
 
-        // Preprocess all images and stack into batch tensor
+        // Preprocess all images in parallel and stack into batch tensor
         let mut batch_array = Array4::<f32>::zeros((batch_size, 3, target, target));
-        let mut sizes_array = Array2::zeros((batch_size, 2));
+        let mut sizes_array = Array2::<i64>::zeros((batch_size, 2));
 
-        for (i, (img, _page_index)) in images.iter().enumerate() {
-            sizes_array[[i, 0]] = img.width() as i64;
-            sizes_array[[i, 1]] = img.height() as i64;
+        // Parallel preprocessing - each image is independent
+        let preprocessed: Vec<_> = images
+            .par_iter()
+            .map(|(img, _page_index)| {
+                let resized = img.resize_exact(
+                    target_size,
+                    target_size,
+                    image::imageops::FilterType::Triangle,
+                );
+                let rgb_img = resized.to_rgb8();
 
-            let resized = img.resize_exact(
-                target_size,
-                target_size,
-                image::imageops::FilterType::Triangle,
-            );
-            let rgb_img = resized.to_rgb8();
+                // Create per-image buffer
+                let mut img_data = vec![0.0f32; 3 * target * target];
+                for y in 0..target {
+                    for x in 0..target {
+                        let pixel = rgb_img.get_pixel(x as u32, y as u32);
+                        let base = y * target + x;
+                        img_data[base] = pixel[0] as f32 / 255.0;
+                        img_data[target * target + base] = pixel[1] as f32 / 255.0;
+                        img_data[2 * target * target + base] = pixel[2] as f32 / 255.0;
+                    }
+                }
+                (img.width() as i64, img.height() as i64, img_data)
+            })
+            .collect();
 
-            for y in 0..target {
-                for x in 0..target {
-                    let pixel = rgb_img.get_pixel(x as u32, y as u32);
-                    batch_array[[i, 0, y, x]] = pixel[0] as f32 / 255.0;
-                    batch_array[[i, 1, y, x]] = pixel[1] as f32 / 255.0;
-                    batch_array[[i, 2, y, x]] = pixel[2] as f32 / 255.0;
+        // Copy preprocessed data into batch tensor (sequential but fast memcpy)
+        for (i, (w, h, img_data)) in preprocessed.into_iter().enumerate() {
+            sizes_array[[i, 0]] = w;
+            sizes_array[[i, 1]] = h;
+
+            for c in 0..3 {
+                for y in 0..target {
+                    for x in 0..target {
+                        batch_array[[i, c, y, x]] = img_data[c * target * target + y * target + x];
+                    }
                 }
             }
         }
 
-        debug!("✓ Batch preprocessed: {} images into [{}, 3, {}, {}]", batch_size, batch_size, target, target);
+        debug!("✓ Batch preprocessed (parallel): {} images into [{}, 3, {}, {}]", batch_size, batch_size, target, target);
 
         let images_value = Value::from_array(batch_array)?;
         let sizes_value = Value::from_array(sizes_array)?;

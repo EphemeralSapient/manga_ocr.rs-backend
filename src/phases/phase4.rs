@@ -179,7 +179,7 @@ impl Phase4Pipeline {
     fn create_cleaned_base_mask(
         &self,
         image_data: &ImageData,
-        phase1_output: &Phase1Output,
+        _phase1_output: &Phase1Output,
         phase3_output: &Phase3Output,
     ) -> Result<RgbaImage> {
         let img: DynamicImage = if let Some(ref decoded) = image_data.decoded_image {

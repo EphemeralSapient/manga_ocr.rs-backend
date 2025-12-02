@@ -984,12 +984,13 @@ impl Phase2Pipeline {
                 .or_else(|| std::env::var("CEREBRAS_API_KEY").ok())
                 .ok_or_else(|| anyhow::anyhow!("Cerebras API key not provided"))?;
 
-            let cerebras = CerebrasClient::new(cerebras_key)?;
+            // Validate key by creating client (used in spawned tasks below)
+            let _cerebras = CerebrasClient::new(cerebras_key.clone())?;
 
             // Batch into chunks of 80 for parallel API calls
             const BATCH_SIZE: usize = 80;
             let chunks: Vec<_> = ocr_results.chunks(BATCH_SIZE).collect();
-            
+
             if chunks.len() > 1 {
                 info!("📦 Splitting {} regions into {} batches of max {}", ocr_results.len(), chunks.len(), BATCH_SIZE);
             }
