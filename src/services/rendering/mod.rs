@@ -5,7 +5,7 @@ use cosmic_text::{
 };
 use image::{Rgba, RgbaImage};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use parking_lot::Mutex;  // Use parking_lot for better performance with sync mutex
 use tracing::{debug, info};
 
 /// Detect if text contains CJK (Chinese, Japanese, Korean) characters
@@ -78,8 +78,8 @@ impl CosmicTextRenderer {
 
     /// Load a Google Font into the font system
     /// The font_data should be the raw font file bytes (TTF, OTF, or WOFF2)
-    pub async fn load_google_font(&self, font_data: Vec<u8>, family_name: &str) -> Result<()> {
-        let mut font_system = self.font_system.lock().await;
+    pub fn load_google_font(&self, font_data: Vec<u8>, family_name: &str) -> Result<()> {
+        let mut font_system = self.font_system.lock();
         font_system.db_mut().load_font_data(font_data);
         info!("✓ Loaded Google Font: {}", family_name);
         Ok(())
@@ -137,7 +137,7 @@ impl CosmicTextRenderer {
     ///
     /// Uses LayoutRun's line_top + line_height for accurate vertical measurement,
     /// and line_w for horizontal measurement (no arbitrary padding).
-    pub async fn measure_text(
+    pub fn measure_text(
         &self,
         text: &str,
         font_family: &str,
@@ -149,7 +149,7 @@ impl CosmicTextRenderer {
             return Ok((0.0, 0.0));
         }
 
-        let mut font_system = self.font_system.lock().await;
+        let mut font_system = self.font_system.lock();
 
         let family = Self::parse_font_family(font_family);
         let weight = Self::is_bold_font(font_family);
@@ -197,7 +197,7 @@ impl CosmicTextRenderer {
     ///
     /// # Arguments
     /// * `region_bounds` - Optional (min_x, min_y, max_x, max_y) to constrain rendering within specific region
-    pub async fn render_text(
+    pub fn render_text(
         &self,
         img: &mut RgbaImage,
         text: &str,
@@ -234,14 +234,14 @@ impl CosmicTextRenderer {
                             y + offset_y,
                             max_width,
                             _region_bounds, // Apply region bounds to stroke as well
-                        ).await?;
+                        )?;
                     }
                 }
             }
         }
 
         // Render fill text
-        self.render_text_internal(img, text, font_family, font_size, color, x, y, max_width, _region_bounds).await?;
+        self.render_text_internal(img, text, font_family, font_size, color, x, y, max_width, _region_bounds)?;
 
         Ok(())
     }
@@ -251,7 +251,7 @@ impl CosmicTextRenderer {
     ///
     /// # Arguments
     /// * `region_bounds` - Optional (min_x, min_y, max_x, max_y) to constrain rendering within specific region
-    async fn render_text_internal(
+    fn render_text_internal(
         &self,
         img: &mut RgbaImage,
         text: &str,
@@ -266,69 +266,59 @@ impl CosmicTextRenderer {
         let family = Self::parse_font_family(font_family);
         let weight = Self::is_bold_font(font_family);
 
-        let buffer = {
-            let mut font_system = self.font_system.lock().await;
+        let mut font_system = self.font_system.lock();
 
-            // Use consistent line_height = font_size * 1.2 (matches measure_text)
-            let line_height = font_size * 1.2;
-            let metrics = Metrics::new(font_size, line_height);
-            let mut buffer = Buffer::new(&mut font_system, metrics);
+        // Use consistent line_height = font_size * 1.2 (matches measure_text)
+        let line_height = font_size * 1.2;
+        let metrics = Metrics::new(font_size, line_height);
+        let mut buffer = Buffer::new(&mut font_system, metrics);
 
-            if let Some(width) = max_width {
-                buffer.set_size(&mut font_system, Some(width), None);
-            }
+        if let Some(width) = max_width {
+            buffer.set_size(&mut font_system, Some(width), None);
+        }
 
-            // Word wrap only - never break words mid-character
-            buffer.set_wrap(&mut font_system, Wrap::Word);
+        // Word wrap only - never break words mid-character
+        buffer.set_wrap(&mut font_system, Wrap::Word);
 
-            let attrs = Attrs::new().family(family).weight(weight);
-            buffer.set_text(&mut font_system, text, &attrs, Shaping::Advanced);
-            buffer.shape_until_scroll(&mut font_system, false);
-
-            buffer
-        };
+        let attrs = Attrs::new().family(family).weight(weight);
+        buffer.set_text(&mut font_system, text, &attrs, Shaping::Advanced);
+        buffer.shape_until_scroll(&mut font_system, false);
 
         let cosmic_color = CosmicColor::rgba(color[0], color[1], color[2], color[3]);
 
-        // OPTIMIZATION 2: Lock only for actual drawing
-        // Drawing is fast, so this lock is held briefly
-        {
-            let mut font_system = self.font_system.lock().await;
-            let mut swash_cache = self.swash_cache.lock().await;
+        let mut swash_cache = self.swash_cache.lock();
 
-            buffer.draw(&mut font_system, &mut swash_cache, cosmic_color, |px_x, px_y, _w, _h, pixel_color| {
-                let img_x = x + px_x;
-                let img_y = y + px_y;
+        buffer.draw(&mut font_system, &mut swash_cache, cosmic_color, |px_x, px_y, _w, _h, pixel_color| {
+            let img_x = x + px_x;
+            let img_y = y + px_y;
 
-                // Only check bounds to prevent crashes, don't clip text rendering
-                // Text can now overflow freely without being clipped
-                if img_x >= 0 && img_x < img.width() as i32
-                    && img_y >= 0 && img_y < img.height() as i32 {
-                    let existing = img.get_pixel(img_x as u32, img_y as u32);
+            // Only check bounds to prevent crashes, don't clip text rendering
+            // Text can now overflow freely without being clipped
+            if img_x >= 0 && img_x < img.width() as i32
+                && img_y >= 0 && img_y < img.height() as i32 {
+                let existing = img.get_pixel(img_x as u32, img_y as u32);
 
-                    // Alpha blend
-                    let alpha = pixel_color.a() as f32 / 255.0;
-                    let inv_alpha = 1.0 - alpha;
+                // Alpha blend
+                let alpha = pixel_color.a() as f32 / 255.0;
+                let inv_alpha = 1.0 - alpha;
 
-                    let blended = Rgba([
-                        ((pixel_color.r() as f32 * alpha) + (existing[0] as f32 * inv_alpha)) as u8,
-                        ((pixel_color.g() as f32 * alpha) + (existing[1] as f32 * inv_alpha)) as u8,
-                        ((pixel_color.b() as f32 * alpha) + (existing[2] as f32 * inv_alpha)) as u8,
-                        existing[3].max(pixel_color.a()),
-                    ]);
+                let blended = Rgba([
+                    ((pixel_color.r() as f32 * alpha) + (existing[0] as f32 * inv_alpha)) as u8,
+                    ((pixel_color.g() as f32 * alpha) + (existing[1] as f32 * inv_alpha)) as u8,
+                    ((pixel_color.b() as f32 * alpha) + (existing[2] as f32 * inv_alpha)) as u8,
+                    existing[3].max(pixel_color.a()),
+                ]);
 
-                    img.put_pixel(img_x as u32, img_y as u32, blended);
-                }
-            });
-            // Locks released here automatically
-        }
+                img.put_pixel(img_x as u32, img_y as u32, blended);
+            }
+        });
 
         Ok(())
     }
 
     /// Render multi-line text with automatic layout and vertical alignment
     /// Uses consistent line_height = font_size * 1.2 to match measure_text
-    pub async fn render_multiline_text(
+    pub fn render_multiline_text(
         &self,
         img: &mut RgbaImage,
         text: &str,
@@ -347,7 +337,7 @@ impl CosmicTextRenderer {
 
         // Calculate y_offset for vertical alignment
         let y_offset = {
-            let mut font_system = self.font_system.lock().await;
+            let mut font_system = self.font_system.lock();
 
             let family = Self::parse_font_family(font_family);
             let weight = Self::is_bold_font(font_family);
@@ -378,7 +368,6 @@ impl CosmicTextRenderer {
         };
 
         // Render with stroke and fill
-        // No more deadlock risk - render_text_internal manages its own locks properly
         if let Some(width) = stroke_width {
             let stroke_color = Self::get_stroke_color(color);
             for offset_y in -width..=width {
@@ -401,14 +390,14 @@ impl CosmicTextRenderer {
                             y + y_offset + offset_y,
                             Some(max_width),
                             None, // No region bounds for stroke
-                        ).await?;
+                        )?;
                     }
                 }
             }
         }
 
         // Render fill
-        self.render_text_internal(img, text, font_family, font_size, color, x, y + y_offset, Some(max_width), None).await?;
+        self.render_text_internal(img, text, font_family, font_size, color, x, y + y_offset, Some(max_width), None)?;
 
         Ok(())
     }
@@ -424,7 +413,7 @@ impl CosmicTextRenderer {
     /// Solution:
     /// 1. Binary search to find approximate fit (fast, O(log n))
     /// 2. Local neighborhood search (±3px) to find true maximum (handles discontinuities)
-    pub async fn find_optimal_font_size(
+    pub fn find_optimal_font_size(
         &self,
         text: &str,
         font_family: &str,
@@ -445,9 +434,9 @@ impl CosmicTextRenderer {
         let search_max = max_size.min(effective_height); // Font can't be taller than box
 
         // Helper: check if size fits
-        let fits = |size: f32| async move {
-            let (w, h) = self.measure_text(text, font_family, size, Some(effective_width)).await?;
-            Ok::<bool, anyhow::Error>(w <= effective_width && h <= effective_height)
+        let fits = |size: f32| -> Result<bool> {
+            let (w, h) = self.measure_text(text, font_family, size, Some(effective_width))?;
+            Ok(w <= effective_width && h <= effective_height)
         };
 
         // PHASE 1: Binary search to find approximate boundary
@@ -457,13 +446,13 @@ impl CosmicTextRenderer {
         let mut best_fit = search_min;
 
         // Quick check: does max size fit?
-        if fits(search_max).await? {
+        if fits(search_max)? {
             best_fit = search_max;
-        } else if !fits(search_min).await? {
+        } else if !fits(search_min)? {
             // Even min doesn't fit - try going smaller
             let mut emergency_size = search_min;
             while emergency_size >= absolute_min {
-                if fits(emergency_size).await? {
+                if fits(emergency_size)? {
                     best_fit = emergency_size;
                     break;
                 }
@@ -480,7 +469,7 @@ impl CosmicTextRenderer {
             // Binary search: find the largest fitting size
             while hi - lo > 1.0 {
                 let mid = (lo + hi) / 2.0;
-                if fits(mid).await? {
+                if fits(mid)? {
                     lo = mid;
                     best_fit = mid;
                 } else {
@@ -494,7 +483,7 @@ impl CosmicTextRenderer {
         let mut final_best = best_fit;
         for offset in [-3.0, -2.5, -2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0] {
             let test_size = (best_fit + offset).clamp(search_min, search_max);
-            if test_size > final_best && fits(test_size).await? {
+            if test_size > final_best && fits(test_size)? {
                 final_best = test_size;
             }
         }
@@ -508,6 +497,7 @@ impl CosmicTextRenderer {
     }
 }
 
+/// Vertical alignment options for text rendering
 #[derive(Debug, Clone, Copy)]
 pub enum VerticalAlign {
     Top,

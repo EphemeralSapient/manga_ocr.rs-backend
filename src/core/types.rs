@@ -300,7 +300,7 @@ pub struct BananaResult {
 }
 
 /// Phase 2 output: API call results
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Phase2Output {
     pub page_index: usize,
     pub simple_bg_translations: Vec<(usize, OCRTranslation)>, // (region_id, translation)

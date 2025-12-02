@@ -172,35 +172,51 @@ impl BatchOrchestrator {
         let filter_orphan_regions = config.filter_orphan_regions.unwrap_or(false);
         let blur_free_text = config.blur_free_text_bg.unwrap_or(app_config.blur_free_text());
 
-        info!("Processing {} batches phase-by-phase: Phase 1 → Phase 2 (global) → Phase 3{} → Phase 4",
+        // Prepare Phase 2 config early
+        let ocr_model_override = config.ocr_translation_model.as_deref().map(|s| s.to_string());
+        let banana_model_override = config.banana_image_model.as_deref().map(|s| s.to_string());
+        let banana_mode = config.banana_mode.unwrap_or(app_config.banana_mode_enabled());
+        let cache_enabled = config.cache_enabled.unwrap_or(true);
+        let custom_api_keys = config.api_keys.clone();
+        let target_language = config.target_language.as_deref().map(|s| s.to_string());
+        let reuse_factor = config.reuse_factor.unwrap_or(4).clamp(1, 8);
+        let ocr_enabled = config.ocr_enabled.unwrap_or(false);
+        let use_cerebras = config.use_cerebras.unwrap_or(false);
+        let cerebras_api_key = config.cerebras_api_key.as_deref().map(|s| s.to_string());
+
+        // Warn if Cerebras is requested but local OCR is not enabled
+        if use_cerebras && !ocr_enabled {
+            warn!("⚠️  use_cerebras=true requires ocr_enabled=true. Falling back to Gemini for OCR+translation.");
+        }
+
+        info!("Processing {} batches: Detection (all) → OCR+Cleaning (parallel, batched translation) → Phase 3{} → Phase 4",
               batches.len(),
               if use_mask { "" } else { " (skipped - early cleaned)" });
 
-        // ===== PHASE 1: DETECTION ONLY (Segmentation runs in background) =====
-        info!("Starting Phase 1 detection for all {} batches", batches.len());
+        // ===== PHASE 1: DETECTION FOR ALL PAGES =====
+        info!("🚀 Starting Phase 1: Detection for all pages...");
 
         let phase1_start = Instant::now();
+        let mut phase1_metrics = PerformanceMetrics::default();
         let mut all_phase1_data: Vec<(ImageData, crate::core::types::Phase1Output)> = Vec::new();
         let mut all_decoded_images: Vec<image::DynamicImage> = Vec::new();
-        let mut phase1_metrics = PerformanceMetrics::default();
 
-        // Check if using DirectML - if so, use sequential processing
+        // Check if using DirectML - if so, use sequential detection
         let is_directml = self.phase1.is_directml();
+        let is_l1_debug = config.l1_debug.unwrap_or(false);
 
         if is_directml {
-            // DirectML: Sequential processing through single session (no parallelism)
-            info!("🔄 DirectML detected: Processing {} batches sequentially (detection only)", batches.len());
+            // DirectML: Sequential detection
+            info!("🔄 DirectML: Sequential detection for {} batches", batches.len());
 
             for batch in batches.into_iter() {
                 match self.phase1.execute_detection_only(&batch.images, merge_img, config.target_size, filter_orphan_regions, use_mask, blur_free_text).await {
                     Ok((mut outputs, decoded_images)) => {
                         for (i, output) in outputs.iter_mut().enumerate() {
-                            // Filter out label 2 if not included
                             if !include_free_text {
                                 output.regions.retain(|r| r.label != 2);
                             }
 
-                            // Count metrics
                             phase1_metrics.total_regions += output.regions.len();
                             for region in &output.regions {
                                 match region.label {
@@ -226,11 +242,8 @@ impl BatchOrchestrator {
                 }
             }
         } else {
-            // Non-DirectML: Parallel processing
-            let num_batches = batches.len();
-            if num_batches > 1 {
-                info!("⚡ Non-DirectML backend: Processing {} batches in parallel (detection only)", num_batches);
-            }
+            // Non-DirectML: Parallel detection
+            info!("⚡ Non-DirectML: Parallel detection for {} batches", batches.len());
 
             let mut phase1_tasks = Vec::new();
             for batch in batches {
@@ -246,17 +259,14 @@ impl BatchOrchestrator {
                 phase1_tasks.push(task);
             }
 
-            // Wait for all Phase 1 detection to complete
             for task in phase1_tasks {
                 match task.await {
                     Ok(Ok((images, mut outputs, decoded_images))) => {
                         for (i, output) in outputs.iter_mut().enumerate() {
-                            // Filter out label 2 if not included
                             if !include_free_text {
                                 output.regions.retain(|r| r.label != 2);
                             }
 
-                            // Count metrics
                             phase1_metrics.total_regions += output.regions.len();
                             for region in &output.regions {
                                 match region.label {
@@ -276,25 +286,21 @@ impl BatchOrchestrator {
                         }
                         all_decoded_images.extend(decoded_images);
                     }
-                    Ok(Err(e)) => {
-                        tracing::error!("Phase 1 detection failed: {:?}", e);
-                    }
-                    Err(e) => {
-                        tracing::error!("Phase 1 detection task panicked: {:?}", e);
-                    }
+                    Ok(Err(e)) => tracing::error!("Phase 1 detection failed: {:?}", e),
+                    Err(e) => tracing::error!("Phase 1 detection task panicked: {:?}", e),
                 }
             }
         }
 
         phase1_metrics.phase1_time = phase1_start.elapsed();
         info!(
-            "Phase 1 detection complete for all {} pages in {:.2}ms",
+            "✓ Phase 1 detection complete for {} pages in {:.2}ms",
             all_phase1_data.len(),
             phase1_metrics.phase1_time.as_secs_f64() * 1000.0
         );
 
         // ===== L1_DEBUG MODE: Early return with bbox visualization =====
-        if config.l1_debug.unwrap_or(false) {
+        if is_l1_debug {
             info!("🔍 L1_DEBUG mode enabled - returning bbox visualization (use_mask={})", use_mask);
 
             let mut debug_results = Vec::new();
@@ -443,37 +449,84 @@ impl BatchOrchestrator {
             });
         }
 
-        // ===== SEQUENTIAL: OCR first, then cleaning (single OCR pass) =====
-        // Phase 2 OCR runs first to determine which regions have valid text.
-        // Cleaning only processes regions with OCR-validated text (prevents over-cleaning).
-        info!("🔄 Starting OCR → Cleaning (single OCR pass)...");
-        let ocr_clean_start = Instant::now();
+        // ===== PHASE 2: TRUE PARALLEL PIPELINE =====
+        // Step 1: OCR ONNX + Cleaning ONNX run in parallel (no API calls yet)
+        // Step 2: Translation API + Apply Cleaning run in parallel
+        // This maximizes parallelism by separating ONNX inference from API calls
+        info!("🚀 Starting Phase 2: TRUE PARALLEL PIPELINE...");
+        let phase2_start = Instant::now();
 
-        // Prepare Phase 2 config
-        let ocr_model_override = config.ocr_translation_model.as_deref().map(|s| s.to_string());
-        let banana_model_override = config.banana_image_model.as_deref().map(|s| s.to_string());
-        let banana_mode = config.banana_mode.unwrap_or(app_config.banana_mode_enabled());
-        let cache_enabled = config.cache_enabled.unwrap_or(true);
-        let custom_api_keys = config.api_keys.clone();
-        let target_language = config.target_language.as_deref().map(|s| s.to_string());
-        let reuse_factor = config.reuse_factor.unwrap_or(4).clamp(1, 8);
-        let ocr_enabled = config.ocr_enabled.unwrap_or(false);
-        let use_cerebras = config.use_cerebras.unwrap_or(false);
-        let cerebras_api_key = config.cerebras_api_key.as_deref().map(|s| s.to_string());
+        // STEP 1: OCR ONNX + Cleaning ONNX in parallel
+        info!("📦 Step 1: Running OCR + Cleaning ONNX models in parallel...");
+        let onnx_start = Instant::now();
 
-        // Warn if Cerebras is requested but local OCR is not enabled
-        if use_cerebras && !ocr_enabled {
-            warn!("⚠️  use_cerebras=true requires ocr_enabled=true. Falling back to Gemini for OCR+translation.");
-        }
-
-        // Step 1: Run Phase 2 (OCR + Translation) FIRST
-        // This determines which regions have valid text
-        let phase2_outputs = if ocr_enabled {
+        let (ocr_result, cleaning_result) = if ocr_enabled {
             let models_dir = std::path::Path::new("models");
+            let phase1_data_for_ocr = all_phase1_data.clone();
+            let phase1_data_for_clean: Vec<_> = all_phase1_data.iter().map(|(_, p1)| p1.clone()).collect();
+            let decoded_images_for_clean = all_decoded_images.clone();
+
+            let phase2 = Arc::clone(&self.phase2);
+            let phase1 = Arc::clone(&self.phase1);
+            let models_dir = models_dir.to_path_buf();
+
+            // Run OCR ONNX and Cleaning ONNX in TRUE PARALLEL
+            let ocr_task = tokio::task::spawn_blocking(move || {
+                phase2.execute_ocr_only(&phase1_data_for_ocr, &models_dir, cache_enabled)
+            });
+            
+            let clean_task = async {
+                let mut phase1_outputs = phase1_data_for_clean;
+                phase1
+                    .complete_cleaning(&mut phase1_outputs, &decoded_images_for_clean, None)
+                    .await
+                    .map(|_| phase1_outputs)
+            };
+            
+            let (ocr_res, clean_res) = tokio::join!(ocr_task, clean_task);
+            let ocr_res = ocr_res.map_err(|e| anyhow::anyhow!("OCR task panicked: {:?}", e))?;
+            (ocr_res, clean_res)
+        } else {
+            // Non-OCR mode: just run cleaning
+            let phase1_data_for_clean: Vec<_> = all_phase1_data.iter().map(|(_, p1)| p1.clone()).collect();
+            let decoded_images_for_clean = all_decoded_images.clone();
+
+            let clean_result = {
+                let mut phase1_outputs = phase1_data_for_clean;
+                self.phase1
+                    .complete_cleaning(&mut phase1_outputs, &decoded_images_for_clean, None)
+                    .await
+                    .map(|_| phase1_outputs)
+            };
+
+            (Ok((Vec::new(), Vec::new())), clean_result)
+        };
+
+        let onnx_ms = onnx_start.elapsed().as_secs_f64() * 1000.0;
+        info!("✓ ONNX models complete in {:.2}ms", onnx_ms);
+
+        // Extract OCR results (or empty if failed)
+        let (ocr_results, cached_results) = ocr_result.unwrap_or_else(|e| {
+            tracing::error!("OCR failed: {:?}", e);
+            (Vec::new(), Vec::new())
+        });
+
+        // Extract cleaned phase1 outputs
+        let updated_phase1_outputs = cleaning_result.unwrap_or_else(|e| {
+            tracing::error!("Cleaning failed: {:?}", e);
+            all_phase1_data.iter().map(|(_, p1)| p1.clone()).collect()
+        });
+
+        // STEP 2: Translation API call (happens after all ONNX work is done)
+        // This is a single batched call for all OCR results
+        info!("🌐 Step 2: Batched translation API call for {} regions...", ocr_results.len());
+        let api_start = Instant::now();
+
+        let translations = if ocr_enabled && !ocr_results.is_empty() {
             self.phase2
-                .execute_batch_with_local_ocr(
-                    &all_phase1_data,
-                    models_dir,
+                .translate_ocr_results(
+                    ocr_results,
+                    cached_results,
                     use_cerebras,
                     cerebras_api_key.as_deref(),
                     target_language.as_deref(),
@@ -481,8 +534,13 @@ impl BatchOrchestrator {
                     custom_api_keys.as_deref(),
                 )
                 .await
-        } else {
-            self.phase2
+                .unwrap_or_else(|e| {
+                    tracing::error!("Translation failed: {:?}", e);
+                    Vec::new()
+                })
+        } else if !ocr_enabled {
+            // Use Gemini API for OCR+translation
+            match self.phase2
                 .execute_batch(
                     &all_phase1_data,
                     ocr_model_override.as_deref(),
@@ -494,57 +552,41 @@ impl BatchOrchestrator {
                     reuse_factor,
                 )
                 .await
-        };
-
-        // Step 2: Extract valid region IDs from Phase 2 output
-        // These are regions that have OCR text and translations
-        let valid_region_ids: std::collections::HashSet<usize> = match &phase2_outputs {
-            Ok(outputs) => {
-                outputs
-                    .iter()
-                    .flat_map(|o| {
-                        // Collect from both simple and complex bg translations
-                        o.simple_bg_translations.iter().map(|(id, _)| *id)
-                            .chain(o.complex_bg_translations.iter().map(|(id, _)| *id))
-                    })
-                    .collect()
+            {
+                Ok(outputs) => {
+                    // Convert to translation format
+                    outputs.into_iter()
+                        .flat_map(|o| {
+                            let page_idx = o.page_index;
+                            o.simple_bg_translations.into_iter()
+                                .chain(o.complex_bg_translations.into_iter())
+                                .map(move |(id, t)| (page_idx, id, t))
+                        })
+                        .collect()
+                }
+                Err(e) => {
+                    tracing::error!("Gemini API failed: {:?}", e);
+                    Vec::new()
+                }
             }
-            Err(_) => std::collections::HashSet::new(),
-        };
-        debug!("OCR validated {} regions with text", valid_region_ids.len());
-
-        // Step 3: Run cleaning with valid_region_ids filter
-        // Only regions with OCR text are cleaned (prevents over-cleaning of art)
-        let mut phase1_outputs_for_clean: Vec<_> = all_phase1_data
-            .iter()
-            .map(|(_, output)| output.clone())
-            .collect();
-
-        let cleaning_result = self.phase1
-            .complete_cleaning(
-                &mut phase1_outputs_for_clean,
-                &all_decoded_images,
-                if valid_region_ids.is_empty() { None } else { Some(&valid_region_ids) },
-            )
-            .await;
-
-        // Process cleaning result
-        let updated_phase1_outputs = match cleaning_result {
-            Ok(()) => phase1_outputs_for_clean,
-            Err(e) => {
-                tracing::error!("Text cleaning failed: {:?}", e);
-                all_phase1_data.iter().map(|(_, p1)| p1.clone()).collect()
-            }
+        } else {
+            cached_results
         };
 
-        let ocr_clean_ms = ocr_clean_start.elapsed().as_secs_f64() * 1000.0;
-        info!("✓ OCR + Cleaning completed in {:.2}ms", ocr_clean_ms);
+        let api_ms = api_start.elapsed().as_secs_f64() * 1000.0;
+        info!("✓ Translation API complete in {:.2}ms ({} results)", api_ms, translations.len());
 
-        // CLEANUP: Free detection and text cleaner ONNX sessions
+        // Build Phase2 outputs
+        let phase2_outputs = self.phase2.build_phase2_outputs(&all_phase1_data, translations);
+
+        let phase2_ms = phase2_start.elapsed().as_secs_f64() * 1000.0;
+        info!("✓ Phase 2 complete in {:.2}ms (ONNX: {:.2}ms, API: {:.2}ms)", phase2_ms, onnx_ms, api_ms);
+
+        // CLEANUP: Free ONNX sessions
         self.phase1.cleanup_detection_sessions();
         self.phase1.cleanup_segmentation_sessions();
 
-        phase1_metrics.phase2_time = ocr_clean_start.elapsed();
+        phase1_metrics.phase2_time = phase2_start.elapsed();
         info!(
             "Phase 2 complete for all {} pages in {:.2}ms",
             all_phase1_data.len(),
@@ -554,32 +596,27 @@ impl BatchOrchestrator {
         // Combine Phase 1 (with completed segmentation) and Phase 2 outputs
         let mut all_phase2_data: Vec<(ImageData, crate::core::types::Phase1Output, crate::core::types::Phase2Output)> = Vec::new();
 
-        match phase2_outputs {
-            Ok(outputs) => {
-                // Collect metrics
-                let mut total_simple_translations = 0;
-                for (i, phase2_output) in outputs.into_iter().enumerate() {
-                    let (image_data, _) = &all_phase1_data[i];
-                    let updated_phase1 = &updated_phase1_outputs[i];
-
-                    total_simple_translations += phase2_output.simple_bg_translations.len();
-                    phase1_metrics.api_calls_banana += phase2_output.complex_bg_bananas.len();
-                    if !phase2_output.complex_bg_translations.is_empty() {
-                        phase1_metrics.api_calls_complex += 1;
-                    }
-
-                    all_phase2_data.push((image_data.clone(), updated_phase1.clone(), phase2_output));
-                }
-
-                // Count as 1 logical batch (split across keys)
-                if total_simple_translations > 0 {
-                    phase1_metrics.api_calls_simple = 1;
-                }
+        // Collect metrics
+        let mut total_simple_translations = 0;
+        for (i, phase2_output) in phase2_outputs.into_iter().enumerate() {
+            if i >= all_phase1_data.len() {
+                break;
             }
-            Err(e) => {
-                tracing::error!("Phase 2 global failed: {:?}", e);
-                return Err(e);
+            let (image_data, _) = &all_phase1_data[i];
+            let updated_phase1 = &updated_phase1_outputs[i];
+
+            total_simple_translations += phase2_output.simple_bg_translations.len();
+            phase1_metrics.api_calls_banana += phase2_output.complex_bg_bananas.len();
+            if !phase2_output.complex_bg_translations.is_empty() {
+                phase1_metrics.api_calls_complex += 1;
             }
+
+            all_phase2_data.push((image_data.clone(), updated_phase1.clone(), phase2_output));
+        }
+
+        // Count as 1 logical batch (split across keys)
+        if total_simple_translations > 0 {
+            phase1_metrics.api_calls_simple = 1;
         }
 
         // ===== PHASE 3: ALL PAGES =====
@@ -1449,8 +1486,8 @@ async fn process_single_page(
             // Download and load Google Font
             match font_manager.get_google_font(google_font).await {
                 Ok(font_data) => {
-                    // Load font into Phase4's renderer
-                    if let Err(e) = phase4.load_google_font(font_data, google_font).await {
+                    // Load font into Phase4's renderer (now sync)
+                    if let Err(e) = phase4.load_google_font(font_data, google_font) {
                         tracing::warn!("Failed to load Google Font '{}': {}. Falling back to built-in font.", google_font, e);
                         font_family
                     } else {

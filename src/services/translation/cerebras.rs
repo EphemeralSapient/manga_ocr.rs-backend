@@ -6,7 +6,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, error};
+
+/// Retry configuration
+const MAX_RETRIES: u32 = 3;
+const INITIAL_RETRY_DELAY_MS: u64 = 1000;
+const MAX_RETRY_DELAY_MS: u64 = 10000;
 
 /// Cerebras API endpoint
 const CEREBRAS_API_URL: &str = "https://api.cerebras.ai/v1/chat/completions";
@@ -225,26 +230,84 @@ impl CerebrasClient {
 
         let start = Instant::now();
 
-        let response = self
-            .http_client
-            .post(CEREBRAS_API_URL)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send request to Cerebras API")?;
+        // Retry loop with exponential backoff
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut retry_delay_ms = INITIAL_RETRY_DELAY_MS;
+        
+        let response_data = 'retry: {
+            for attempt in 0..=MAX_RETRIES {
+                if attempt > 0 {
+                    warn!(
+                        "Cerebras: Retry attempt {} after {}ms delay",
+                        attempt, retry_delay_ms
+                    );
+                    tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                    // Exponential backoff with cap
+                    retry_delay_ms = (retry_delay_ms * 2).min(MAX_RETRY_DELAY_MS);
+                }
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Cerebras API error: {} - {}", status, error_text);
-        }
+                let send_result = self
+                    .http_client
+                    .post(CEREBRAS_API_URL)
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .header("Content-Type", "application/json")
+                    .json(&request)
+                    .send()
+                    .await;
 
-        let response_data: ChatCompletionResponse = response
-            .json()
-            .await
-            .context("Failed to parse Cerebras response")?;
+                let response = match send_result {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        let is_retryable = e.is_timeout() || e.is_connect();
+                        error!(
+                            "Cerebras: Request failed (attempt {}): {} (retryable: {})",
+                            attempt + 1, e, is_retryable
+                        );
+                        if is_retryable && attempt < MAX_RETRIES {
+                            last_error = Some(e.into());
+                            continue;
+                        }
+                        return Err(e).context("Failed to send request to Cerebras API");
+                    }
+                };
+
+                let status = response.status();
+                
+                // Check for retryable HTTP status codes (5xx, 429)
+                if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let error_text = response.text().await.unwrap_or_default();
+                    error!(
+                        "Cerebras: Server error {} (attempt {}): {}",
+                        status, attempt + 1, error_text
+                    );
+                    if attempt < MAX_RETRIES {
+                        last_error = Some(anyhow::anyhow!("Cerebras API error: {} - {}", status, error_text));
+                        continue;
+                    }
+                    anyhow::bail!("Cerebras API error after {} retries: {} - {}", MAX_RETRIES + 1, status, error_text);
+                }
+
+                if !status.is_success() {
+                    let error_text = response.text().await.unwrap_or_default();
+                    anyhow::bail!("Cerebras API error: {} - {}", status, error_text);
+                }
+
+                match response.json::<ChatCompletionResponse>().await {
+                    Ok(data) => break 'retry data,
+                    Err(e) => {
+                        error!("Cerebras: Failed to parse response (attempt {}): {}", attempt + 1, e);
+                        if attempt < MAX_RETRIES {
+                            last_error = Some(e.into());
+                            continue;
+                        }
+                        return Err(e).context("Failed to parse Cerebras response");
+                    }
+                }
+            }
+            
+            // All retries exhausted
+            return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error after retries")));
+        };
 
         let elapsed = start.elapsed();
 

@@ -29,8 +29,8 @@ impl Phase4Pipeline {
         Self { config, renderer }
     }
 
-    pub async fn load_google_font(&self, font_data: Vec<u8>, family_name: &str) -> Result<()> {
-        self.renderer.load_google_font(font_data, family_name).await
+    pub fn load_google_font(&self, font_data: Vec<u8>, family_name: &str) -> Result<()> {
+        self.renderer.load_google_font(font_data, family_name)
     }
 
     /// Execute Phase 4: Render text and composite
@@ -109,7 +109,7 @@ impl Phase4Pipeline {
 
                 debug!("Phase 4: Rendering text for region {}: '{}'",
                     region_id,
-                    &translation.translated_text[..translation.translated_text.len().min(30)]
+                    translation.translated_text.chars().take(30).collect::<String>()
                 );
 
                 // Render text for this region
@@ -243,55 +243,25 @@ impl Phase4Pipeline {
 
         let stroke_width_f = if text_stroke { Some(self.config.text_stroke_width() as f32) } else { None };
 
-        // Helper to get or create tokio runtime
-        let get_runtime = || -> tokio::runtime::Runtime {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create runtime")
-        };
-
         // STEP 1: Find optimal font size that fits (algorithm handles line estimation)
-        let font_size = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.block_on(self.renderer.find_optimal_font_size(
-                text,
-                font_family,
-                available_width,
-                available_height,
-                min_font,
-                max_font,
-                stroke_width_f,
-            )).unwrap_or(min_font)
-        } else {
-            let rt = get_runtime();
-            rt.block_on(self.renderer.find_optimal_font_size(
-                text,
-                font_family,
-                available_width,
-                available_height,
-                min_font,
-                max_font,
-                stroke_width_f,
-            )).unwrap_or(min_font)
-        };
+        // Now sync - no async/block_on needed
+        let font_size = self.renderer.find_optimal_font_size(
+            text,
+            font_family,
+            available_width,
+            available_height,
+            min_font,
+            max_font,
+            stroke_width_f,
+        ).unwrap_or(min_font);
 
         // STEP 2: Measure actual rendered text dimensions at this font size
-        let (actual_text_width, actual_text_height) = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.block_on(self.renderer.measure_text(
-                text,
-                font_family,
-                font_size,
-                Some(available_width),
-            )).unwrap_or((available_width, font_size * 1.4))
-        } else {
-            let rt = get_runtime();
-            rt.block_on(self.renderer.measure_text(
-                text,
-                font_family,
-                font_size,
-                Some(available_width),
-            )).unwrap_or((available_width, font_size * 1.4))
-        };
+        let (actual_text_width, actual_text_height) = self.renderer.measure_text(
+            text,
+            font_family,
+            font_size,
+            Some(available_width),
+        ).unwrap_or((available_width, font_size * 1.4));
 
         // STEP 3: Calculate centered position within the text area
         let offset_x = ((available_width - actual_text_width) / 2.0 + margin_px).max(margin_px);
@@ -319,35 +289,19 @@ impl Phase4Pipeline {
             None
         };
 
-        // STEP 5: Render text at the centered position
-        let render_result = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.block_on(self.renderer.render_text(
-                &mut text_canvas,
-                text,
-                font_family,
-                scaled_font,
-                text_color,
-                scaled_x,
-                scaled_y,
-                Some(scaled_max_width),
-                stroke_width_render,
-                None,
-            ))
-        } else {
-            let rt = get_runtime();
-            rt.block_on(self.renderer.render_text(
-                &mut text_canvas,
-                text,
-                font_family,
-                scaled_font,
-                text_color,
-                scaled_x,
-                scaled_y,
-                Some(scaled_max_width),
-                stroke_width_render,
-                None,
-            ))
-        };
+        // STEP 5: Render text at the centered position (now sync)
+        let render_result = self.renderer.render_text(
+            &mut text_canvas,
+            text,
+            font_family,
+            scaled_font,
+            text_color,
+            scaled_x,
+            scaled_y,
+            Some(scaled_max_width),
+            stroke_width_render,
+            None,
+        );
 
         if let Err(e) = render_result {
             debug!("Text render warning: {:?}", e);
