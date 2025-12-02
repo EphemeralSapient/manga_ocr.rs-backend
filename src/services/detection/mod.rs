@@ -1,5 +1,6 @@
 use crate::core::config::Config;
 use crate::core::types::BubbleDetection;
+use crate::services::onnx_builder::DynamicSessionPool;
 use anyhow::{Result, Context};
 use image::DynamicImage;
 use ndarray::{Array2, Array4};
@@ -40,8 +41,7 @@ fn load_model_bytes(config: &Config) -> Result<Vec<u8>> {
     }
 }
 
-use crate::services::onnx_builder::DynamicSessionPool;
-
+/// Detection service with single session (detector.onnx is 160MB)
 pub struct DetectionService {
     session_pool: Arc<DynamicSessionPool>,
     config: Arc<Config>,
@@ -54,21 +54,22 @@ impl DetectionService {
         Self::new_with_limit(config, None).await
     }
 
-    /// Create detection service with optional session limit override
-    pub async fn new_with_limit(config: Arc<Config>, session_limit: Option<usize>) -> Result<Self> {
-        // Use provided limit or fall back to config default
-        let max_sessions = session_limit.unwrap_or_else(|| config.onnx_pool_size());
+    /// Create detection service (single session only - 160MB model)
+    pub async fn new_with_limit(config: Arc<Config>, _session_limit: Option<usize>) -> Result<Self> {
+        // detector.onnx is 160MB - use only 1 session to avoid RAM bloat
+        let max_sessions = 1;
 
-        info!("🚀 [DYNAMIC ALLOCATION] Creating detection service with max {} sessions", max_sessions);
-        info!("   Starting with 1 session for warmup, will expand on demand");
+        info!("🚀 Initializing detection service (single session - 160MB model)");
 
-        // Create first session to determine device type
-        let (device_type, first_session) = Self::initialize_with_acceleration(&config)?;
+        // Load model bytes (160MB)
+        let model_bytes = load_model_bytes(&config)?;
+        info!("Loaded detector model ({:.1} MB)", model_bytes.len() as f64 / 1_048_576.0);
 
-        // Create dynamic session pool with capacity for max_sessions
+        // Create single session
+        let (device_type, first_session) = Self::create_session_with_acceleration(&config, &model_bytes)?;
+
+        // Create session pool with max 1 session
         let session_pool = DynamicSessionPool::new(max_sessions);
-
-        // Add ONLY the first session
         session_pool.add_session(first_session);
 
         let session_pool = Arc::new(session_pool);
@@ -86,8 +87,7 @@ impl DetectionService {
         service.warmup().await?;
         info!("✓ Detection warmup completed in {:.2}ms", warmup_start.elapsed().as_secs_f64() * 1000.0);
 
-        info!("✓ Detection: {} (1/{} sessions allocated, ~42 MB used, {} MB max)",
-              device_type, max_sessions, max_sessions * 42);
+        info!("✓ Detection: {} (single session, ~160 MB)", device_type);
 
         Ok(service)
     }
@@ -99,24 +99,34 @@ impl DetectionService {
         // Create a small dummy image (just needs to match expected dimensions)
         let dummy_img = image::DynamicImage::new_rgb8(target_size, target_size);
 
-        // Run inference on one session to trigger optimization
+        // Run inference to trigger optimization
         let (preprocessed, original_size) = self.preprocess_image(&dummy_img, None);
 
         let images_value = Value::from_array(preprocessed)?;
         let sizes_value = Value::from_array(original_size)?;
 
         // Acquire session and run dummy inference
+        // CRITICAL: Must release session even on error to avoid deadlock
         let mut session = self.session_pool.acquire();
-        {
+        let result: Result<()> = (|| {
             let _outputs = session.run(ort::inputs![
                 "images" => images_value,
                 "orig_target_sizes" => sizes_value
             ])?;
-            // outputs dropped here before releasing session
-        }
+            Ok(())
+        })();
+        
+        // Always release session back to pool (even on error)
         self.session_pool.release(session);
+        
+        // Now propagate any error
+        result
+    }
 
-        Ok(())
+    /// No-op: detector.onnx uses single session to avoid 160MB RAM bloat per session
+    #[inline]
+    fn expand_if_needed(&self) {
+        // Intentionally disabled - detector.onnx is 160MB, we use single session only
     }
 
     fn try_forced_backend(backend: &str, model_bytes: &[u8]) -> Result<(String, Session)> {
@@ -246,11 +256,9 @@ impl DetectionService {
         }
     }
 
-    fn initialize_with_acceleration(config: &Config) -> Result<(String, Session)> {
-        // Load model bytes (embedded or from runtime path)
-        let model_bytes = load_model_bytes(config)?;
-        info!("Loaded detector model ({:.1} MB)", model_bytes.len() as f64 / 1_048_576.0);
-
+    /// Create a session with hardware acceleration using pre-loaded model bytes
+    /// This avoids reloading the 160MB model file for each session
+    fn create_session_with_acceleration(config: &Config, model_bytes: &[u8]) -> Result<(String, Session)> {
         // Validate ONNX model header
         if model_bytes.len() < 100 {
             anyhow::bail!(
@@ -266,8 +274,11 @@ impl DetectionService {
                 model_bytes[0], model_bytes[1], model_bytes[2], model_bytes[3]);
         }
 
-        // Log environment info
-        info!("Platform: {}/{}", std::env::consts::OS, std::env::consts::ARCH);
+        // Log environment info (only first time)
+        static LOGGED_PLATFORM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED_PLATFORM.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            info!("Platform: {}/{}", std::env::consts::OS, std::env::consts::ARCH);
+        }
 
         // Check if a specific backend is forced via config
         if let Some(ref backend) = config.detection.inference_backend {
@@ -405,69 +416,12 @@ impl DetectionService {
         self.device_type.contains("DirectML")
     }
 
-    /// Expand session pool if under capacity (lazy allocation)
-    /// Expands aggressively when high contention detected
-    ///
-    /// IMPORTANT: DirectML processes sequentially, so pool expansion is disabled
-    fn expand_if_needed(&self) {
-        // DirectML can only use 1 session at a time (sequential processing)
-        if self.is_directml() {
-            return;
-        }
-
-        let available = self.session_pool.available();
-        let in_use = self.session_pool.in_use();
-        let total = available + in_use;
-
-        // Aggressive expansion: create multiple sessions if under pressure
-        // - No available sessions + low total = create 2-3 sessions for parallelism
-        // - Some available but high load = create 1 session
-        let sessions_to_create = if available == 0 && total < self.max_sessions {
-            // High contention: create multiple sessions for better parallelism
-            let headroom = self.max_sessions - total;
-            std::cmp::min(3, headroom) // Create up to 3 sessions at once
-        } else {
-            0
-        };
-
-        if sessions_to_create > 0 {
-            debug!("🔄 [LAZY EXPANSION] Detection pool under pressure: {}/{} sessions, creating {} new sessions",
-                   total, self.max_sessions, sessions_to_create);
-
-            // Create sessions in parallel for faster startup
-            let mut created = 0;
-            for _ in 0..sessions_to_create {
-                if let Ok((_, new_session)) = Self::initialize_with_acceleration(&self.config) {
-                    self.session_pool.add_session(new_session);
-                    created += 1;
-                } else {
-                    debug!("⚠️  Failed to create additional detection session");
-                    break;
-                }
-            }
-
-            if created > 0 {
-                info!("✓ Expanded detection pool: {}/{} sessions ({} MB used)",
-                      total + created, self.max_sessions, (total + created) * 42);
-            }
-        }
-    }
-
-    /// Drain all sessions and free memory (call after phase 1 complete)
-    ///
-    /// IMPORTANT: DirectML keeps persistent sessions (no cleanup)
+    /// Keep session alive - detector uses single 160MB session that should persist across requests
+    /// (Previously drained sessions which caused deadlock on second request)
     pub fn cleanup_sessions(&self) {
-        // DirectML: Keep persistent session (no cleanup/recreation overhead)
-        if self.is_directml() {
-            debug!("DirectML: Keeping persistent detection session (no cleanup)");
-            return;
-        }
-
-        let sessions = self.session_pool.drain_all();
-        let count = sessions.len();
-        drop(sessions); // Explicit drop to ensure memory is freed
-        info!("🧹 [CLEANUP] Dropped {} detection sessions (~{} MB freed)",
-              count, count * 42);
+        // Keep session alive - draining would cause next request to block forever
+        // since we only have 1 session and no expansion
+        debug!("Detection: Keeping single session alive (160MB model)");
     }
 
     fn preprocess_image(&self, img: &DynamicImage, target_size_override: Option<u32>) -> (Array4<f32>, Array2<i64>) {
@@ -599,7 +553,7 @@ impl DetectionService {
         page_index: usize,
         target_size_override: Option<u32>,
     ) -> Result<(Vec<BubbleDetection>, Vec<BubbleDetection>, Vec<BubbleDetection>)> {
-        debug!("🔍 [DETECTION] Starting detection for ALL labels on page {}", page_index);
+        debug!("🔍 [DETECTION] Starting detection for page {}", page_index);
         let detection_start = std::time::Instant::now();
 
         let (preprocessed, original_size) = self.preprocess_image(img, target_size_override);
@@ -610,21 +564,22 @@ impl DetectionService {
         debug!("Running ONNX inference on {}...", self.device_type);
         let inference_start = std::time::Instant::now();
 
-        // Lazy expand pool if needed before acquiring
+        // Expand pool if needed before acquiring
         self.expand_if_needed();
 
         // Acquire session from pool and run inference
-        // OPTIMIZED: Process tensors in-place and only clone filtered results
-        let (label_0_detections, label_1_detections, label_2_detections, inference_time) = {
-            let mut session = self.session_pool.acquire();
+        // CRITICAL: Must release session even on error to avoid deadlock
+        let mut session = self.session_pool.acquire();
+        let result = (|| -> Result<_> {
             let outputs = session.run(ort::inputs![
                 "images" => images_value,
                 "orig_target_sizes" => sizes_value
             ])?;
 
             let inference_time = inference_start.elapsed();
+            debug!("✓ Inference completed in {:.2}ms", inference_time.as_secs_f64() * 1000.0);
 
-            // Extract tensor references (no cloning yet)
+            // Extract tensor references
             let (labels_shape, labels_data) = outputs["labels"].try_extract_tensor::<i64>()?;
             let (_boxes_shape, boxes_data) = outputs["boxes"].try_extract_tensor::<f32>()?;
             let (_scores_shape, scores_data) = outputs["scores"].try_extract_tensor::<f32>()?;
@@ -642,12 +597,11 @@ impl DetectionService {
                 let label = labels_data[i];
                 let score = scores_data[i];
 
-                // Early filter - skip low-confidence detections without allocating
+                // Early filter - skip low-confidence detections
                 if score < confidence_threshold {
                     continue;
                 }
 
-                // Only clone bbox data for high-confidence detections
                 let bbox = [
                     boxes_data[i * 4] as i32,
                     boxes_data[i * 4 + 1] as i32,
@@ -660,29 +614,28 @@ impl DetectionService {
                     confidence: score,
                     page_index,
                     bubble_index: i,
-                    text_regions: vec![], // Will be populated later in Phase1
+                    text_regions: vec![],
                 };
 
                 match label {
                     0 => label_0_detections.push(detection),
                     1 => label_1_detections.push(detection),
                     2 => label_2_detections.push(detection),
-                    _ => {} // Ignore unknown labels
+                    _ => {}
                 }
             }
 
-            // Drop outputs and return session to pool
-            drop(outputs);
-            self.session_pool.release(session);  // No await - crossbeam is sync!
-
-            (label_0_detections, label_1_detections, label_2_detections, inference_time)
-        };
-
-        debug!("✓ Inference completed in {:.2}ms", inference_time.as_secs_f64() * 1000.0);
+            Ok((label_0_detections, label_1_detections, label_2_detections))
+        })();
+        
+        // Always release session back to pool (even on error)
+        self.session_pool.release(session);
+        
+        let (label_0_detections, label_1_detections, label_2_detections) = result?;
 
         let total_time = detection_start.elapsed();
         debug!(
-            "✓ Detection completed in {:.2}ms: {} label 0, {} label 1, {} label 2",
+            "✓ Detection completed in {:.2}ms: {} L0, {} L1, {} L2",
             total_time.as_secs_f64() * 1000.0,
             label_0_detections.len(),
             label_1_detections.len(),
@@ -712,13 +665,12 @@ impl DetectionService {
         }
 
         let batch_size = images.len();
-        debug!("🔍 [BATCH DETECTION] Starting batched detection for {} images", batch_size);
+        debug!("🔍 [BATCH] Starting batched detection for {} images", batch_size);
         let detection_start = std::time::Instant::now();
 
-        // Determine target size: use override if provided, otherwise use config default
+        // Determine target size
         let target_size = match target_size_override {
             Some(0) => {
-                // 0 means use source resolution - find max dimension across all images
                 let max_dim = images.iter()
                     .map(|(img, _)| img.width().max(img.height()))
                     .max()
@@ -731,7 +683,7 @@ impl DetectionService {
                 size
             }
             None => {
-                debug!("Using config default target size for batch: {}", self.config.target_size());
+                debug!("Using config default target size: {}", self.config.target_size());
                 self.config.target_size()
             }
         };
@@ -742,11 +694,9 @@ impl DetectionService {
         let mut sizes_array = Array2::zeros((batch_size, 2));
 
         for (i, (img, _page_index)) in images.iter().enumerate() {
-            // Store original size
             sizes_array[[i, 0]] = img.width() as i64;
             sizes_array[[i, 1]] = img.height() as i64;
 
-            // Resize and normalize
             let resized = img.resize_exact(
                 target_size,
                 target_size,
@@ -754,7 +704,6 @@ impl DetectionService {
             );
             let rgb_img = resized.to_rgb8();
 
-            // Fill batch tensor
             for y in 0..target {
                 for x in 0..target {
                     let pixel = rgb_img.get_pixel(x as u32, y as u32);
@@ -773,12 +722,13 @@ impl DetectionService {
         debug!("Running batched ONNX inference on {}...", self.device_type);
         let inference_start = std::time::Instant::now();
 
-        // Lazy expand pool if needed
+        // Expand pool if needed
         self.expand_if_needed();
 
         // Run batched inference
-        let results = {
-            let mut session = self.session_pool.acquire();
+        // CRITICAL: Must release session even on error to avoid deadlock
+        let mut session = self.session_pool.acquire();
+        let result = (|| -> Result<_> {
             let outputs = session.run(ort::inputs![
                 "images" => images_value,
                 "orig_target_sizes" => sizes_value
@@ -795,7 +745,6 @@ impl DetectionService {
             let num_detections = labels_shape[1] as usize;
             let confidence_threshold = self.config.confidence_threshold();
 
-            // Process results for each image in batch
             let mut all_results = Vec::with_capacity(batch_size);
 
             for batch_idx in 0..batch_size {
@@ -813,12 +762,9 @@ impl DetectionService {
                         continue;
                     }
 
-                    // Box index depends on output format
                     let box_base = if boxes_shape.len() == 3 {
-                        // Shape [batch, detections, 4]
                         (batch_idx * num_detections + det_idx) * 4
                     } else {
-                        // Shape [batch * detections, 4] - flattened
                         flat_idx * 4
                     };
 
@@ -848,11 +794,13 @@ impl DetectionService {
                 all_results.push((label_0, label_1, label_2));
             }
 
-            drop(outputs);
-            self.session_pool.release(session);
-
-            all_results
-        };
+            Ok(all_results)
+        })();
+        
+        // Always release session back to pool (even on error)
+        self.session_pool.release(session);
+        
+        let results = result?;
 
         let total_time = detection_start.elapsed();
         debug!(
@@ -891,21 +839,22 @@ impl DetectionService {
         debug!("Running ONNX inference on {}...", self.device_type);
         let inference_start = std::time::Instant::now();
 
-        // Lazy expand pool if needed
+        // Expand pool if needed
         self.expand_if_needed();
 
         // Acquire session from pool and run inference
-        // OPTIMIZED: Process tensors in-place and only clone filtered results
-        let (text_detections, inference_time) = {
-            let mut session = self.session_pool.acquire();
+        // CRITICAL: Must release session even on error to avoid deadlock
+        let mut session = self.session_pool.acquire();
+        let result = (|| -> Result<_> {
             let outputs = session.run(ort::inputs![
                 "images" => images_value,
                 "orig_target_sizes" => sizes_value
             ])?;
 
             let inference_time = inference_start.elapsed();
+            debug!("✓ Inference completed in {:.2}ms", inference_time.as_secs_f64() * 1000.0);
 
-            // Extract tensor references (no cloning yet)
+            // Extract tensor references
             let (labels_shape, labels_data) = outputs["labels"].try_extract_tensor::<i64>()?;
             let (_boxes_shape, boxes_data) = outputs["boxes"].try_extract_tensor::<f32>()?;
             let (_scores_shape, scores_data) = outputs["scores"].try_extract_tensor::<f32>()?;
@@ -916,17 +865,14 @@ impl DetectionService {
             let confidence_threshold = self.config.confidence_threshold();
             let mut text_detections = Vec::new();
 
-            // Process tensors in-place - only clone filtered detections
             for i in 0..num_detections {
                 let label = labels_data[i];
                 let score = scores_data[i];
 
-                // Early filter - skip non-matching or low-confidence detections
                 if label != target_label || score < confidence_threshold {
                     continue;
                 }
 
-                // Only clone bbox data for matching detections
                 let bbox = [
                     boxes_data[i * 4] as i32,
                     boxes_data[i * 4 + 1] as i32,
@@ -942,18 +888,17 @@ impl DetectionService {
                     confidence: score,
                     page_index,
                     bubble_index: i,
-                    text_regions: Vec::new(), // Will be filled later by detect_bubbles()
+                    text_regions: Vec::new(),
                 });
             }
 
-            // Drop outputs and return session to pool
-            drop(outputs);
-            self.session_pool.release(session);  // No await - crossbeam is sync!
-
-            (text_detections, inference_time)
-        };
-
-        debug!("✓ Inference completed in {:.2}ms", inference_time.as_secs_f64() * 1000.0);
+            Ok(text_detections)
+        })();
+        
+        // Always release session back to pool (even on error)
+        self.session_pool.release(session);
+        
+        let text_detections = result?;
 
         debug!("Filtered {} detections above confidence threshold {:.2}",
             text_detections.len(), self.config.confidence_threshold());
@@ -970,6 +915,5 @@ impl DetectionService {
 
         Ok(sorted)
     }
-
 }
 

@@ -132,13 +132,11 @@ impl CosmicTextRenderer {
         }
     }
 
-    /// Measure text dimensions with cosmic-text using PROPER TTF METRICS
-    /// Returns (width, height) in pixels INCLUDING glyph overhangs and visual bounds
+    /// Measure text dimensions with cosmic-text using ACTUAL LAYOUT POSITIONS
+    /// Returns (width, height) in pixels based on real glyph layout, not heuristics
     ///
-    /// This uses actual glyph bounding boxes rather than logical advance widths,
-    /// which prevents text edge clipping issues.
-    ///
-    /// OPTIMIZED: Early return for empty text, iterator-based glyph bounds calculation
+    /// Uses LayoutRun's line_top + line_height for accurate vertical measurement,
+    /// and line_w for horizontal measurement (no arbitrary padding).
     pub async fn measure_text(
         &self,
         text: &str,
@@ -146,7 +144,7 @@ impl CosmicTextRenderer {
         font_size: f32,
         max_width: Option<f32>,
     ) -> Result<(f32, f32)> {
-        // OPTIMIZATION: Early return for empty text
+        // Early return for empty text
         if text.trim().is_empty() {
             return Ok((0.0, 0.0));
         }
@@ -156,8 +154,8 @@ impl CosmicTextRenderer {
         let family = Self::parse_font_family(font_family);
         let weight = Self::is_bold_font(font_family);
 
-        // Get actual font metrics from TTF
-        let line_height = Self::get_font_line_height(&font_system, &family, &weight, font_size);
+        // Use font_size * 1.2 as default line height (cosmic-text standard)
+        let line_height = font_size * 1.2;
         let metrics = Metrics::new(font_size, line_height);
 
         let mut buffer = Buffer::new(&mut font_system, metrics);
@@ -166,96 +164,33 @@ impl CosmicTextRenderer {
             buffer.set_size(&mut font_system, Some(width), None);
         }
 
-        // Enable word wrapping for comic text (WordOrGlyph allows breaking long words)
-        buffer.set_wrap(&mut font_system, Wrap::WordOrGlyph);
+        // Word wrap only - never break words mid-character
+        buffer.set_wrap(&mut font_system, Wrap::Word);
 
         let attrs = Attrs::new().family(family).weight(weight);
-        buffer.set_text(
-            &mut font_system,
-            text,
-            &attrs,
-            Shaping::Advanced,
-        );
-
+        buffer.set_text(&mut font_system, text, &attrs, Shaping::Advanced);
         buffer.shape_until_scroll(&mut font_system, false);
 
-        // Calculate ACTUAL visual bounds including glyph overhangs
-        // OPTIMIZED: Use iterator methods for better performance
-        let mut min_x = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut total_lines = 0;
+        // Calculate dimensions from ACTUAL layout positions
+        let mut max_width_seen = 0.0f32;
+        let mut max_bottom = 0.0f32;
 
         for run in buffer.layout_runs() {
-            total_lines += 1;
+            // Width: use line_w directly (actual rendered width)
+            max_width_seen = max_width_seen.max(run.line_w);
 
-            // OPTIMIZED: Use iterator fold for glyph bounds calculation
-            let (run_min_x, run_max_x) = run.glyphs.iter()
-                .map(|g| (g.x, g.x + g.w))
-                .fold((f32::MAX, f32::MIN), |(min, max), (x1, x2)| {
-                    (min.min(x1), max.max(x2))
-                });
-
-            // Fall back to line_w if we couldn't get glyph bounds
-            let (run_min_x, run_max_x) = if run_min_x == f32::MAX {
-                (0.0, run.line_w)
-            } else {
-                (run_min_x, run_max_x)
-            };
-
-            min_x = min_x.min(run_min_x);
-            max_x = max_x.max(run_max_x);
+            // Height: track the bottom of the last line
+            // line_top is Y offset to top of line, line_height is the line's height
+            let line_bottom = run.line_top + run.line_height;
+            max_bottom = max_bottom.max(line_bottom);
         }
 
-        // Calculate visual width (accounting for any negative offsets or overhangs)
-        let width = if min_x == f32::MAX {
-            // No glyphs rendered, use logical width
-            buffer.layout_runs().map(|run| run.line_w).fold(0.0f32, |max_w, w| max_w.max(w))
-        } else {
-            // Use actual visual bounds
-            // Add small padding for glyph overhangs (5% on each side)
-            let visual_width = max_x - min_x;
-            let overhang_padding = visual_width * 0.05;
-            visual_width + overhang_padding * 2.0
-        };
+        // If no runs, return zero dimensions
+        if max_bottom == 0.0 {
+            return Ok((0.0, 0.0));
+        }
 
-        let height = total_lines as f32 * metrics.line_height;
-
-        Ok((width, height))
-    }
-
-    /// Get actual line height from TTF font metrics
-    /// Uses improved heuristics based on font type
-    ///
-    /// NOTE: cosmic-text's fontdb doesn't expose raw font metrics (ascender/descender)
-    /// so we use intelligent heuristics based on font family
-    fn get_font_line_height(_font_system: &FontSystem, family: &Family, _weight: &CosmicWeight, font_size: f32) -> f32 {
-        // Different font families have different typical line height ratios
-        // These are empirically determined from common fonts
-        let line_height_ratio = match family {
-            Family::Serif => 1.45,        // Serif fonts tend to be taller
-            Family::SansSerif => 1.35,    // Sans-serif more compact
-            Family::Monospace => 1.50,    // Monospace needs extra vertical space
-            Family::Cursive => 1.55,      // Script/cursive fonts have large ascenders/descenders
-            Family::Fantasy => 1.50,      // Fantasy fonts vary, use safe value
-            Family::Name(name) => {
-                // Specific font overrides
-                let name_lower = name.to_lowercase();
-                if name_lower.contains("comic") {
-                    1.40  // Comic Sans and similar
-                } else if name_lower.contains("arial") || name_lower.contains("helvetica") {
-                    1.35  // Arial, Helvetica
-                } else if name_lower.contains("times") {
-                    1.45  // Times New Roman
-                } else if name_lower.contains("courier") || name_lower.contains("mono") {
-                    1.50  // Monospace fonts
-                } else {
-                    1.40  // Default for unknown fonts
-                }
-            }
-        };
-
-        // Calculate line height with minimum of 1.2x font size
-        (font_size * line_height_ratio).max(font_size * 1.2)
+        Ok((max_width_seen, max_bottom))
     }
 
     /// Render text with advanced shaping and optional stroke
@@ -312,8 +247,7 @@ impl CosmicTextRenderer {
     }
 
     /// Internal text rendering implementation
-    /// OPTIMIZED: Minimized lock scope to reduce contention (20-30% faster under load)
-    /// Uses proper TTF-based line height for accurate text rendering
+    /// Uses consistent line_height = font_size * 1.2 to match measure_text
     ///
     /// # Arguments
     /// * `region_bounds` - Optional (min_x, min_y, max_x, max_y) to constrain rendering within specific region
@@ -332,13 +266,11 @@ impl CosmicTextRenderer {
         let family = Self::parse_font_family(font_family);
         let weight = Self::is_bold_font(font_family);
 
-        // OPTIMIZATION: Calculate line_height and create buffer in a SINGLE lock scope
-        // Previous version locked twice - once for line_height, once for buffer
         let buffer = {
             let mut font_system = self.font_system.lock().await;
 
-            // Get proper line height from TTF metrics (inside the lock)
-            let line_height = Self::get_font_line_height(&font_system, &family, &weight, font_size);
+            // Use consistent line_height = font_size * 1.2 (matches measure_text)
+            let line_height = font_size * 1.2;
             let metrics = Metrics::new(font_size, line_height);
             let mut buffer = Buffer::new(&mut font_system, metrics);
 
@@ -346,20 +278,13 @@ impl CosmicTextRenderer {
                 buffer.set_size(&mut font_system, Some(width), None);
             }
 
-            // Enable word wrapping for comic text
+            // Word wrap only - never break words mid-character
             buffer.set_wrap(&mut font_system, Wrap::Word);
 
             let attrs = Attrs::new().family(family).weight(weight);
-            buffer.set_text(
-                &mut font_system,
-                text,
-                &attrs,
-                Shaping::Advanced,
-            );
-
+            buffer.set_text(&mut font_system, text, &attrs, Shaping::Advanced);
             buffer.shape_until_scroll(&mut font_system, false);
 
-            // Lock released here - shaping is complete
             buffer
         };
 
@@ -401,9 +326,8 @@ impl CosmicTextRenderer {
         Ok(())
     }
 
-    /// Render multi-line text with automatic layout
-    /// OPTIMIZED: No more deadlock-prone explicit drop() - improved lock granularity fixes this
-    /// Uses proper TTF-based line height for accurate rendering
+    /// Render multi-line text with automatic layout and vertical alignment
+    /// Uses consistent line_height = font_size * 1.2 to match measure_text
     pub async fn render_multiline_text(
         &self,
         img: &mut RgbaImage,
@@ -428,8 +352,8 @@ impl CosmicTextRenderer {
             let family = Self::parse_font_family(font_family);
             let weight = Self::is_bold_font(font_family);
 
-            // Use proper TTF-based line height
-            let line_height = Self::get_font_line_height(&font_system, &family, &weight, font_size);
+            // Use consistent line_height = font_size * 1.2
+            let line_height = font_size * 1.2;
             let metrics = Metrics::new(font_size, line_height);
             let mut buffer = Buffer::new(&mut font_system, metrics);
 
@@ -437,25 +361,20 @@ impl CosmicTextRenderer {
             buffer.set_wrap(&mut font_system, Wrap::Word);
 
             let attrs = Attrs::new().family(family).weight(weight);
-            buffer.set_text(
-                &mut font_system,
-                text,
-                &attrs,
-                Shaping::Advanced,
-            );
-
+            buffer.set_text(&mut font_system, text, &attrs, Shaping::Advanced);
             buffer.shape_until_scroll(&mut font_system, false);
 
-            // Calculate actual text height for vertical alignment
-            let line_count = buffer.layout_runs().count();
-            let actual_height = line_count as f32 * metrics.line_height;
+            // Calculate actual text height from layout runs
+            let mut max_bottom = 0.0f32;
+            for run in buffer.layout_runs() {
+                max_bottom = max_bottom.max(run.line_top + run.line_height);
+            }
 
             match vertical_align {
                 VerticalAlign::Top => 0,
-                VerticalAlign::Middle => ((max_height - actual_height) / 2.0) as i32,
-                VerticalAlign::Bottom => (max_height - actual_height) as i32,
+                VerticalAlign::Middle => ((max_height - max_bottom) / 2.0).max(0.0) as i32,
+                VerticalAlign::Bottom => (max_height - max_bottom).max(0.0) as i32,
             }
-            // Lock automatically released here
         };
 
         // Render with stroke and fill
@@ -496,9 +415,15 @@ impl CosmicTextRenderer {
 
     /// Find optimal font size to fit text in given dimensions
     ///
-    /// Uses coarse-to-fine search to handle line-break discontinuities properly.
-    /// Binary search fails because font_size → text_dimensions isn't monotonic
-    /// (a slightly smaller font can cause different line breaks, changing dimensions non-linearly).
+    /// Uses BINARY SEARCH + LOCAL REFINEMENT for O(log n) performance.
+    ///
+    /// The challenge: font_size → dimensions isn't perfectly monotonic due to line breaks.
+    /// A slightly larger font might cause fewer line breaks (word fits on line),
+    /// resulting in smaller total height. This creates local discontinuities.
+    ///
+    /// Solution:
+    /// 1. Binary search to find approximate fit (fast, O(log n))
+    /// 2. Local neighborhood search (±3px) to find true maximum (handles discontinuities)
     pub async fn find_optimal_font_size(
         &self,
         text: &str,
@@ -509,73 +434,77 @@ impl CosmicTextRenderer {
         max_size: f32,
         stroke_width: Option<f32>,
     ) -> Result<f32> {
-        // Step 1: Apply stroke margin ONCE at the start
+        // Apply stroke margin
         let stroke_extra = stroke_width.unwrap_or(0.0) * 2.0;
         let effective_width = (max_width - stroke_extra).max(10.0);
         let effective_height = (max_height - stroke_extra).max(10.0);
 
-        // Absolute minimum - 7px is the smallest readable size
-        // Below this, text becomes illegible - better to overflow slightly
-        let absolute_min = 7.0f32;
+        // Absolute minimum readable size
+        let absolute_min = 6.0f32;
         let search_min = min_size.max(absolute_min);
+        let search_max = max_size.min(effective_height); // Font can't be taller than box
 
-        // Step 2: Coarse scan from max to min at 2px intervals
-        // Find the largest size that fits
-        let mut best_size = search_min;
-        let mut size = max_size;
-
-        while size >= search_min {
+        // Helper: check if size fits
+        let fits = |size: f32| async move {
             let (w, h) = self.measure_text(text, font_family, size, Some(effective_width)).await?;
-            if w <= effective_width && h <= effective_height {
-                best_size = size;
-                break; // Found largest that fits
+            Ok::<bool, anyhow::Error>(w <= effective_width && h <= effective_height)
+        };
+
+        // PHASE 1: Binary search to find approximate boundary
+        // Find largest size where text fits (within 1px precision)
+        let mut lo = search_min;
+        let mut hi = search_max;
+        let mut best_fit = search_min;
+
+        // Quick check: does max size fit?
+        if fits(search_max).await? {
+            best_fit = search_max;
+        } else if !fits(search_min).await? {
+            // Even min doesn't fit - try going smaller
+            let mut emergency_size = search_min;
+            while emergency_size >= absolute_min {
+                if fits(emergency_size).await? {
+                    best_fit = emergency_size;
+                    break;
+                }
+                emergency_size -= 1.0;
             }
-            size -= 2.0;
+            if emergency_size < absolute_min {
+                tracing::warn!(
+                    "Text doesn't fit even at {:.1}px: '{:.30}...'",
+                    absolute_min, text
+                );
+                return Ok(absolute_min);
+            }
+        } else {
+            // Binary search: find the largest fitting size
+            while hi - lo > 1.0 {
+                let mid = (lo + hi) / 2.0;
+                if fits(mid).await? {
+                    lo = mid;
+                    best_fit = mid;
+                } else {
+                    hi = mid;
+                }
+            }
         }
 
-        // Step 3: Fine-tune upward from best_size (try to maximize)
-        for delta in [1.5, 1.0, 0.5] {
-            let test = best_size + delta;
-            if test <= max_size {
-                let (w, h) = self.measure_text(text, font_family, test, Some(effective_width)).await?;
-                if w <= effective_width && h <= effective_height {
-                    best_size = test;
-                }
-            }
-        }
-
-        // Step 4: If still nothing fits, go below min_size down to absolute_min
-        if best_size <= search_min {
-            let (w, h) = self.measure_text(text, font_family, best_size, Some(effective_width)).await?;
-            if w > effective_width || h > effective_height {
-                // Need to go smaller
-                let mut size = search_min - 1.0;
-                while size >= absolute_min {
-                    let (w, h) = self.measure_text(text, font_family, size, Some(effective_width)).await?;
-                    if w <= effective_width && h <= effective_height {
-                        best_size = size;
-                        break;
-                    }
-                    size -= 1.0;
-                }
-
-                if best_size > size {
-                    best_size = absolute_min;
-                    tracing::warn!(
-                        "Text doesn't fit even at {:.1}px: '{:.30}...'",
-                        absolute_min,
-                        text
-                    );
-                }
+        // PHASE 2: Local refinement to handle line-break discontinuities
+        // Check neighborhood of ±3px with 0.5px steps
+        let mut final_best = best_fit;
+        for offset in [-3.0, -2.5, -2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0] {
+            let test_size = (best_fit + offset).clamp(search_min, search_max);
+            if test_size > final_best && fits(test_size).await? {
+                final_best = test_size;
             }
         }
 
         tracing::debug!(
             "Font size: {:.1}px for {}x{} (text: '{:.20}...')",
-            best_size, effective_width as i32, effective_height as i32, text
+            final_best, effective_width as i32, effective_height as i32, text
         );
 
-        Ok(best_size)
+        Ok(final_best)
     }
 }
 

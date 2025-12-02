@@ -246,7 +246,7 @@ pub struct CategorizedRegion {
     pub label_1_regions: Vec<[i32; 4]>, // For label 0, contains its label 1 children
 }
 
-/// Phase 1 output: Categorized regions
+/// Phase 1 output: Categorized regions with cleaned images
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Phase1Output {
     pub page_index: usize,
@@ -254,8 +254,16 @@ pub struct Phase1Output {
     pub width: u32,
     pub height: u32,
     pub regions: Vec<CategorizedRegion>,
-    pub segmentation_mask: Vec<u8>, // Flattened (h*w)
-    pub mask_mode: String, // Always "fast" - FPN text detector
+    /// Pre-cleaned label_1 region images: (region_id, PNG bytes, bbox)
+    /// Each entry is a cleaned label_1 area with its position for compositing
+    /// Text areas are already filled with white - no Phase 3 needed
+    #[serde(skip)]
+    pub cleaned_regions: Vec<(usize, Vec<u8>, [i32; 4])>,
+    /// Pre-computed OCR results: (region_id, japanese_text, confidence)
+    /// When available, Phase 2 can skip image OCR and send text directly for translation
+    /// OPTIMIZATION: Parallel OCR during Phase 1 reduces API payload and latency
+    #[serde(skip)]
+    pub ocr_results: Vec<(usize, String, f32)>,
     pub validation_warnings: Vec<String>, // e.g., label 1 not in label 0
 }
 
@@ -300,12 +308,12 @@ pub struct Phase2Output {
     pub complex_bg_translations: Vec<(usize, OCRTranslation)>, // Only if banana mode disabled
 }
 
-/// Phase 3 output: Text removed images
+/// Phase 3 output: Text removed images (pass-through from Phase 1)
 #[derive(Debug, Clone)]
 pub struct Phase3Output {
     #[allow(dead_code)]
     pub page_index: usize,
-    pub cleaned_regions: Vec<(usize, Vec<u8>)>, // (region_id, cleaned image bytes)
+    pub cleaned_regions: Vec<(usize, Vec<u8>, [i32; 4])>, // (region_id, cleaned image bytes, bbox)
 }
 
 /// Phase 4 output: Final rendered image

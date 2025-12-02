@@ -190,21 +190,19 @@ impl Phase4Pipeline {
         };
 
         let mut final_image = img.to_rgba8();
-        let cleaned_map = build_cleaned_map(phase3_output);
+        let cleaned_list = build_cleaned_map(phase3_output);
 
-        // Composite each cleaned region onto the base image
-        for region in &phase1_output.regions {
-            if let Some(cleaned_bytes) = cleaned_map.get(&region.region_id) {
-                let cleaned_img = image::load_from_memory(cleaned_bytes)
-                    .context("Failed to load cleaned region")?
-                    .to_rgba8();
+        // Composite each cleaned label_1 region onto the base image
+        for (cleaned_bytes, bbox) in cleaned_list {
+            let cleaned_img = image::load_from_memory(cleaned_bytes)
+                .context("Failed to load cleaned region")?
+                .to_rgba8();
 
-                let [x1, y1, _, _] = region.bbox;
-                image::imageops::overlay(&mut final_image, &cleaned_img, x1 as i64, y1 as i64);
-            }
+            let [x1, y1, _, _] = bbox;
+            image::imageops::overlay(&mut final_image, &cleaned_img, x1 as i64, y1 as i64);
         }
 
-        debug!("Phase 4: Created cleaned base (MASK mode - segmentation)");
+        debug!("Phase 4: Created cleaned base ({} label_1 regions)", phase3_output.cleaned_regions.len());
         Ok(final_image)
     }
 
@@ -231,15 +229,17 @@ impl Phase4Pipeline {
         let text_area_width = (max_x - min_x).max(1) as f32;
         let text_area_height = (max_y - min_y).max(1) as f32;
 
-        // SINGLE fixed-pixel margin (not percentage - small bubbles keep more space)
-        let margin_px = 4.0f32;
+        // Margin scales with box size: larger boxes get proportionally more margin
+        // Min 2px, max 8px, scales at 2% of smaller dimension
+        let margin_px = (text_area_width.min(text_area_height) * 0.02).clamp(2.0, 8.0);
         let available_width = (text_area_width - margin_px * 2.0).max(10.0);
         let available_height = (text_area_height - margin_px * 2.0).max(10.0);
 
-        // Font size bounds - NO heuristic estimation, let algorithm determine
-        let min_font = 8.0f32;
-        // Max font: reasonable upper bound based on area size
-        let max_font = (available_height * 0.9).min(available_width * 0.6).max(min_font + 1.0);
+        // Font size bounds
+        let min_font = 7.0f32;
+        // Max font: use available_height as upper bound (single line max)
+        // The algorithm will find optimal size considering line wrapping
+        let max_font = available_height.min(72.0).max(min_font + 1.0);
 
         let stroke_width_f = if text_stroke { Some(self.config.text_stroke_width() as f32) } else { None };
 
@@ -413,6 +413,6 @@ fn build_banana_map(phase2: &Phase2Output) -> HashMap<usize, &BananaResult> {
     phase2.complex_bg_bananas.iter().map(|b| (b.region_id, b)).collect()
 }
 
-fn build_cleaned_map(phase3: &Phase3Output) -> HashMap<usize, &Vec<u8>> {
-    phase3.cleaned_regions.iter().map(|(id, bytes)| (*id, bytes)).collect()
+fn build_cleaned_map(phase3: &Phase3Output) -> Vec<(&Vec<u8>, [i32; 4])> {
+    phase3.cleaned_regions.iter().map(|(_, bytes, bbox)| (bytes, *bbox)).collect()
 }

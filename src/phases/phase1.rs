@@ -116,28 +116,43 @@ impl Phase1Pipeline {
             .map(|d| RegionDetection { bbox: d.bbox, label: 2, confidence: d.confidence })
             .collect();
 
-        // Step 2: Collect bboxes for segmentation (label 1 + label 2)
-        let mut seg_bboxes: Vec<[i32; 4]> = label_1.iter().map(|r| r.bbox).collect();
-        seg_bboxes.extend(label_2.iter().map(|r| r.bbox));
-
-        // Step 3: Run segmentation only on detected regions
-        let segmentation_start = std::time::Instant::now();
-        let segmentation_mask = self.segmenter
-            .generate_mask_for_regions(img, &seg_bboxes)
-            .await
-            .context("Failed to generate segmentation mask")?;
-        let segmentation_ms = segmentation_start.elapsed().as_secs_f64() * 1000.0;
-
-        info!(
-            "⏱️  Detection: {:.0}ms | Segmentation: {:.0}ms ({} regions) | L0={}, L1={}, L2={}",
-            detection_ms, segmentation_ms, seg_bboxes.len(),
-            label_0.len(), label_1.len(), label_2.len()
-        );
-
-        // Validate and categorize
+        // Step 2: Validate and categorize
         let (regions, warnings) = self.categorize_regions(
             img, &label_0, &label_1, &label_2, image_data.index, filter_orphan_regions,
         )?;
+
+        // Step 3: Clean each label_1 region (crop, detect text, fill with white)
+        // Only clean within label_1_regions bounds, not the entire region bbox
+        let cleaning_start = std::time::Instant::now();
+        let mut regions_to_clean: Vec<(usize, DynamicImage, [i32; 4])> = Vec::new();
+
+        for region in &regions {
+            // For each label_1 bbox within this region, crop and clean
+            for l1_bbox in &region.label_1_regions {
+                let [x1, y1, x2, y2] = *l1_bbox;
+                let x1 = x1.max(0) as u32;
+                let y1 = y1.max(0) as u32;
+                let x2 = (x2 as u32).min(img.width());
+                let y2 = (y2 as u32).min(img.height());
+
+                if x2 > x1 && y2 > y1 {
+                    let crop = img.crop_imm(x1, y1, x2 - x1, y2 - y1);
+                    regions_to_clean.push((region.region_id, crop, *l1_bbox));
+                }
+            }
+        }
+
+        let cleaned_regions = self.segmenter
+            .clean_regions_batch(&regions_to_clean)
+            .await
+            .context("Failed to clean regions")?;
+        let cleaning_ms = cleaning_start.elapsed().as_secs_f64() * 1000.0;
+
+        info!(
+            "⏱️  Detection: {:.0}ms | Cleaning: {:.0}ms ({} regions) | L0={}, L1={}, L2={}",
+            detection_ms, cleaning_ms, regions.len(),
+            label_0.len(), label_1.len(), label_2.len()
+        );
 
         Ok(Phase1Output {
             page_index: image_data.index,
@@ -145,8 +160,8 @@ impl Phase1Pipeline {
             width: image_data.width,
             height: image_data.height,
             regions,
-            segmentation_mask,
-            mask_mode: "fast".to_string(),
+            cleaned_regions,
+            ocr_results: Vec::new(),
             validation_warnings: warnings,
         })
     }
@@ -191,8 +206,9 @@ impl Phase1Pipeline {
             decoded_images.push(img);
         }
 
-        // Run detection: batched or parallel based on merge_img setting
+        // Run detection: batched or parallel
         let batch_detections: Vec<(Vec<_>, Vec<_>, Vec<_>)> = if merge_img {
+            // Batch mode: single inference for all images
             let batch_refs: Vec<(&DynamicImage, usize)> = decoded_images
                 .iter()
                 .zip(images.iter())
@@ -202,6 +218,7 @@ impl Phase1Pipeline {
             self.detector.detect_all_labels_batch(&batch_refs, target_size_override).await
                 .context("Batch detection failed")?
         } else {
+            // Parallel mode: multiple concurrent inferences
             let detection_tasks: Vec<_> = decoded_images
                 .iter()
                 .zip(images.iter())
@@ -256,17 +273,15 @@ impl Phase1Pipeline {
                 filter_orphan_regions,
             )?;
 
-            // Empty segmentation mask placeholder
-            let empty_mask = vec![0u8; (image_data.width * image_data.height) as usize];
-
+            // Empty cleaned_regions placeholder (filled later by complete_cleaning)
             outputs.push(Phase1Output {
                 page_index: image_data.index,
                 filename: image_data.filename.clone(),
                 width: image_data.width,
                 height: image_data.height,
                 regions,
-                segmentation_mask: empty_mask,
-                mask_mode: "fast".to_string(),
+                cleaned_regions: Vec::new(),
+                ocr_results: Vec::new(),
                 validation_warnings,
             });
         }
@@ -274,46 +289,172 @@ impl Phase1Pipeline {
         Ok((outputs, decoded_images))
     }
 
-    /// Run segmentation and update Phase1Output with masks
-    /// This is called after Phase 2 starts, to fill in the segmentation masks before Phase 3
-    /// Uses region-based segmentation - only processes label 1 and label 2 bboxes
-    pub async fn complete_segmentation(
+    /// Run text cleaning and update Phase1Output with cleaned region images
+    /// This is called after detection to fill in the cleaned_regions
+    /// Only cleans within label_1_regions bounds, not entire region bbox
+    ///
+    /// # Arguments
+    /// * `valid_region_ids` - Optional set of region IDs that should be cleaned.
+    ///   Only regions with OCR-validated text should be cleaned. If None, all regions are cleaned.
+    pub async fn complete_cleaning(
         &self,
         outputs: &mut [Phase1Output],
         decoded_images: &[DynamicImage],
-        _use_mask: bool,
-        _mask_mode: Option<&str>,
+        valid_region_ids: Option<&std::collections::HashSet<usize>>,
     ) -> Result<()> {
-        let seg_start = std::time::Instant::now();
+        let clean_start = std::time::Instant::now();
         let mut total_regions = 0usize;
 
-        // Process each image - extract bboxes from regions and run region-based segmentation
+        // Process each image - crop and clean each label_1 region
         for (i, img) in decoded_images.iter().enumerate() {
-            // Collect label 1 bboxes from all regions + standalone label 2 regions
-            let mut seg_bboxes: Vec<[i32; 4]> = Vec::new();
+            let mut regions_to_clean: Vec<(usize, DynamicImage, [i32; 4])> = Vec::new();
+
             for region in &outputs[i].regions {
-                // Add all label_1_regions (text areas)
-                seg_bboxes.extend(&region.label_1_regions);
-                // For label 2 (free text), add the bbox itself
-                if region.label == 2 {
-                    seg_bboxes.push(region.bbox);
+                // Clean each label_1 bbox within this region
+                for l1_bbox in &region.label_1_regions {
+                    let [x1, y1, x2, y2] = *l1_bbox;
+                    let x1 = x1.max(0) as u32;
+                    let y1 = y1.max(0) as u32;
+                    let x2 = (x2 as u32).min(img.width());
+                    let y2 = (y2 as u32).min(img.height());
+
+                    if x2 > x1 && y2 > y1 {
+                        let crop = img.crop_imm(x1, y1, x2 - x1, y2 - y1);
+                        regions_to_clean.push((region.region_id, crop, *l1_bbox));
+                    }
                 }
             }
 
-            total_regions += seg_bboxes.len();
+            total_regions += regions_to_clean.len();
 
-            let mask = self.segmenter
-                .generate_mask_for_regions(img, &seg_bboxes)
+            // Use filtered cleaning if valid_region_ids provided
+            let cleaned = self.segmenter
+                .clean_regions_batch_filtered(&regions_to_clean, valid_region_ids)
                 .await
-                .context("Failed to generate segmentation mask")?;
+                .context("Failed to clean regions")?;
 
-            outputs[i].segmentation_mask = mask;
-            outputs[i].mask_mode = "fast".to_string();
+            outputs[i].cleaned_regions = cleaned;
         }
 
-        let seg_ms = seg_start.elapsed().as_secs_f64() * 1000.0;
-        info!("⏱️  Segmentation: {:.0}ms for {} images ({} regions, {:.1}ms/img)",
-              seg_ms, decoded_images.len(), total_regions, seg_ms / decoded_images.len().max(1) as f64);
+        let clean_ms = clean_start.elapsed().as_secs_f64() * 1000.0;
+        info!("⏱️  Cleaning: {:.0}ms for {} images ({} label_1 regions, {:.1}ms/img)",
+              clean_ms, decoded_images.len(), total_regions, clean_ms / decoded_images.len().max(1) as f64);
+
+        Ok(())
+    }
+
+    /// Run text cleaning AND OCR in parallel, updating Phase1Output with both
+    /// 
+    /// OPTIMIZATION: OCR and cleaning run in parallel instead of sequentially.
+    /// OCR results are stored in Phase1Output for Phase 2 to use directly,
+    /// avoiding redundant image OCR via Gemini API.
+    /// 
+    /// # Arguments
+    /// * `models_dir` - Path to models directory containing OCR model
+    /// * `valid_region_ids` - Optional set of region IDs to filter (used for cleaning)
+    /// 
+    /// # Flow:
+    /// 1. Crop all label_1 regions from images
+    /// 2. Fork into parallel tasks:
+    ///    a) Run OCR on each cropped region → store Japanese text
+    ///    b) Run text_cleaner on each region → store cleaned PNG
+    /// 3. Combine results into Phase1Output
+    pub async fn complete_cleaning_with_ocr(
+        &self,
+        outputs: &mut [Phase1Output],
+        decoded_images: &[DynamicImage],
+        models_dir: &std::path::Path,
+        valid_region_ids: Option<&std::collections::HashSet<usize>>,
+    ) -> Result<()> {
+        use crate::services::ocr::{get_ocr_service, is_ocr_available};
+
+        let start = std::time::Instant::now();
+
+        // Check OCR availability
+        let ocr_available = is_ocr_available(models_dir);
+        if !ocr_available {
+            warn!("OCR models not available, falling back to cleaning-only mode");
+            return self.complete_cleaning(outputs, decoded_images, valid_region_ids).await;
+        }
+
+        let ocr_service = get_ocr_service(models_dir)?;
+        let mut total_regions = 0usize;
+        let mut ocr_success_count = 0usize;
+
+        // Process each image
+        for (i, img) in decoded_images.iter().enumerate() {
+            // Collect all regions to process with their crops
+            let mut region_crops: Vec<(usize, DynamicImage, [i32; 4])> = Vec::new();
+
+            for region in &outputs[i].regions {
+                for l1_bbox in &region.label_1_regions {
+                    let [x1, y1, x2, y2] = *l1_bbox;
+                    let x1 = x1.max(0) as u32;
+                    let y1 = y1.max(0) as u32;
+                    let x2 = (x2 as u32).min(img.width());
+                    let y2 = (y2 as u32).min(img.height());
+
+                    if x2 > x1 && y2 > y1 {
+                        let crop = img.crop_imm(x1, y1, x2 - x1, y2 - y1);
+                        region_crops.push((region.region_id, crop, *l1_bbox));
+                    }
+                }
+            }
+
+            total_regions += region_crops.len();
+
+            // PARALLEL PROCESSING: Run OCR and cleaning simultaneously
+            // Clone crops for OCR (cleaning consumes the crops)
+            let ocr_crops: Vec<(usize, DynamicImage, [i32; 4])> = region_crops
+                .iter()
+                .map(|(id, crop, bbox)| (*id, crop.clone(), *bbox))
+                .collect();
+
+            // Fork into parallel tasks
+            let (cleaned_result, ocr_results) = tokio::join!(
+                // Task 1: Text cleaning
+                async {
+                    self.segmenter
+                        .clean_regions_batch_filtered(&region_crops, valid_region_ids)
+                        .await
+                        .context("Failed to clean regions")
+                },
+                // Task 2: OCR recognition (run on blocking threadpool)
+                async {
+                    let ocr_service_clone = ocr_service.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut results = Vec::new();
+                        for (region_id, crop, _bbox) in ocr_crops {
+                            match ocr_service_clone.recognize(&crop) {
+                                Ok((text, confidence)) => {
+                                    if !text.trim().is_empty() {
+                                        results.push((region_id, text, confidence));
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("OCR failed for region {}: {:?}", region_id, e);
+                                }
+                            }
+                        }
+                        results
+                    })
+                    .await
+                    .context("OCR task panicked")
+                }
+            );
+
+            outputs[i].cleaned_regions = cleaned_result?;
+
+            let ocr_results = ocr_results?;
+            ocr_success_count += ocr_results.len();
+            outputs[i].ocr_results = ocr_results;
+        }
+
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        info!(
+            "⏱️  Parallel OCR+Cleaning: {:.0}ms for {} images ({} regions, {} OCR success)",
+            elapsed_ms, decoded_images.len(), total_regions, ocr_success_count
+        );
 
         Ok(())
     }
@@ -359,9 +500,10 @@ impl Phase1Pipeline {
             decoded_images.push(img);
         }
 
-        // Run detection
+        // Run detection: batched or parallel
         let detection_start = std::time::Instant::now();
         let batch_detections: Vec<(Vec<_>, Vec<_>, Vec<_>)> = if merge_img {
+            // Batch mode: single inference for all images
             let batch_refs: Vec<(&DynamicImage, usize)> = decoded_images
                 .iter()
                 .zip(images.iter())
@@ -371,6 +513,7 @@ impl Phase1Pipeline {
             self.detector.detect_all_labels_batch(&batch_refs, target_size_override).await
                 .context("Batch detection failed")?
         } else {
+            // Parallel mode: multiple concurrent inferences
             let detection_tasks: Vec<_> = decoded_images
                 .iter()
                 .zip(images.iter())
@@ -391,9 +534,8 @@ impl Phase1Pipeline {
         };
         let detection_ms = detection_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Process detections and categorize regions first (need bboxes for segmentation)
+        // Process detections and categorize regions
         let mut outputs = Vec::with_capacity(images.len());
-        let mut all_seg_bboxes: Vec<Vec<[i32; 4]>> = Vec::with_capacity(images.len());
 
         for (i, (label_0_raw, label_1_raw, label_2_raw)) in batch_detections.into_iter().enumerate() {
             let image_data = &images[i];
@@ -413,11 +555,6 @@ impl Phase1Pipeline {
                 .map(|d| RegionDetection { bbox: d.bbox, label: 2, confidence: d.confidence })
                 .collect();
 
-            // Collect bboxes for segmentation (label 1 + label 2)
-            let mut seg_bboxes: Vec<[i32; 4]> = label_1_detections.iter().map(|r| r.bbox).collect();
-            seg_bboxes.extend(label_2_detections.iter().map(|r| r.bbox));
-            all_seg_bboxes.push(seg_bboxes);
-
             // Categorize regions
             let (regions, validation_warnings) = self.categorize_regions(
                 img,
@@ -428,35 +565,55 @@ impl Phase1Pipeline {
                 filter_orphan_regions,
             )?;
 
-            // Create output with empty mask (filled next)
+            // Create output with empty cleaned_regions (filled next)
             outputs.push(Phase1Output {
                 page_index: image_data.index,
                 filename: image_data.filename.clone(),
                 width: image_data.width,
                 height: image_data.height,
                 regions,
-                segmentation_mask: vec![],  // Will be filled below
-                mask_mode: "fast".to_string(),
+                cleaned_regions: Vec::new(),
+                ocr_results: Vec::new(),
                 validation_warnings,
             });
         }
 
-        // Run region-based segmentation for each image
-        let seg_start = std::time::Instant::now();
+        // Clean each label_1 region (not entire region bbox)
+        let clean_start = std::time::Instant::now();
         let mut total_regions = 0usize;
 
         for (i, img) in decoded_images.iter().enumerate() {
-            total_regions += all_seg_bboxes[i].len();
-            let mask = self.segmenter
-                .generate_mask_for_regions(img, &all_seg_bboxes[i])
-                .await
-                .context("Failed to generate segmentation mask")?;
-            outputs[i].segmentation_mask = mask;
-        }
-        let segmentation_ms = seg_start.elapsed().as_secs_f64() * 1000.0;
+            let mut regions_to_clean: Vec<(usize, DynamicImage, [i32; 4])> = Vec::new();
 
-        info!("⏱️  Detection ({}): {:.0}ms | Segmentation: {:.0}ms ({} regions) | Total: {:.0}ms for {} images",
-              mode_str, detection_ms, segmentation_ms, total_regions,
+            for region in &outputs[i].regions {
+                // Clean each label_1 bbox within this region
+                for l1_bbox in &region.label_1_regions {
+                    let [x1, y1, x2, y2] = *l1_bbox;
+                    let x1 = x1.max(0) as u32;
+                    let y1 = y1.max(0) as u32;
+                    let x2 = (x2 as u32).min(img.width());
+                    let y2 = (y2 as u32).min(img.height());
+
+                    if x2 > x1 && y2 > y1 {
+                        let crop = img.crop_imm(x1, y1, x2 - x1, y2 - y1);
+                        regions_to_clean.push((region.region_id, crop, *l1_bbox));
+                    }
+                }
+            }
+
+            total_regions += regions_to_clean.len();
+
+            let cleaned = self.segmenter
+                .clean_regions_batch(&regions_to_clean)
+                .await
+                .context("Failed to clean regions")?;
+
+            outputs[i].cleaned_regions = cleaned;
+        }
+        let cleaning_ms = clean_start.elapsed().as_secs_f64() * 1000.0;
+
+        info!("⏱️  Detection ({}): {:.0}ms | Cleaning: {:.0}ms ({} label_1 regions) | Total: {:.0}ms for {} images",
+              mode_str, detection_ms, cleaning_ms, total_regions,
               batch_start.elapsed().as_secs_f64() * 1000.0, images.len());
 
         debug!(
